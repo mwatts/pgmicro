@@ -3365,6 +3365,26 @@ impl PostgreSQLTranslator {
         })))
     }
 
+    /// Map PostgreSQL SortBy nulls ordering to Turso AST.
+    ///
+    /// PostgreSQL defaults differ from SQLite: ASC defaults to NULLS LAST, DESC to
+    /// NULLS FIRST. When the parser leaves nulls at DEFAULT/UNDEFINED we apply those
+    /// PostgreSQL defaults explicitly so execution does not fall back to SQLite rules.
+    fn translate_sort_nulls(sortby_dir: i32, sortby_nulls: i32) -> Option<ast::NullsOrder> {
+        use pg_query::protobuf::{SortByDir, SortByNulls};
+
+        match SortByNulls::try_from(sortby_nulls) {
+            Ok(SortByNulls::SortbyNullsFirst) => Some(ast::NullsOrder::First),
+            Ok(SortByNulls::SortbyNullsLast) => Some(ast::NullsOrder::Last),
+            Ok(SortByNulls::SortbyNullsDefault) | Ok(SortByNulls::Undefined) | Err(_) => {
+                match SortByDir::try_from(sortby_dir) {
+                    Ok(SortByDir::SortbyDesc) => Some(ast::NullsOrder::First),
+                    _ => Some(ast::NullsOrder::Last),
+                }
+            }
+        }
+    }
+
     fn translate_order_by(
         &self,
         sort_clause: &[pg_query::protobuf::Node],
@@ -3387,11 +3407,10 @@ impl PostgreSQLTranslator {
                         _ => None, // Default or undefined
                     };
 
-                    sorted_columns.push(ast::SortedColumn {
-                        expr,
-                        order,
-                        nulls: None,
-                    });
+                    let nulls =
+                        Self::translate_sort_nulls(sort_by.sortby_dir, sort_by.sortby_nulls);
+
+                    sorted_columns.push(ast::SortedColumn { expr, order, nulls });
                 }
                 _ => {
                     return Err(ParseError::ParseError(format!(
@@ -5652,6 +5671,37 @@ mod tests {
             }
         } else {
             panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_order_by_nulls_first_last() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected_nulls) in [
+            (
+                "SELECT id FROM t ORDER BY v ASC",
+                Some(ast::NullsOrder::Last),
+            ),
+            (
+                "SELECT id FROM t ORDER BY v DESC",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT id FROM t ORDER BY v ASC NULLS FIRST",
+                Some(ast::NullsOrder::First),
+            ),
+            (
+                "SELECT id FROM t ORDER BY v ASC NULLS LAST",
+                Some(ast::NullsOrder::Last),
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            let ast::Stmt::Select(select) = translated else {
+                panic!("expected select for {sql}");
+            };
+            let col = select.order_by.first().expect("expected order by");
+            assert_eq!(col.nulls, expected_nulls, "wrong nulls for {sql}");
         }
     }
 
