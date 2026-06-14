@@ -361,8 +361,6 @@ impl Connection {
     }
 
     fn handle_pg_set_search_path(self: &Arc<Self>, stmt: &PgSetStmt) -> Result<()> {
-        let _ = stmt.is_local;
-        // SET LOCAL is stored at session scope for now; transaction rollback does not restore it.
         let schemas: Vec<String> = stmt
             .values
             .iter()
@@ -371,7 +369,14 @@ impl Connection {
         for name in &schemas {
             validate_schema_name(name)?;
         }
+        if stmt.is_local {
+            let mut saved = self.pg_search_path_local_saved.write();
+            if saved.is_none() {
+                *saved = Some(self.pg_search_path.read().clone());
+            }
+        }
         *self.pg_search_path.write() = schemas;
+        self.bump_prepare_context_generation();
         Ok(())
     }
 
@@ -382,6 +387,7 @@ impl Connection {
         };
         if reset_search_path {
             *self.pg_search_path.write() = Self::default_pg_search_path();
+            self.bump_prepare_context_generation();
         }
         Ok(())
     }

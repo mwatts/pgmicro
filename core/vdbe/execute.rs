@@ -3875,6 +3875,7 @@ pub fn op_auto_commit(
             }
             conn.rollback_attached_wal_txns();
             conn.rollback_temp_schema();
+            conn.restore_pg_search_path_local();
             conn.set_tx_state(TransactionState::None);
             conn.auto_commit.store(true, Ordering::SeqCst);
             conn.set_cdc_transaction_id(-1);
@@ -3961,6 +3962,7 @@ pub fn op_auto_commit(
     {
         conn.set_cdc_transaction_id(-1);
         conn.clear_named_savepoints();
+        conn.restore_pg_search_path_local();
     }
 
     res

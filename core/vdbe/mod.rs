@@ -1732,6 +1732,9 @@ impl Program {
                         pagers.iter().any(|(_, pager)| pager.holds_read_lock())
                     });
             if !has_attached_mv_tx && !has_attached_wal_tx {
+                if self.connection.auto_commit.load(Ordering::SeqCst) {
+                    self.connection.restore_pg_search_path_local();
+                }
                 return Ok(IOResult::Done(()));
             }
         }
@@ -1762,6 +1765,7 @@ impl Program {
                 } else {
                     self.connection.commit_temp_schema();
                 }
+                self.connection.restore_pg_search_path_local();
             }
         }
         Ok(res)

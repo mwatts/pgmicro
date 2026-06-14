@@ -232,6 +232,9 @@ pub struct Connection {
     pub(super) sql_dialect: AtomicSqlDialect,
     /// PostgreSQL session `search_path` for unqualified object resolution.
     pub(super) pg_search_path: RwLock<Vec<String>>,
+    /// Session `search_path` saved on the first `SET LOCAL search_path` in a
+    /// transaction; restored when the transaction ends (COMMIT or ROLLBACK).
+    pub(super) pg_search_path_local_saved: RwLock<Option<Vec<String>>>,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
@@ -2834,6 +2837,16 @@ impl Connection {
         self.pg_search_path.read().clone()
     }
 
+    /// Restore `search_path` after a transaction ends if `SET LOCAL search_path`
+    /// was used in that transaction.
+    pub(crate) fn restore_pg_search_path_local(&self) {
+        let saved = self.pg_search_path_local_saved.write().take();
+        if let Some(path) = saved {
+            *self.pg_search_path.write() = path;
+            self.bump_prepare_context_generation();
+        }
+    }
+
     pub fn enable_custom_types(&self) {
         self.custom_types_override
             .store(true, crate::sync::atomic::Ordering::Relaxed);
@@ -3277,6 +3290,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.restore_pg_search_path_local();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
         self.clear_deferred_foreign_key_violations();
