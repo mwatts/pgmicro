@@ -148,8 +148,8 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
+        use pg_query::protobuf::node::Node;
 
         let relation = create
             .relation
@@ -294,8 +294,8 @@ impl PostgreSQLTranslator {
         has_autoincrement: bool,
         has_table_pk: bool,
     ) -> Result<ast::ColumnDefinition, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
+        use pg_query::protobuf::node::Node;
 
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
@@ -513,8 +513,8 @@ impl PostgreSQLTranslator {
         &self,
         alter: &pg_query::protobuf::AlterTableStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::AlterTableType;
+        use pg_query::protobuf::node::Node;
 
         let relation = alter
             .relation
@@ -658,8 +658,8 @@ impl PostgreSQLTranslator {
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
     ) -> Result<ast::ColumnDefinition, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
+        use pg_query::protobuf::node::Node;
 
         let col_name = ast::Name::from_string(&col_def.colname);
 
@@ -789,8 +789,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_drop(&self, drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ObjectType;
+        use pg_query::protobuf::node::Node;
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
@@ -2531,7 +2531,7 @@ impl PostgreSQLTranslator {
                                     _ => {
                                         return Err(ParseError::ParseError(
                                             "Field access on non-identifier expression".into(),
-                                        ))
+                                        ));
                                     }
                                 },
                                 ast::Name::from_string(s.sval.clone()),
@@ -3190,11 +3190,13 @@ impl PostgreSQLTranslator {
             }
         }
 
+        let order_by = self.translate_order_by(&func_call.agg_order)?;
+
         Ok(ast::Expr::FunctionCall {
             name: ast::Name::from_string(func_name),
             distinctness,
             args,
-            order_by: vec![],
+            order_by,
             filter_over,
         })
     }
@@ -3659,8 +3661,8 @@ impl PostgreSQLTranslator {
         &self,
         on_conflict: &Option<Box<pg_query::protobuf::OnConflictClause>>,
     ) -> Result<Option<Box<ast::Upsert>>, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::OnConflictAction;
+        use pg_query::protobuf::node::Node;
 
         let clause = match on_conflict {
             Some(c) => c,
@@ -4169,8 +4171,8 @@ impl PostgreSQLTranslator {
         &self,
         domain: &pg_query::protobuf::CreateDomainStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
+        use pg_query::protobuf::node::Node;
 
         // Extract domain name (skip schema qualifiers like "pg_catalog")
         let mut domain_name = String::new();
@@ -4730,8 +4732,8 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
 
 /// Try to extract a RESET statement from a PG parse result.
 pub fn try_extract_reset(parse_result: &ParseResult) -> Option<PgResetStmt> {
-    use pg_query::protobuf::VariableSetKind;
     use pg_query::NodeRef;
+    use pg_query::protobuf::VariableSetKind;
 
     if parse_result.protobuf.nodes().is_empty() {
         return None;
@@ -4804,8 +4806,8 @@ pub fn try_extract_create_schema(parse_result: &ParseResult) -> Option<PgCreateS
 
 /// Try to extract a DROP SCHEMA statement from pg_query parse output.
 pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchemaStmt> {
-    use pg_query::protobuf::{DropBehavior, ObjectType};
     use pg_query::NodeRef;
+    use pg_query::protobuf::{DropBehavior, ObjectType};
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
@@ -6552,6 +6554,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_aggregate_order_by_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT array_agg(x ORDER BY y) FROM t";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        let ast::Stmt::Select(select) = translated else {
+            panic!("Expected Select");
+        };
+        let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+            panic!("Expected Select body");
+        };
+        let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+            panic!("Expected expression column");
+        };
+        let ast::Expr::FunctionCall {
+            name,
+            args,
+            order_by,
+            ..
+        } = &**expr
+        else {
+            panic!("Expected FunctionCall, got: {expr:?}");
+        };
+        assert_eq!(name.as_str(), "array_agg");
+        assert_eq!(args.len(), 1);
+        assert_eq!(order_by.len(), 1);
+        assert!(matches!(&*order_by[0].expr, ast::Expr::Id(id) if id.as_str() == "y"));
     }
 
     #[test]
