@@ -3710,3 +3710,41 @@ fn test_postgres_distinct_on(db: TempDatabase) {
     assert!(salaries.contains(&100));
     assert!(salaries.contains(&80));
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_is_true_false_truth_semantics(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    let mut rows = conn.query("SELECT 2 IS TRUE").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*value, 1, "2 IS TRUE should be true in PG truth semantics");
+    drop(rows);
+
+    let mut rows = conn.query("SELECT 0 IS FALSE").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*value, 1, "0 IS FALSE should be true");
+    drop(rows);
+
+    let mut rows = conn.query("SELECT 2 IS FALSE").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value");
+    };
+    assert_eq!(*value, 0, "2 IS FALSE should be false");
+}
