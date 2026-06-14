@@ -323,6 +323,16 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     result
 }
 
+/// PostgreSQL GREATEST: variadic max with PG NULL semantics (any NULL arg → NULL).
+pub fn exec_greatest<'a, T: Iterator<Item = &'a Value>>(args: T) -> Value {
+    Value::exec_max(args)
+}
+
+/// PostgreSQL LEAST: variadic min with PG NULL semantics (any NULL arg → NULL).
+pub fn exec_least<'a, T: Iterator<Item = &'a Value>>(args: T) -> Value {
+    Value::exec_min(args)
+}
+
 pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Value {
     let s = match input {
         Value::Text(t) => t.to_string(),

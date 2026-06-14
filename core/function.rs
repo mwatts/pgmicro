@@ -574,6 +574,9 @@ pub enum ScalarFunc {
     // PostgreSQL boolean operator functions
     BoolEq,
     BoolNe,
+    // PostgreSQL variadic comparison functions
+    Greatest,
+    Least,
 }
 
 impl Deterministic for ScalarFunc {
@@ -706,7 +709,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ToChar
             | ScalarFunc::PgInputIsValid
             | ScalarFunc::BoolEq
-            | ScalarFunc::BoolNe => true,
+            | ScalarFunc::BoolNe
+            | ScalarFunc::Greatest
+            | ScalarFunc::Least => true,
         }
     }
 }
@@ -865,6 +870,8 @@ impl Display for ScalarFunc {
             Self::PgInputIsValid => "pg_input_is_valid",
             Self::BoolEq => "booleq",
             Self::BoolNe => "boolne",
+            Self::Greatest => "greatest",
+            Self::Least => "least",
         };
         write!(f, "{str}")
     }
@@ -975,7 +982,7 @@ impl ScalarFunc {
             Self::PgGetExpr => &[2, 3],
             Self::Lpad | Self::Rpad => &[2, 3],
             // Scalar max/min (multi-arg)
-            Self::Max | Self::Min => &[-1],
+            Self::Max | Self::Min | Self::Greatest | Self::Least => &[-1],
             // Test functions for custom types (1-arg encode/decode, 2-arg operators)
             Self::TestUintEncode | Self::TestUintDecode | Self::StringReverse => &[1],
             Self::TestUintAdd
@@ -1426,6 +1433,8 @@ impl Func {
             "pg_input_is_valid" => Ok(Some(Self::Scalar(ScalarFunc::PgInputIsValid))),
             "booleq" => Ok(Some(Self::Scalar(ScalarFunc::BoolEq))),
             "boolne" => Ok(Some(Self::Scalar(ScalarFunc::BoolNe))),
+            "greatest" if arg_count >= 1 => Ok(Some(Self::Scalar(ScalarFunc::Greatest))),
+            "least" if arg_count >= 1 => Ok(Some(Self::Scalar(ScalarFunc::Least))),
             "abs" => Ok(Some(Self::Scalar(ScalarFunc::Abs))),
             "upper" => Ok(Some(Self::Scalar(ScalarFunc::Upper))),
             "lower" => Ok(Some(Self::Scalar(ScalarFunc::Lower))),

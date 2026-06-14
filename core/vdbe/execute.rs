@@ -77,9 +77,10 @@ use crate::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
         postgres::{
-            exec_gcd, exec_lcm, exec_lpad, exec_pg_encoding_to_char, exec_pg_format_type,
-            exec_pg_get_constraintdef, exec_pg_get_indexdef, exec_pg_get_user_by_id,
-            exec_pg_input_is_valid, exec_pg_is_visible, exec_repeat, exec_rpad, exec_to_char,
+            exec_gcd, exec_greatest, exec_lcm, exec_least, exec_lpad, exec_pg_encoding_to_char,
+            exec_pg_format_type, exec_pg_get_constraintdef, exec_pg_get_indexdef,
+            exec_pg_get_user_by_id, exec_pg_input_is_valid, exec_pg_is_visible, exec_repeat,
+            exec_rpad, exec_to_char,
         },
         printf::exec_printf,
     },
@@ -7393,6 +7394,16 @@ pub fn op_function(
                 let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
                 state.registers[*dest]
                     .set_value(Value::exec_max(reg_values.iter().map(|v| v.get_value())));
+            }
+            ScalarFunc::Greatest => {
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                state.registers[*dest]
+                    .set_value(exec_greatest(reg_values.iter().map(|v| v.get_value())));
+            }
+            ScalarFunc::Least => {
+                let reg_values = &state.registers[*start_reg..*start_reg + arg_count];
+                state.registers[*dest]
+                    .set_value(exec_least(reg_values.iter().map(|v| v.get_value())));
             }
             ScalarFunc::Nullif => {
                 let first_value = &state.registers[*start_reg];
