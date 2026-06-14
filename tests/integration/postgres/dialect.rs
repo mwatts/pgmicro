@@ -3634,6 +3634,70 @@ fn test_postgres_set_reset_search_path(db: TempDatabase) {
     assert_eq!(path.value, "public");
 }
 
+fn show_search_path(conn: &std::sync::Arc<turso_core::Connection>) -> String {
+    let mut rows = conn.query("SHOW search_path").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected SHOW row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(path) = row.get_value(0) else {
+        panic!("expected text search_path");
+    };
+    path.value.to_string()
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_set_local_search_path(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("SET search_path TO public").unwrap();
+    assert_eq!(show_search_path(&conn), "public");
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO myschema").unwrap();
+    assert_eq!(show_search_path(&conn), "myschema");
+
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        show_search_path(&conn),
+        "public",
+        "ROLLBACK should restore session search_path after SET LOCAL"
+    );
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO myschema").unwrap();
+    assert_eq!(show_search_path(&conn), "myschema");
+
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        show_search_path(&conn),
+        "public",
+        "COMMIT should restore session search_path after SET LOCAL"
+    );
+
+    conn.execute("SET search_path TO public, other").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("SET LOCAL search_path TO myschema").unwrap();
+    conn.execute("SAVEPOINT sp").unwrap();
+    conn.execute("SET LOCAL search_path TO nested").unwrap();
+    assert_eq!(show_search_path(&conn), "nested");
+
+    conn.execute("ROLLBACK TO SAVEPOINT sp").unwrap();
+    assert_eq!(
+        show_search_path(&conn),
+        "nested",
+        "SET LOCAL search_path should survive savepoint rollback"
+    );
+
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        show_search_path(&conn),
+        "public, other",
+        "ROLLBACK should restore pre-transaction session search_path"
+    );
+}
+
 #[turso_macros::test(mvcc)]
 fn test_postgres_search_path_resolution(db: TempDatabase) {
     let conn = db.connect_limbo();

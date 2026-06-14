@@ -1827,6 +1827,7 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             sql_dialect: AtomicSqlDialect::new(SqlDialect::default()),
             pg_search_path: RwLock::new(vec!["public".to_string()]),
+            pg_search_path_local_saved: RwLock::new(None),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),
             progress_handler: ProgressHandler::new(),
