@@ -13,7 +13,7 @@ use crate::connection::Connection;
 use crate::copy::parse_copy_text_format;
 use crate::statement::StatementOrigin;
 use crate::types::Text;
-use crate::{Cmd, LimboError, Result, SqlDialect, Statement, Value};
+use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
     is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
     try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
@@ -98,6 +98,7 @@ impl Connection {
     /// The schema database file is created in the same directory as the main database.
     fn handle_pg_create_schema(self: &Arc<Self>, stmt: &PgCreateSchemaStmt) -> Result<()> {
         let name = stmt.name.to_lowercase();
+        validate_schema_name(&name)?;
         if name == "public" {
             // "public" always exists
             if stmt.if_not_exists {
@@ -140,6 +141,7 @@ impl Connection {
     /// For other schemas: drops all tables, then DETACHes.
     fn handle_pg_drop_schema(self: &Arc<Self>, stmt: &PgDropSchemaStmt) -> Result<()> {
         let name = stmt.name.to_lowercase();
+        validate_schema_name(&name)?;
         if name == "public" {
             return self.handle_pg_drop_schema_public(stmt.cascade);
         }

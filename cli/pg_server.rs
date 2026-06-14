@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{Connection, Value};
+use turso_core::{validate_schema_name, Connection, Value};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -136,6 +136,10 @@ impl TursoPgHandler {
         if name.is_empty() || name == "public" {
             return;
         }
+        if validate_schema_name(name).is_err() {
+            tracing::warn!("Refusing to clean up schema file for invalid name {name:?}");
+            return;
+        }
         let parent = std::path::Path::new(&self.db_file)
             .parent()
             .unwrap_or(std::path::Path::new("."));
@@ -192,14 +196,17 @@ impl SimpleQueryHandler for TursoPgHandler {
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-            self.cleanup_dropped_schema_file(sql);
-
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
                 responses.push(execute_query(&mut stmt, header)?);
             }
+
+            // Only delete the backing schema file once the statement has
+            // executed successfully. Deleting before execution risks orphaning
+            // schema metadata if execution fails.
+            self.cleanup_dropped_schema_file(sql);
         }
 
         Ok(responses)
@@ -231,14 +238,14 @@ impl ExtendedQueryHandler for TursoPgHandler {
             .prepare(query)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
-
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query)?;
+            // Delete the backing schema file only after successful execution.
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
