@@ -1456,6 +1456,43 @@ fn test_postgres_array_nested(db: TempDatabase) {
 }
 
 // =====================================================================
+// expr = ANY(array)
+// =====================================================================
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_op_any_array(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    let mut rows = conn
+        .query("SELECT 2 = ANY(ARRAY[1, 2, 3])")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 1);
+    drop(rows);
+
+    let mut rows = conn
+        .query("SELECT 4 = ANY(ARRAY[1, 2, 3])")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 0);
+}
+
+// =====================================================================
 // Array operators (@>, <@, &&)
 // =====================================================================
 

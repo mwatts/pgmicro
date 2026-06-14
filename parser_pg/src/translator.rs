@@ -2618,12 +2618,7 @@ impl PostgreSQLTranslator {
                 // ILIKE/NOT ILIKE → LOWER(lhs) LIKE LOWER(rhs)
                 self.translate_ilike_expr(a_expr)
             }
-            AExprKind::AexprOpAny => {
-                // expr = ANY(array) → stub as 0 (false).
-                // Our pg_catalog tables that use arrays are empty stubs,
-                // so this never actually evaluates.
-                Ok(ast::Expr::Literal(ast::Literal::Numeric("0".to_string())))
-            }
+            AExprKind::AexprOpAny => self.translate_op_any_expr(a_expr),
             AExprKind::AexprBetween | AExprKind::AexprBetweenSym => {
                 self.translate_between_expr(a_expr, false)
             }
@@ -2934,6 +2929,51 @@ impl PostgreSQLTranslator {
             .unwrap_or(false);
 
         Ok(ast::Expr::InList { lhs, not, rhs })
+    }
+
+    fn translate_op_any_expr(
+        &self,
+        a_expr: &pg_query::protobuf::AExpr,
+    ) -> Result<ast::Expr, ParseError> {
+        let rexpr = a_expr.rexpr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("ANY: missing right-hand expression".to_string())
+        })?;
+
+        if let Some(pg_query::protobuf::node::Node::SubLink(sub_link)) = &rexpr.node {
+            return self.translate_sublink(sub_link);
+        }
+
+        let op_name = a_expr
+            .name
+            .iter()
+            .rev()
+            .find_map(|name| match &name.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .ok_or_else(|| ParseError::ParseError("ANY: missing operator".to_string()))?;
+
+        let lhs = a_expr.lexpr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("ANY: missing left-hand expression".to_string())
+        })?;
+        let left = Box::new(self.translate_expr(lhs)?);
+        let right = Box::new(self.translate_expr(rexpr)?);
+
+        match op_name {
+            "=" => Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("array_contains"),
+                distinctness: None,
+                args: vec![right, left],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }),
+            op => Err(ParseError::ParseError(format!(
+                "Unsupported ANY array operator: {op}"
+            ))),
+        }
     }
 
     fn translate_like_expr(
@@ -7055,6 +7095,49 @@ mod tests {
                     assert_eq!(name.as_str(), "array_overlap");
                 } else {
                     panic!("Expected FunctionCall for &&, got: {wc:?}");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_op_any_array_equals() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT 2 = ANY(ARRAY[1, 2, 3])";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**expr {
+                        assert_eq!(name.as_str(), "array_contains");
+                        assert_eq!(args.len(), 2);
+                        if let ast::Expr::FunctionCall {
+                            name: array_name,
+                            args: array_args,
+                            ..
+                        } = &*args[0]
+                        {
+                            assert_eq!(array_name.as_str(), "array");
+                            assert_eq!(array_args.len(), 3);
+                        } else {
+                            panic!("Expected array(...) as first arg, got: {:?}", args[0]);
+                        }
+                        if let ast::Expr::Literal(ast::Literal::Numeric(n)) = &*args[1] {
+                            assert_eq!(n, "2");
+                        } else {
+                            panic!("Expected literal 2 as second arg, got: {:?}", args[1]);
+                        }
+                    } else {
+                        panic!("Expected array_contains call, got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
                 }
             } else {
                 panic!("Expected Select variant");
