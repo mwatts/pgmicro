@@ -3348,3 +3348,53 @@ fn test_pg_catalog_dml_rejection(db: TempDatabase) {
         "unexpected error: {err}"
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_not_in_subquery(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE orders (user_id INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')")
+        .unwrap();
+    conn.execute("INSERT INTO orders VALUES (1), (1)").unwrap();
+
+    let mut names = Vec::new();
+    for sql in [
+        "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders) ORDER BY name",
+        "SELECT name FROM users WHERE id <> ALL (SELECT user_id FROM orders) ORDER BY name",
+    ] {
+        let mut rows = conn.query(sql).unwrap().unwrap();
+        names.clear();
+        loop {
+            match rows.step().unwrap() {
+                StepResult::Row => {
+                    let row = rows.row().unwrap();
+                    let Value::Text(name) = row.get_value(0) else {
+                        panic!("expected text name");
+                    };
+                    names.push(name.value.clone());
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected step result: {other:?}"),
+            }
+        }
+        assert_eq!(names, ["bob", "carol"], "unexpected rows for {sql}");
+    }
+
+    let mut rows = conn
+        .query("SELECT name FROM users WHERE id IN (SELECT user_id FROM orders) ORDER BY name")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(name) = row.get_value(0) else {
+        panic!("expected text name");
+    };
+    assert_eq!(name.value, "alice");
+}
