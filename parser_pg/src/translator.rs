@@ -9,6 +9,28 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PgSetOp {
+    Union,
+    UnionAll,
+    Intersect,
+    IntersectAll,
+    Except,
+    ExceptAll,
+}
+
+impl PgSetOp {
+    fn to_compound_operator(self) -> Option<ast::CompoundOperator> {
+        match self {
+            Self::Union => Some(ast::CompoundOperator::Union),
+            Self::UnionAll => Some(ast::CompoundOperator::UnionAll),
+            Self::Intersect => Some(ast::CompoundOperator::Intersect),
+            Self::Except => Some(ast::CompoundOperator::Except),
+            Self::IntersectAll | Self::ExceptAll => None,
+        }
+    }
+}
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
@@ -1355,38 +1377,49 @@ impl PostgreSQLTranslator {
         // Flatten the left-deep tree of set operations into a list.
         // pg_query represents A UNION B UNION C as:
         //   SetOp(SetOp(A, B), C)
-        let mut parts: Vec<(
-            Option<ast::CompoundOperator>,
-            &pg_query::protobuf::SelectStmt,
-        )> = Vec::new();
+        let mut parts: Vec<(Option<PgSetOp>, &pg_query::protobuf::SelectStmt)> = Vec::new();
         Self::flatten_set_operation(select, &mut parts);
 
         if parts.is_empty() {
             return Err(ParseError::ParseError("Empty set operation".to_string()));
         }
 
-        // First part becomes the primary select
-        let (_, first_stmt) = &parts[0];
-        let first_select = self.translate_one_select(first_stmt)?;
+        let order_by = self.translate_order_by(&select.sort_clause)?;
+        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
 
-        // Remaining parts become compounds
+        let mut left_select = self.translate_one_select(parts[0].1)?;
         let mut compounds = Vec::new();
+
         for (op, stmt) in parts.iter().skip(1) {
             let operator =
                 op.ok_or_else(|| ParseError::ParseError("Missing compound operator".to_string()))?;
-            compounds.push(ast::CompoundSelect {
-                operator,
-                select: self.translate_one_select(stmt)?,
-            });
-        }
+            let right_select = self.translate_one_select(stmt)?;
 
-        let order_by = self.translate_order_by(&select.sort_clause)?;
-        let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+            match operator {
+                PgSetOp::IntersectAll => {
+                    let left = Self::select_from_parts(left_select, std::mem::take(&mut compounds));
+                    left_select = self.fold_intersect_all(left, right_select)?;
+                }
+                PgSetOp::ExceptAll => {
+                    let left = Self::select_from_parts(left_select, std::mem::take(&mut compounds));
+                    left_select = self.fold_except_all(left, right_select)?;
+                }
+                _ => {
+                    let compound_op = operator
+                        .to_compound_operator()
+                        .expect("non-ALL operators map to CompoundOperator");
+                    compounds.push(ast::CompoundSelect {
+                        operator: compound_op,
+                        select: right_select,
+                    });
+                }
+            }
+        }
 
         Ok(ast::Select {
             with: None,
             body: ast::SelectBody {
-                select: first_select,
+                select: left_select,
                 compounds,
             },
             order_by,
@@ -1396,10 +1429,7 @@ impl PostgreSQLTranslator {
 
     fn flatten_set_operation<'a>(
         stmt: &'a pg_query::protobuf::SelectStmt,
-        parts: &mut Vec<(
-            Option<ast::CompoundOperator>,
-            &'a pg_query::protobuf::SelectStmt,
-        )>,
+        parts: &mut Vec<(Option<PgSetOp>, &'a pg_query::protobuf::SelectStmt)>,
     ) {
         use pg_query::protobuf::SetOperation;
 
@@ -1411,10 +1441,12 @@ impl PostgreSQLTranslator {
         }
 
         let operator = match (set_op, stmt.all) {
-            (SetOperation::SetopUnion, true) => ast::CompoundOperator::UnionAll,
-            (SetOperation::SetopUnion, false) => ast::CompoundOperator::Union,
-            (SetOperation::SetopIntersect, _) => ast::CompoundOperator::Intersect,
-            (SetOperation::SetopExcept, _) => ast::CompoundOperator::Except,
+            (SetOperation::SetopUnion, true) => PgSetOp::UnionAll,
+            (SetOperation::SetopUnion, false) => PgSetOp::Union,
+            (SetOperation::SetopIntersect, true) => PgSetOp::IntersectAll,
+            (SetOperation::SetopIntersect, false) => PgSetOp::Intersect,
+            (SetOperation::SetopExcept, true) => PgSetOp::ExceptAll,
+            (SetOperation::SetopExcept, false) => PgSetOp::Except,
             _ => return,
         };
 
@@ -1429,6 +1461,356 @@ impl PostgreSQLTranslator {
                 parts[prev_len].0 = Some(operator);
             }
         }
+    }
+
+    fn select_from_parts(
+        select: ast::OneSelect,
+        compounds: Vec<ast::CompoundSelect>,
+    ) -> ast::Select {
+        ast::Select {
+            with: None,
+            body: ast::SelectBody { select, compounds },
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    fn partition_specs_from_one_select(
+        select: &ast::OneSelect,
+    ) -> Result<Vec<(Box<ast::Expr>, String)>, ParseError> {
+        const COL_PREFIX: &str = "__pgmicro_c";
+
+        let ast::OneSelect::Select { columns, .. } = select else {
+            return Err(ParseError::ParseError(
+                "INTERSECT ALL/EXCEPT ALL is not supported with VALUES".to_string(),
+            ));
+        };
+
+        let mut specs = Vec::new();
+        for (i, col) in columns.iter().enumerate() {
+            match col {
+                ast::ResultColumn::Expr(expr, _) => {
+                    specs.push((expr.clone(), format!("{COL_PREFIX}{i}")));
+                }
+                _ => {
+                    return Err(ParseError::ParseError(
+                        "INTERSECT ALL/EXCEPT ALL requires an explicit select list".to_string(),
+                    ));
+                }
+            }
+        }
+        if specs.is_empty() {
+            return Err(ParseError::ParseError(
+                "INTERSECT ALL/EXCEPT ALL requires at least one select column".to_string(),
+            ));
+        }
+        Ok(specs)
+    }
+
+    fn conjoin(mut exprs: Vec<ast::Expr>) -> Box<ast::Expr> {
+        let first = exprs.remove(0);
+        exprs
+            .into_iter()
+            .fold(first, |acc, expr| {
+                ast::Expr::Binary(Box::new(acc), ast::Operator::And, Box::new(expr))
+            })
+            .into_boxed()
+    }
+
+    fn build_numbered_subquery(
+        inner: ast::Select,
+        alias: &str,
+        specs: &[(Box<ast::Expr>, String)],
+    ) -> Box<ast::SelectTable> {
+        const INNER_ALIAS: &str = "__pgmicro_inner";
+        const RN_COL: &str = "__pgmicro_rn";
+
+        let partition_by: Vec<Box<ast::Expr>> = specs
+            .iter()
+            .map(|(expr, _)| Self::qualify_expr_for_inner_subquery(expr, INNER_ALIAS))
+            .collect();
+        let mut columns: Vec<ast::ResultColumn> = specs
+            .iter()
+            .map(|(expr, col_alias)| {
+                ast::ResultColumn::Expr(
+                    Self::qualify_expr_for_inner_subquery(expr, INNER_ALIAS),
+                    Some(ast::As::As(ast::Name::from_string(col_alias))),
+                )
+            })
+            .collect();
+        columns.push(ast::ResultColumn::Expr(
+            Box::new(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("row_number"),
+                distinctness: None,
+                args: vec![],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: Some(ast::Over::Window(ast::Window {
+                        base: None,
+                        partition_by,
+                        order_by: vec![ast::SortedColumn {
+                            expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric(
+                                "1".to_string(),
+                            ))),
+                            order: None,
+                            nulls: None,
+                        }],
+                        frame_clause: None,
+                    })),
+                },
+            }),
+            Some(ast::As::As(ast::Name::from_string(RN_COL))),
+        ));
+
+        let numbered = ast::OneSelect::Select {
+            distinctness: None,
+            columns,
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select(
+                    inner,
+                    Some(ast::As::As(ast::Name::from_string(INNER_ALIAS))),
+                )),
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: None,
+            window_clause: vec![],
+        };
+
+        Box::new(ast::SelectTable::Select(
+            ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: numbered,
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            Some(ast::As::As(ast::Name::from_string(alias))),
+        ))
+    }
+
+    fn build_count_subquery(
+        inner: ast::Select,
+        alias: &str,
+        specs: &[(Box<ast::Expr>, String)],
+    ) -> Box<ast::SelectTable> {
+        const INNER_ALIAS: &str = "__pgmicro_inner";
+        const CNT_COL: &str = "__pgmicro_cnt";
+
+        let mut columns: Vec<ast::ResultColumn> = specs
+            .iter()
+            .map(|(expr, col_alias)| {
+                ast::ResultColumn::Expr(
+                    Self::qualify_expr_for_inner_subquery(expr, INNER_ALIAS),
+                    Some(ast::As::As(ast::Name::from_string(col_alias))),
+                )
+            })
+            .collect();
+        columns.push(ast::ResultColumn::Expr(
+            Box::new(ast::Expr::FunctionCallStar {
+                name: ast::Name::from_string("count"),
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }),
+            Some(ast::As::As(ast::Name::from_string(CNT_COL))),
+        ));
+
+        let grouped = ast::OneSelect::Select {
+            distinctness: None,
+            columns,
+            from: Some(ast::FromClause {
+                select: Box::new(ast::SelectTable::Select(
+                    inner,
+                    Some(ast::As::As(ast::Name::from_string(INNER_ALIAS))),
+                )),
+                joins: vec![],
+            }),
+            where_clause: None,
+            group_by: Some(ast::GroupBy {
+                exprs: specs
+                    .iter()
+                    .map(|(expr, _)| Self::qualify_expr_for_inner_subquery(expr, INNER_ALIAS))
+                    .collect(),
+                having: None,
+            }),
+            window_clause: vec![],
+        };
+
+        Box::new(ast::SelectTable::Select(
+            ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: grouped,
+                    compounds: vec![],
+                },
+                order_by: vec![],
+                limit: None,
+            },
+            Some(ast::As::As(ast::Name::from_string(alias))),
+        ))
+    }
+
+    fn fold_intersect_all(
+        &self,
+        left: ast::Select,
+        right: ast::OneSelect,
+    ) -> Result<ast::OneSelect, ParseError> {
+        const LEFT_ALIAS: &str = "__pgmicro_l";
+        const RIGHT_ALIAS: &str = "__pgmicro_r";
+        const RN_COL: &str = "__pgmicro_rn";
+
+        let specs = Self::partition_specs_from_one_select(&left.body.select)?;
+        let right_select = Self::select_from_parts(right, vec![]);
+
+        let left_tbl = Self::build_numbered_subquery(left, LEFT_ALIAS, &specs);
+        let right_tbl = Self::build_numbered_subquery(right_select, RIGHT_ALIAS, &specs);
+
+        let mut join_conds = Vec::new();
+        for (_, col_alias) in &specs {
+            join_conds.push(ast::Expr::Binary(
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(LEFT_ALIAS),
+                    ast::Name::from_string(col_alias),
+                )),
+                ast::Operator::Equals,
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(RIGHT_ALIAS),
+                    ast::Name::from_string(col_alias),
+                )),
+            ));
+        }
+        join_conds.push(ast::Expr::Binary(
+            Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(LEFT_ALIAS),
+                ast::Name::from_string(RN_COL),
+            )),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(RIGHT_ALIAS),
+                ast::Name::from_string(RN_COL),
+            )),
+        ));
+
+        let outer_columns = Self::outer_columns_from_set_op_specs(&specs, LEFT_ALIAS);
+
+        Ok(ast::OneSelect::Select {
+            distinctness: None,
+            columns: outer_columns,
+            from: Some(ast::FromClause {
+                select: left_tbl,
+                joins: vec![ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::TypedJoin(Some(ast::JoinType::INNER)),
+                    table: right_tbl,
+                    constraint: Some(ast::JoinConstraint::On(Self::conjoin(join_conds))),
+                }],
+            }),
+            where_clause: None,
+            group_by: None,
+            window_clause: vec![],
+        })
+    }
+
+    fn fold_except_all(
+        &self,
+        left: ast::Select,
+        right: ast::OneSelect,
+    ) -> Result<ast::OneSelect, ParseError> {
+        const LEFT_ALIAS: &str = "__pgmicro_l";
+        const RIGHT_ALIAS: &str = "__pgmicro_r";
+        const RN_COL: &str = "__pgmicro_rn";
+        const CNT_COL: &str = "__pgmicro_cnt";
+
+        let specs = Self::partition_specs_from_one_select(&left.body.select)?;
+        let right_select = Self::select_from_parts(right, vec![]);
+
+        let left_tbl = Self::build_numbered_subquery(left, LEFT_ALIAS, &specs);
+        let right_tbl = Self::build_count_subquery(right_select, RIGHT_ALIAS, &specs);
+
+        let mut join_conds = Vec::new();
+        for (_, col_alias) in &specs {
+            join_conds.push(ast::Expr::Binary(
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(LEFT_ALIAS),
+                    ast::Name::from_string(col_alias),
+                )),
+                ast::Operator::Equals,
+                Box::new(ast::Expr::Qualified(
+                    ast::Name::from_string(RIGHT_ALIAS),
+                    ast::Name::from_string(col_alias),
+                )),
+            ));
+        }
+
+        let where_clause = ast::Expr::Binary(
+            Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(LEFT_ALIAS),
+                ast::Name::from_string(RN_COL),
+            )),
+            ast::Operator::Greater,
+            Box::new(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("coalesce"),
+                distinctness: None,
+                args: vec![
+                    Box::new(ast::Expr::Qualified(
+                        ast::Name::from_string(RIGHT_ALIAS),
+                        ast::Name::from_string(CNT_COL),
+                    )),
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
+                ],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            }),
+        );
+
+        let outer_columns = Self::outer_columns_from_set_op_specs(&specs, LEFT_ALIAS);
+
+        Ok(ast::OneSelect::Select {
+            distinctness: None,
+            columns: outer_columns,
+            from: Some(ast::FromClause {
+                select: left_tbl,
+                joins: vec![ast::JoinedSelectTable {
+                    operator: ast::JoinOperator::TypedJoin(Some(
+                        ast::JoinType::LEFT | ast::JoinType::OUTER,
+                    )),
+                    table: right_tbl,
+                    constraint: Some(ast::JoinConstraint::On(Self::conjoin(join_conds))),
+                }],
+            }),
+            where_clause: Some(Box::new(where_clause)),
+            group_by: None,
+            window_clause: vec![],
+        })
+    }
+
+    fn outer_columns_from_set_op_specs(
+        specs: &[(Box<ast::Expr>, String)],
+        left_alias: &str,
+    ) -> Vec<ast::ResultColumn> {
+        specs
+            .iter()
+            .map(|(expr, col_alias)| {
+                let output_alias = match expr.as_ref() {
+                    ast::Expr::Id(name) => Some(ast::As::As(name.clone())),
+                    _ => None,
+                };
+                ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Qualified(
+                        ast::Name::from_string(left_alias),
+                        ast::Name::from_string(col_alias),
+                    )),
+                    output_alias,
+                )
+            })
+            .collect()
     }
 
     /// Translate a single leaf SELECT (no set operations) into a OneSelect.
@@ -3447,15 +3829,27 @@ impl PostgreSQLTranslator {
         }
     }
 
+    fn qualify_expr_for_inner_subquery(expr: &ast::Expr, inner_alias: &str) -> Box<ast::Expr> {
+        match expr {
+            ast::Expr::Id(name) => Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(inner_alias),
+                name.clone(),
+            )),
+            other => Box::new(other.clone()),
+        }
+    }
+
     fn qualify_result_column(col: ast::ResultColumn, sub_alias: &str) -> ast::ResultColumn {
         match col {
             ast::ResultColumn::Expr(expr, alias) => {
-                let col_name = alias.as_ref().map(|a| a.name().clone()).unwrap_or_else(|| {
-                    match *expr {
-                        ast::Expr::Id(name) => name,
-                        _ => ast::Name::from_string("column"),
-                    }
-                });
+                let col_name =
+                    alias
+                        .as_ref()
+                        .map(|a| a.name().clone())
+                        .unwrap_or_else(|| match *expr {
+                            ast::Expr::Id(name) => name,
+                            _ => ast::Name::from_string("column"),
+                        });
                 ast::ResultColumn::Expr(
                     Box::new(ast::Expr::Qualified(
                         ast::Name::from_string(sub_alias),
@@ -5950,6 +6344,53 @@ mod tests {
                 panic!("Expected Select for {sql}");
             }
         }
+    }
+
+    #[test]
+    fn test_intersect_all_rewrites_with_row_number() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected select");
+        };
+        let ast::OneSelect::Select { from, .. } = &select.body.select else {
+            panic!("expected simple select body");
+        };
+        let from = from.as_ref().expect("expected from clause");
+        assert!(
+            from.joins.iter().any(|join| {
+                matches!(
+                    join.table.as_ref(),
+                    ast::SelectTable::Select(_, Some(ast::As::As(name)))
+                        if name.as_str() == "__pgmicro_r"
+                )
+            }),
+            "INTERSECT ALL should join numbered right subquery, got {from:?}"
+        );
+    }
+
+    #[test]
+    fn test_except_all_rewrites_with_count_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT a FROM t1 EXCEPT ALL SELECT a FROM t2";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        let ast::Stmt::Select(select) = translated else {
+            panic!("expected select");
+        };
+        let ast::OneSelect::Select { where_clause, .. } = &select.body.select else {
+            panic!("expected simple select body");
+        };
+        let where_clause = where_clause.as_ref().expect("expected where clause");
+        assert!(
+            matches!(
+                where_clause.as_ref(),
+                ast::Expr::Binary(_, ast::Operator::Greater, _)
+            ),
+            "EXCEPT ALL should filter with rn > coalesce(count), got {where_clause:?}"
+        );
     }
 
     #[test]

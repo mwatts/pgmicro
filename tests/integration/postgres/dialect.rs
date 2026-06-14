@@ -2295,6 +2295,71 @@ fn test_postgres_compound_order_by(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_postgres_intersect_except_all(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+    conn.execute("CREATE TABLE t1 (a INTEGER)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES (1), (1), (2), (3)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2 (a INTEGER)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES (1), (4), (1)").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT a FROM t1 INTERSECT SELECT a FROM t2 ORDER BY a")
+        .unwrap();
+    let mut results: Vec<i64> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                if let Value::Numeric(Numeric::Integer(v)) = row.get_value(0) {
+                    results.push(*v);
+                }
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(results, vec![1]);
+
+    let mut stmt = conn
+        .prepare("SELECT a FROM t1 INTERSECT ALL SELECT a FROM t2 ORDER BY a")
+        .unwrap();
+    let mut results: Vec<i64> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                if let Value::Numeric(Numeric::Integer(v)) = row.get_value(0) {
+                    results.push(*v);
+                }
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(results, vec![1, 1]);
+
+    let mut stmt = conn
+        .prepare("SELECT a FROM t1 EXCEPT ALL SELECT a FROM t2 ORDER BY a")
+        .unwrap();
+    let mut results: Vec<i64> = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                if let Value::Numeric(Numeric::Integer(v)) = row.get_value(0) {
+                    results.push(*v);
+                }
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(results, vec![2, 3]);
+}
+
+#[turso_macros::test]
 fn test_postgres_insert_default(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = postgres").unwrap();
