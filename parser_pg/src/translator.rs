@@ -3074,6 +3074,34 @@ impl PostgreSQLTranslator {
         Ok(Some(GroupBy { exprs, having }))
     }
 
+    fn sublink_operator_name(sub_link: &pg_query::protobuf::SubLink) -> Option<&str> {
+        sub_link
+            .oper_name
+            .first()
+            .and_then(|name| match &name.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+    }
+
+    fn translate_in_subselect(
+        &self,
+        sub_link: &pg_query::protobuf::SubLink,
+        select: ast::Select,
+        not: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        let test_node = sub_link
+            .testexpr
+            .as_ref()
+            .ok_or_else(|| ParseError::ParseError("IN SubLink missing testexpr".to_string()))?;
+        let lhs = self.translate_expr(test_node)?;
+        Ok(ast::Expr::InSelect {
+            lhs: Box::new(lhs),
+            not,
+            rhs: select,
+        })
+    }
+
     fn translate_sublink(
         &self,
         sub_link: &pg_query::protobuf::SubLink,
@@ -3098,16 +3126,20 @@ impl PostgreSQLTranslator {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
             SubLinkType::AnySublink => {
-                // ANY/IN subquery: testexpr IN (SELECT ...)
-                let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
-                    ParseError::ParseError("ANY SubLink missing testexpr".to_string())
-                })?;
-                let lhs = self.translate_expr(test_node)?;
-                Ok(ast::Expr::InSelect {
-                    lhs: Box::new(lhs),
-                    not: false,
-                    rhs: select,
-                })
+                // `x = ANY (subquery)` / `x IN (subquery)`
+                self.translate_in_subselect(sub_link, select, false)
+            }
+            SubLinkType::AllSublink => {
+                // `x <> ALL (subquery)` is equivalent to `x NOT IN (subquery)`
+                match Self::sublink_operator_name(sub_link) {
+                    Some("<>") => self.translate_in_subselect(sub_link, select, true),
+                    Some(op) => Err(ParseError::ParseError(format!(
+                        "Unsupported ALL subquery operator: {op}"
+                    ))),
+                    None => Err(ParseError::ParseError(
+                        "ALL subquery missing operator".to_string(),
+                    )),
+                }
             }
             other => Err(ParseError::ParseError(format!(
                 "Unsupported SubLink type: {other:?}",
@@ -3393,8 +3425,28 @@ impl PostgreSQLTranslator {
                         "NOT expression must have exactly 1 argument".to_string(),
                     ));
                 }
-                let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
-                Ok(ast::Expr::Unary(ast::UnaryOperator::Not, operand))
+                let operand = self.translate_expr(&bool_expr.args[0])?;
+                match operand {
+                    ast::Expr::InSelect {
+                        lhs,
+                        not: false,
+                        rhs,
+                    } => Ok(ast::Expr::InSelect {
+                        lhs,
+                        not: true,
+                        rhs,
+                    }),
+                    ast::Expr::InList {
+                        lhs,
+                        not: false,
+                        rhs,
+                    } => Ok(ast::Expr::InList {
+                        lhs,
+                        not: true,
+                        rhs,
+                    }),
+                    other => Ok(ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(other))),
+                }
             }
             BoolExprType::AndExpr => {
                 if bool_expr.args.len() < 2 {
@@ -5600,6 +5652,33 @@ mod tests {
             }
         } else {
             panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_not_in_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        for sql in [
+            "SELECT name FROM users WHERE id NOT IN (SELECT user_id FROM orders)",
+            "SELECT name FROM users WHERE id <> ALL (SELECT user_id FROM orders)",
+            "SELECT name FROM users WHERE NOT id IN (SELECT user_id FROM orders)",
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            if let ast::Stmt::Select(select) = translated {
+                let one_select = &select.body.select;
+                if let ast::OneSelect::Select { where_clause, .. } = one_select {
+                    let where_expr = where_clause.as_ref().expect("Should have WHERE clause");
+                    assert!(
+                        matches!(where_expr.as_ref(), ast::Expr::InSelect { not: true, .. }),
+                        "Expected negated InSelect for {sql}, got {where_expr:?}"
+                    );
+                } else {
+                    panic!("Expected Select variant for {sql}");
+                }
+            } else {
+                panic!("Expected Select for {sql}");
+            }
         }
     }
 
