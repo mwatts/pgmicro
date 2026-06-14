@@ -19,21 +19,33 @@ right call.
 |---|---|
 | Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT |
 | Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; ~12 stubs for psql compat |
-| Wire | Simple + Extended query protocol, multi-statement, trust auth |
+| Wire | Simple + Extended query protocol, multi-statement, trust auth (localhost-only; no TLS) |
 | REPL | 19 `\` meta-commands, all tested |
 | Schemas | CREATE/DROP SCHEMA → ATTACH separate `.db` files |
 
 ## Gaps — by severity
 
-### Security (fix before any network exposure)
+### Security
 
-- **Path traversal**, `cli/pg_server.rs:130`. `DROP SCHEMA "../../etc/.../x"` →
-  `parent.join(name)` deletes arbitrary files. No `[A-Za-z0-9_]` validation. Any client can
-  delete process-writable files.
-- **No auth at all.** `NoopHandler` returns `AuthenticationOk` to anyone. No TLS. Help text
-  example binds `0.0.0.0:5432`. Unauthenticated full DB read/write.
-- **Delete-before-execute**, `cli/pg_server.rs:194`. Schema file unlinked after `prepare`,
-  before exec. If exec fails → schema metadata orphaned with no backing file.
+**Fixed (localhost wire server):**
+
+- **Path traversal** — `validate_schema_name()` in `core/pg_schema.rs` rejects schema names
+  outside `[A-Za-z0-9_]` at CREATE/DROP SCHEMA time (before `turso-postgres-schema-<name>.db`
+  paths are built). Defense-in-depth check in `cli/pg_server.rs` cleanup. Stricter than
+  PostgreSQL identifier rules (no dots, Unicode, etc.); documented in `pg_schema.rs`.
+- **Delete-before-execute** — wire server deletes schema `.db` files only after successful
+  execution, not after `prepare`. Tested via API and wire protocol.
+
+**Accepted for localhost-only use:**
+
+- **No auth / no TLS** — `NoopHandler` still returns `AuthenticationOk` to any client that
+  can reach the port. CLI help and startup stderr warn to bind `127.0.0.1` only. Intended for
+  trusted local development, not public network exposure.
+
+**Remaining:**
+
+- **Prepared `DROP SCHEMA $1`** — extended-protocol cleanup still uses string matching on the
+  raw query; parameterized drops do not trigger `.db` file deletion.
 
 ### Correctness — wrong results, silent
 
@@ -114,12 +126,13 @@ right call.
 Core engine works and the design is clean — direct-to-AST translation on a real DB is
 genuinely useful, not faked. The gaps cluster in three buckets:
 
-1. **Network safety** (path traversal + zero auth) — must fix before exposing the port. Real
-   holes, not polish.
-2. **Silent wrong-answer translations** (NOT IN, NULLS ordering, DISTINCT ON, set-op ALL,
-   GREATEST) — violate the project's own "reject loudly over wrong results" principle.
-3. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
+1. **Silent wrong-answer translations** (NOT IN, NULLS ordering, DISTINCT ON, set-op ALL,
+   GREATEST) — violate the project's own "reject loudly over wrong results" principle. Highest
+   priority now that schema file path traversal is fixed.
+2. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
    search_path) — ORMs/typed drivers misbehave; psql mostly survives.
+3. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; prepared-statement
+   schema file cleanup.
 
-Strongest part: translator breadth + test depth. Weakest: wire-protocol security and the
-silent-correctness shortcuts.
+Strongest part: translator breadth + test depth. Weakest: silent-correctness shortcuts in the
+translator and wire-protocol tooling fidelity.
