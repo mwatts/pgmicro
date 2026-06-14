@@ -875,7 +875,13 @@ impl PostgreSQLTranslator {
         &self,
         truncate: &pg_query::protobuf::TruncateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        // TRUNCATE TABLE t → DELETE FROM t (first relation only)
+        // TRUNCATE TABLE t → DELETE FROM t (single-table only; multi-table handled in
+        // try_prepare_pg via sequential DELETEs).
+        if truncate.relations.len() > 1 {
+            return Err(ParseError::ParseError(
+                "multi-table TRUNCATE must be handled by the connection layer".into(),
+            ));
+        }
         let relation = truncate
             .relations
             .first()
@@ -4981,6 +4987,64 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct PgTruncateTable {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgTruncateStmt {
+    pub tables: Vec<PgTruncateTable>,
+}
+
+fn truncate_schema_name(schemaname: &str) -> Option<String> {
+    if schemaname.is_empty()
+        || matches!(
+            schemaname.to_lowercase().as_str(),
+            "public" | "pg_catalog" | "information_schema"
+        )
+    {
+        None
+    } else {
+        Some(schemaname.to_string())
+    }
+}
+
+/// Try to extract a multi-table TRUNCATE statement from pg_query parse output.
+/// Single-table TRUNCATE is translated to DELETE via `translate_truncate`.
+pub fn try_extract_truncate(parse_result: &ParseResult) -> Option<PgTruncateStmt> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::TruncateStmt(truncate) = &nodes[0].0 else {
+        return None;
+    };
+    if truncate.relations.len() <= 1 {
+        return None;
+    }
+
+    let tables: Vec<PgTruncateTable> = truncate
+        .relations
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(Node::RangeVar(rv)) => Some(PgTruncateTable {
+                table_name: rv.relname.clone(),
+                schema_name: truncate_schema_name(&rv.schemaname),
+            }),
+            _ => None,
+        })
+        .collect();
+    if tables.len() != truncate.relations.len() {
+        return None;
+    }
+    Some(PgTruncateStmt { tables })
+}
+
 /// Parse a SQL referential action string to an AST RefAct.
 fn parse_ref_act(action: &str) -> Option<ast::RefAct> {
     match action.to_uppercase().as_str() {
@@ -7582,5 +7646,34 @@ mod tests {
         let copy = try_extract_copy_from(&parsed).unwrap();
         let cols = copy.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_try_extract_truncate_multi_table() {
+        let parsed = crate::parse("TRUNCATE TABLE t1, t2").unwrap();
+        let truncate = try_extract_truncate(&parsed).unwrap();
+        assert_eq!(truncate.tables.len(), 2);
+        assert_eq!(truncate.tables[0].table_name, "t1");
+        assert_eq!(truncate.tables[1].table_name, "t2");
+        assert!(truncate.tables[0].schema_name.is_none());
+        assert!(truncate.tables[1].schema_name.is_none());
+    }
+
+    #[test]
+    fn test_try_extract_truncate_single_table() {
+        let parsed = crate::parse("TRUNCATE TABLE users").unwrap();
+        assert!(try_extract_truncate(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_truncate_multi_table_translation_error() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "TRUNCATE TABLE t1, t2";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(
+            err.to_string().contains("multi-table TRUNCATE"),
+            "unexpected error: {err}"
+        );
     }
 }

@@ -16,8 +16,9 @@ use crate::types::Text;
 use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
     is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
-    try_extract_reset, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgResetStmt, PgSetStmt, PostgreSQLTranslator,
+    try_extract_reset, try_extract_set, try_extract_show, try_extract_truncate, PgCopyFromStmt,
+    PgCreateSchemaStmt, PgDropSchemaStmt, PgResetStmt, PgSetStmt, PgTruncateStmt,
+    PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -94,6 +95,14 @@ impl Connection {
             let rows_inserted = self.handle_pg_copy_from(&copy_stmt)?;
             let stmt = self.prepare_sqlite_sql("SELECT 0 WHERE 0")?;
             stmt.set_n_change(rows_inserted as i64);
+            return Ok(Some(stmt));
+        }
+
+        // TRUNCATE t1, t2, ... → sequential DELETE FROM each table
+        if let Some(truncate_stmt) = try_extract_truncate(&parse_result) {
+            let rows_deleted = self.handle_pg_truncate(&truncate_stmt)?;
+            let stmt = self.prepare_sqlite_sql("SELECT 0 WHERE 0")?;
+            stmt.set_n_change(rows_deleted as i64);
             return Ok(Some(stmt));
         }
 
@@ -210,6 +219,29 @@ impl Connection {
                 stmt.run_ignore_rows()?;
             }
             Ok(())
+        })();
+        self.set_sql_dialect(saved_dialect);
+        result
+    }
+
+    /// Handle multi-table TRUNCATE by deleting all rows from each listed table.
+    /// Returns the total number of rows deleted.
+    fn handle_pg_truncate(self: &Arc<Self>, stmt: &PgTruncateStmt) -> Result<usize> {
+        let saved_dialect = self.get_sql_dialect();
+        self.set_sql_dialect(SqlDialect::Sqlite);
+        let result = (|| {
+            let mut rows_deleted = 0usize;
+            for table in &stmt.tables {
+                let table_name = match &table.schema_name {
+                    Some(schema) => format!("\"{schema}\".\"{}\"", table.table_name),
+                    None => format!("\"{}\"", table.table_name),
+                };
+                let sql = format!("DELETE FROM {table_name}");
+                let mut delete_stmt = self.prepare_with_origin(&sql, StatementOrigin::Root)?;
+                delete_stmt.run_ignore_rows()?;
+                rows_deleted += delete_stmt.n_change().max(0) as usize;
+            }
+            Ok(rows_deleted)
         })();
         self.set_sql_dialect(saved_dialect);
         result
