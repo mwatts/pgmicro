@@ -79,6 +79,45 @@ fn test_postgres_arithmetic_expression(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_greatest_least(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    let mut rows = conn.query("SELECT GREATEST(1, 3, 2)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 3);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT LEAST(5, 1, 3)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 1);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT GREATEST(1, NULL, 2)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert!(
+        matches!(row.get_value(0), Value::Null),
+        "expected NULL for GREATEST with NULL arg, got {:?}",
+        row.get_value(0)
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_parser_integration(db: TempDatabase) {
     let conn = db.connect_limbo();
 
