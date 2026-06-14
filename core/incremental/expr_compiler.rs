@@ -330,6 +330,8 @@ impl CompiledExpression {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            crate::SqlDialect::Sqlite,
+            vec!["public".to_string()],
         );
 
         // Translate the transformed expression to bytecode

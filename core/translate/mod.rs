@@ -103,6 +103,8 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        connection.get_sql_dialect(),
+        connection.get_pg_search_path(),
     );
 
     match stmt {

@@ -230,7 +230,7 @@ pub struct Connection {
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) sql_dialect: AtomicSqlDialect,
-    /// PostgreSQL session `search_path` (unqualified name resolution is not wired yet).
+    /// PostgreSQL session `search_path` for unqualified object resolution.
     pub(super) pg_search_path: RwLock<Vec<String>>,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
@@ -2828,6 +2828,10 @@ impl Connection {
 
     pub fn set_sql_dialect(&self, dialect: SqlDialect) {
         self.sql_dialect.set(dialect);
+    }
+
+    pub(crate) fn get_pg_search_path(&self) -> Vec<String> {
+        self.pg_search_path.read().clone()
     }
 
     pub fn enable_custom_types(&self) {
