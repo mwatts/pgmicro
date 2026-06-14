@@ -230,6 +230,8 @@ pub struct Connection {
     pub(super) sync_mode: AtomicSyncMode,
     pub(super) temp_store: AtomicTempStore,
     pub(super) sql_dialect: AtomicSqlDialect,
+    /// PostgreSQL session `search_path` (unqualified name resolution is not wired yet).
+    pub(super) pg_search_path: RwLock<Vec<String>>,
     pub(super) data_sync_retry: AtomicBool,
     /// Busy handler for lock contention
     /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
