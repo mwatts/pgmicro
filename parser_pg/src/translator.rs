@@ -4098,10 +4098,17 @@ fn pg_fk_action_to_string(action: &str) -> Option<String> {
 
 /// Deparse a simple default expression from PG protobuf into a SQL string.
 /// Only handles simple literals for now.
-/// Extracted SET statement: `SET name = value`
+/// Extracted SET statement: `SET name = value` or `SET name TO val1, val2, ...`
 pub struct PgSetStmt {
     pub name: String,
-    pub value: String,
+    pub values: Vec<String>,
+    pub is_local: bool,
+}
+
+/// Extracted RESET statement: `RESET name` or `RESET ALL`
+pub struct PgResetStmt {
+    /// `None` means `RESET ALL`.
+    pub name: Option<String>,
 }
 
 /// Extracted SHOW statement: `SHOW name`
@@ -4124,18 +4131,50 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
+    use pg_query::protobuf::VariableSetKind;
+
+    if VariableSetKind::try_from(set_stmt.kind) != Ok(VariableSetKind::VarSetValue) {
         return None;
     }
 
-    // Extract the value from args
-    let value = set_stmt.args.first().and_then(deparse_default_expr)?;
+    let values: Vec<String> = set_stmt
+        .args
+        .iter()
+        .filter_map(deparse_default_expr)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
 
     Some(PgSetStmt {
         name: set_stmt.name.clone(),
-        value,
+        values,
+        is_local: set_stmt.is_local,
     })
+}
+
+/// Try to extract a RESET statement from a PG parse result.
+pub fn try_extract_reset(parse_result: &ParseResult) -> Option<PgResetStmt> {
+    use pg_query::protobuf::VariableSetKind;
+    use pg_query::NodeRef;
+
+    if parse_result.protobuf.nodes().is_empty() {
+        return None;
+    }
+
+    let node = &parse_result.protobuf.nodes()[0];
+    let set_stmt = match &node.0 {
+        NodeRef::VariableSetStmt(s) => s,
+        _ => return None,
+    };
+
+    match VariableSetKind::try_from(set_stmt.kind) {
+        Ok(VariableSetKind::VarReset) => Some(PgResetStmt {
+            name: Some(set_stmt.name.clone()),
+        }),
+        Ok(VariableSetKind::VarResetAll) => Some(PgResetStmt { name: None }),
+        _ => None,
+    }
 }
 
 /// Try to extract a SHOW statement from a PG parse result.

@@ -3450,3 +3450,45 @@ fn test_postgres_order_by_nulls_default(db: TempDatabase) {
     }
     assert_eq!(ids, [1, 4, 3, 5, 2]);
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_set_reset_search_path(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("SET search_path TO myschema, public")
+        .expect("SET search_path should succeed");
+
+    let mut rows = conn.query("SHOW search_path").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected SHOW row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(path) = row.get_value(0) else {
+        panic!("expected text search_path");
+    };
+    assert_eq!(path.value, "myschema, public");
+
+    conn.execute("RESET search_path").unwrap();
+    let mut rows = conn.query("SHOW search_path").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected SHOW row after RESET");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(path) = row.get_value(0) else {
+        panic!("expected text search_path");
+    };
+    assert_eq!(path.value, "public");
+
+    conn.execute("SET search_path TO other").unwrap();
+    conn.execute("RESET ALL").unwrap();
+    let mut rows = conn.query("SHOW search_path").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected SHOW row after RESET ALL");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(path) = row.get_value(0) else {
+        panic!("expected text search_path");
+    };
+    assert_eq!(path.value, "public");
+}

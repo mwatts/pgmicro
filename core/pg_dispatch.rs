@@ -16,8 +16,8 @@ use crate::types::Text;
 use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
     is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
-    try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt,
-    PostgreSQLTranslator,
+    try_extract_reset, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
+    PgDropSchemaStmt, PgResetStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -46,14 +46,28 @@ impl Connection {
             Err(_) => return Ok(None),
         };
 
-        // SET name = value → PRAGMA name = value
+        if let Some(reset_stmt) = try_extract_reset(&parse_result) {
+            self.handle_pg_reset(&reset_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
         if let Some(set_stmt) = try_extract_set(&parse_result) {
-            let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, set_stmt.value);
+            if set_stmt.name == "search_path" {
+                self.handle_pg_set_search_path(&set_stmt)?;
+                return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+            }
+            let value = set_stmt
+                .values
+                .first()
+                .ok_or_else(|| LimboError::ParseError("SET statement missing value".to_string()))?;
+            let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value);
             return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
         }
 
-        // SHOW name → PRAGMA name
         if let Some(show_stmt) = try_extract_show(&parse_result) {
+            if show_stmt.name == "search_path" {
+                return Ok(Some(self.prepare_pg_show_search_path()?));
+            }
             let pragma_sql = format!("PRAGMA {}", show_stmt.name);
             return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
         }
@@ -325,5 +339,57 @@ impl Connection {
                 _ => None,
             })
             .collect())
+    }
+
+    fn default_pg_search_path() -> Vec<String> {
+        vec!["public".to_string()]
+    }
+
+    fn pg_search_path_display(path: &[String]) -> String {
+        path.join(", ")
+    }
+
+    fn normalize_pg_identifier(value: &str) -> String {
+        let trimmed = value.trim();
+        if (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        {
+            trimmed[1..trimmed.len() - 1].to_string()
+        } else {
+            trimmed.to_string()
+        }
+    }
+
+    fn handle_pg_set_search_path(self: &Arc<Self>, stmt: &PgSetStmt) -> Result<()> {
+        let _ = stmt.is_local;
+        // SET LOCAL is stored at session scope for now; transaction rollback does not restore it.
+        let schemas: Vec<String> = stmt
+            .values
+            .iter()
+            .map(|v| Self::normalize_pg_identifier(v))
+            .collect();
+        for name in &schemas {
+            validate_schema_name(name)?;
+        }
+        *self.pg_search_path.write() = schemas;
+        Ok(())
+    }
+
+    fn handle_pg_reset(self: &Arc<Self>, stmt: &PgResetStmt) -> Result<()> {
+        let reset_search_path = match &stmt.name {
+            None => true,
+            Some(name) => name == "search_path",
+        };
+        if reset_search_path {
+            *self.pg_search_path.write() = Self::default_pg_search_path();
+        }
+        Ok(())
+    }
+
+    fn prepare_pg_show_search_path(self: &Arc<Self>) -> Result<Statement> {
+        let path = self.pg_search_path.read().clone();
+        let display = Self::pg_search_path_display(&path);
+        let sql = format!("SELECT '{display}'");
+        self.prepare_sqlite_sql(&sql)
     }
 }
