@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
@@ -503,6 +503,24 @@ fn test_postgres_alter_table_add_column(db: TempDatabase) {
         panic!("expected text");
     };
     assert_eq!(name.value, "alice");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_alter_table_multi_add_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    conn.execute("ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT")
+        .unwrap();
+
+    conn.execute("INSERT INTO t (id, a, b) VALUES (1, 10, 20)")
+        .unwrap();
+
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t WHERE id = 1");
+    assert_eq!(rows, vec![(10, 20)]);
 }
 
 #[turso_macros::test(mvcc)]

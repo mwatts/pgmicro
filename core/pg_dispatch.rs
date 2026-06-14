@@ -25,16 +25,16 @@ use crate::sync::Arc;
 
 impl Connection {
     /// Parse PostgreSQL SQL using pg_query and translate to Turso AST.
-    pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Option<Cmd>> {
+    pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Vec<Cmd>> {
         let parse_result =
             turso_parser_pg::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
 
         let translator = PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
+        let stmts = translator
+            .translate_stmts(&parse_result)
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
 
-        Ok(Some(Cmd::Stmt(stmt)))
+        Ok(stmts.into_iter().map(Cmd::Stmt).collect())
     }
 
     /// Handle PG session/schema commands that need connection state.
