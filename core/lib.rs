@@ -48,6 +48,7 @@ mod numeric;
 mod parameters;
 mod pg_catalog;
 mod pg_dispatch;
+mod pg_schema;
 mod pragma;
 mod progress;
 mod pseudo;
@@ -138,6 +139,7 @@ pub use io::{
     SyscallIO, WriteCompletion, IO,
 };
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use pg_schema::validate_schema_name;
 pub use statement::{Statement, StatementStatusCounter};
 pub use storage::{
     buffer_pool::BufferPool,

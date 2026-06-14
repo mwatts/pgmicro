@@ -263,6 +263,41 @@ fn test_postgres_create_schema_public_error(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_create_schema_rejects_path_traversal(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    // A quoted identifier containing path separators must be rejected before it
+    // can be turned into a `turso-postgres-schema-<name>.db` filesystem path.
+    for name in [
+        r#""../evil""#,
+        r#""../../etc/passwd""#,
+        r#""a/b""#,
+        r#""a.b""#,
+    ] {
+        let result = conn.execute(format!("CREATE SCHEMA {name}"));
+        assert!(
+            result.is_err(),
+            "CREATE SCHEMA {name} should be rejected, got {result:?}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_schema_rejects_path_traversal(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    for name in [r#""../evil""#, r#""../../etc/passwd""#, r#""a/b""#] {
+        let result = conn.execute(format!("DROP SCHEMA {name}"));
+        assert!(
+            result.is_err(),
+            "DROP SCHEMA {name} should be rejected, got {result:?}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_drop_schema(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = postgres").unwrap();

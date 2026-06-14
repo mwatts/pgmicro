@@ -88,7 +88,8 @@ struct Opts {
 
     #[clap(
         long,
-        help = "Start PostgreSQL wire protocol server at given address (e.g. 0.0.0.0:5432)"
+        help = "Start PostgreSQL wire protocol server at given address (e.g. 127.0.0.1:5432). \
+                WARNING: the server performs no authentication; do not bind to a public address."
     )]
     server: Option<String>,
 }
@@ -1010,6 +1011,11 @@ fn main() -> anyhow::Result<()> {
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
         auto_attach_pg_schemas(&conn, &db_file);
+        eprintln!(
+            "WARNING: the PostgreSQL wire server performs NO authentication and uses no TLS. \
+             Any client that can reach {address} has full read/write access to the database. \
+             Bind only to a trusted address such as 127.0.0.1."
+        );
         let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
         return server.run();
     }

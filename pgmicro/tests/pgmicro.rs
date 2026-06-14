@@ -865,9 +865,13 @@ fn copy_from_file_not_found_repl() {
 
 /// Start pgmicro with --server and wait for it to be ready.
 fn start_pgmicro_server(port: u16) -> Child {
+    start_pgmicro_server_with_db(port, ":memory:")
+}
+
+fn start_pgmicro_server_with_db(port: u16, db_file: &str) -> Child {
     let addr = format!("127.0.0.1:{port}");
     let mut child = Command::new(env!("CARGO_BIN_EXE_pgmicro"))
-        .arg(":memory:")
+        .arg(db_file)
         .arg("--server")
         .arg(&addr)
         .stdout(Stdio::piped())
@@ -967,6 +971,36 @@ impl PgTestClient {
         let response = self.read_until_ready();
         extract_command_tags(&response)
     }
+
+    /// Send query and return the full wire response bytes.
+    fn query_raw(&mut self, sql: &str) -> Vec<u8> {
+        self.send_query(sql);
+        self.read_until_ready()
+    }
+}
+
+/// Returns true if the wire response contains an ErrorResponse ('E') message.
+fn response_has_error(data: &[u8]) -> bool {
+    let mut pos = 0;
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if pos + 4 > data.len() {
+            break;
+        }
+        let len =
+            i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        let body_len = len - 4;
+        if pos + body_len > data.len() {
+            break;
+        }
+        if tag == b'E' {
+            return true;
+        }
+        pos += body_len;
+    }
+    false
 }
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
@@ -1033,4 +1067,54 @@ fn wire_copy_from_returns_copy_n() {
     std::fs::remove_file(&path).ok();
     server.kill().ok();
     server.wait().ok();
+}
+
+#[test]
+fn wire_drop_schema_keeps_file_on_failure() {
+    let port = 16432 + (std::process::id() % 1000) as u16;
+    let dir = std::env::temp_dir().join(format!("pgmicro-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+    let db_path = dir.join("main.db");
+    let schema_file = dir.join("turso-postgres-schema-wireschema.db");
+
+    let mut server = start_pgmicro_server_with_db(port, &db_path.to_string_lossy());
+    let mut client = PgTestClient::connect(port);
+
+    let tags = client.query_command_tags("CREATE SCHEMA wireschema");
+    assert!(
+        tags.iter().any(|t| t.contains("CREATE")),
+        "expected CREATE tag, got: {tags:?}"
+    );
+    assert!(
+        schema_file.exists(),
+        "schema file should exist after CREATE SCHEMA: {}",
+        schema_file.display()
+    );
+
+    // A failing DROP SCHEMA must not delete the backing file. The wire server
+    // only removes schema files after successful execution.
+    let response = client.query_raw("DROP SCHEMA nosuchschema");
+    assert!(
+        response_has_error(&response),
+        "expected error for DROP SCHEMA nosuchschema"
+    );
+    assert!(
+        schema_file.exists(),
+        "schema file must remain after failed DROP SCHEMA: {}",
+        schema_file.display()
+    );
+
+    let tags = client.query_command_tags("DROP SCHEMA wireschema");
+    assert!(
+        tags.iter().any(|t| t.contains("DROP")),
+        "expected DROP tag, got: {tags:?}"
+    );
+    assert!(
+        !schema_file.exists(),
+        "schema file should be deleted after successful DROP SCHEMA"
+    );
+
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
 }
