@@ -3492,3 +3492,77 @@ fn test_postgres_set_reset_search_path(db: TempDatabase) {
     };
     assert_eq!(path.value, "public");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_distinct_on(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE employees (department TEXT, name TEXT, salary INTEGER)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO employees VALUES \
+         ('eng', 'alice', 100), ('eng', 'bob', 90), ('sales', 'carol', 80)",
+    )
+    .unwrap();
+
+    let mut rows = conn
+        .query(
+            "SELECT name, salary FROM employees \
+             ORDER BY department, salary DESC",
+        )
+        .unwrap()
+        .unwrap();
+    let mut all_names = Vec::new();
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+                let Value::Text(name) = row.get_value(0) else {
+                    panic!("expected name");
+                };
+                all_names.push(name.value.clone());
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+    assert_eq!(all_names.len(), 3);
+
+    let mut rows = conn
+        .query(
+            "SELECT DISTINCT ON (department) name, salary FROM employees \
+             ORDER BY department, salary DESC",
+        )
+        .unwrap()
+        .unwrap();
+    let mut names = Vec::new();
+    let mut salaries = Vec::new();
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+                let Value::Text(name) = row.get_value(0) else {
+                    panic!("expected name");
+                };
+                let Value::Numeric(Numeric::Integer(salary)) = row.get_value(1) else {
+                    panic!("expected salary");
+                };
+                names.push(name.value.to_string());
+                salaries.push(*salary);
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+    assert_eq!(
+        names.len(),
+        2,
+        "DISTINCT ON (department) should return two rows"
+    );
+    assert!(names.iter().any(|n| n == "alice"));
+    assert!(names.iter().any(|n| n == "carol"));
+    assert!(!names.iter().any(|n| n == "bob"));
+    assert!(salaries.contains(&100));
+    assert!(salaries.contains(&80));
+}
