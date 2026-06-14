@@ -3398,3 +3398,55 @@ fn test_postgres_not_in_subquery(db: TempDatabase) {
     };
     assert_eq!(name.value, "alice");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_order_by_nulls_default(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER, v INTEGER)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, NULL), (2, 3), (3, 1), (4, NULL), (5, 2)")
+        .unwrap();
+
+    // PostgreSQL ASC defaults to NULLS LAST (unlike SQLite).
+    let mut ids = Vec::new();
+    let mut rows = conn
+        .query("SELECT id FROM t ORDER BY v ASC, id")
+        .unwrap()
+        .unwrap();
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+                let Value::Numeric(Numeric::Integer(id)) = row.get_value(0) else {
+                    panic!("expected integer id");
+                };
+                ids.push(*id);
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+    assert_eq!(ids, [3, 5, 2, 1, 4]);
+
+    ids.clear();
+    let mut rows = conn
+        .query("SELECT id FROM t ORDER BY v ASC NULLS FIRST, id")
+        .unwrap()
+        .unwrap();
+    loop {
+        match rows.step().unwrap() {
+            StepResult::Row => {
+                let row = rows.row().unwrap();
+                let Value::Numeric(Numeric::Integer(id)) = row.get_value(0) else {
+                    panic!("expected integer id");
+                };
+                ids.push(*id);
+            }
+            StepResult::Done => break,
+            other => panic!("unexpected step: {other:?}"),
+        }
+    }
+    assert_eq!(ids, [1, 4, 3, 5, 2]);
+}
