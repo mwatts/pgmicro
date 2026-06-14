@@ -3539,6 +3539,8 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            crate::SqlDialect::Sqlite,
+            vec!["public".to_string()],
         )
     }
 

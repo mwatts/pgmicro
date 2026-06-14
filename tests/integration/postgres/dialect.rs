@@ -79,6 +79,45 @@ fn test_postgres_arithmetic_expression(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_greatest_least(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    let mut rows = conn.query("SELECT GREATEST(1, 3, 2)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 3);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT LEAST(5, 1, 3)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 1);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT GREATEST(1, NULL, 2)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    assert!(
+        matches!(row.get_value(0), Value::Null),
+        "expected NULL for GREATEST with NULL arg, got {:?}",
+        row.get_value(0)
+    );
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_parser_integration(db: TempDatabase) {
     let conn = db.connect_limbo();
 
@@ -3556,6 +3595,46 @@ fn test_postgres_set_reset_search_path(db: TempDatabase) {
         panic!("expected text search_path");
     };
     assert_eq!(path.value, "public");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_search_path_resolution(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE SCHEMA other").unwrap();
+    conn.execute("CREATE TABLE other.t (id INTEGER PRIMARY KEY, source TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO other.t (id, source) VALUES (1, 'other')")
+        .unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, source TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t (id, source) VALUES (1, 'public')")
+        .unwrap();
+
+    conn.execute("SET search_path TO other, public").unwrap();
+    let mut rows = conn.query("SELECT source FROM t").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row with search_path other, public");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(source) = row.get_value(0) else {
+        panic!("expected text source");
+    };
+    assert_eq!(source.as_str(), "other");
+    drop(rows);
+
+    conn.execute("SET search_path TO public, other").unwrap();
+    let mut rows = conn.query("SELECT source FROM t").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row with search_path public, other");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(source) = row.get_value(0) else {
+        panic!("expected text source");
+    };
+    assert_eq!(source.as_str(), "public");
 }
 
 #[turso_macros::test(mvcc)]

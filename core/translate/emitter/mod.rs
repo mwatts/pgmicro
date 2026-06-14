@@ -43,7 +43,7 @@ use crate::{
         check_expr_references_column, exprs_are_equivalent, normalize_ident, parse_numeric_literal,
     },
     CaptureDataChangesExt, Connection, Database, DatabaseCatalog, LimboError, Result, RwLock,
-    SymbolTable,
+    SqlDialect, SymbolTable,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
@@ -180,6 +180,9 @@ pub struct Resolver<'a> {
     /// (e.g. via a nested sub-program), update this field on that
     /// path or switch to a live read.
     has_temp_schema: bool,
+    sql_dialect: SqlDialect,
+    /// Snapshot of PostgreSQL `search_path` at prepare time.
+    pg_search_path: Vec<String>,
 }
 
 /// Context for restricting table resolution during trigger subprogram compilation.
@@ -209,6 +212,8 @@ impl<'a> Resolver<'a> {
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
+        sql_dialect: SqlDialect,
+        pg_search_path: Vec<String>,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -227,6 +232,8 @@ impl<'a> Resolver<'a> {
             dqs_dml,
             trigger_context: None,
             has_temp_schema,
+            sql_dialect,
+            pg_search_path,
         }
     }
 
@@ -255,6 +262,8 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            sql_dialect: self.sql_dialect,
+            pg_search_path: self.pg_search_path.clone(),
         }
     }
 
@@ -275,6 +284,8 @@ impl<'a> Resolver<'a> {
             dqs_dml: self.dqs_dml,
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
+            sql_dialect: self.sql_dialect,
+            pg_search_path: self.pg_search_path.clone(),
         }
     }
 
@@ -430,6 +441,31 @@ impl<'a> Resolver<'a> {
             .collect()
     }
 
+    fn database_id_for_pg_search_path_entry(&self, schema_name: &str) -> Option<usize> {
+        let normalized = normalize_ident(schema_name);
+        match normalized.as_str() {
+            "public" | "pg_catalog" | "information_schema" => Some(crate::MAIN_DB_ID),
+            "temp" | "pg_temp" => Some(crate::TEMP_DB_ID),
+            _ => self
+                .get_attached_database(&normalized)
+                .map(|(database_id, _)| database_id),
+        }
+    }
+
+    fn pg_search_path_database_ids(&self) -> Vec<usize> {
+        let mut database_ids = Vec::new();
+        for schema_name in &self.pg_search_path {
+            let Some(database_id) = self.database_id_for_pg_search_path_entry(schema_name) else {
+                continue;
+            };
+            if database_ids.contains(&database_id) {
+                continue;
+            }
+            database_ids.push(database_id);
+        }
+        database_ids
+    }
+
     fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
@@ -449,13 +485,16 @@ impl<'a> Resolver<'a> {
             return crate::TEMP_DB_ID;
         }
 
-        if self.with_schema(crate::MAIN_DB_ID, |schema| {
-            schema_contains_object(schema, object_name)
-        }) {
-            return crate::MAIN_DB_ID;
-        }
+        let database_ids = match self.sql_dialect {
+            SqlDialect::Postgres => self.pg_search_path_database_ids(),
+            SqlDialect::Sqlite => {
+                let mut database_ids = vec![crate::MAIN_DB_ID];
+                database_ids.extend(self.attached_database_ids_in_search_order());
+                database_ids
+            }
+        };
 
-        for database_id in self.attached_database_ids_in_search_order() {
+        for database_id in database_ids {
             if self.with_schema(database_id, |schema| {
                 schema_contains_object(schema, object_name)
             }) {
