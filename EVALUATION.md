@@ -49,11 +49,18 @@ right call.
 
 ### Correctness — wrong results, silent
 
-- **`NOT IN (subquery)` → `IN`**, `translator.rs:3108`. `not: false` hardcoded. Negation
-  dropped. Real wrong answers.
-- **NULLS FIRST/LAST dropped** in ORDER BY, `translator.rs:3358`. PG and SQLite have opposite
-  defaults → different row order, breaks LIMIT pagination.
-- **DISTINCT ON → DISTINCT**, `translator.rs:1304`. Different result set.
+**Fixed:**
+
+- **`NOT IN (subquery)` / `<> ALL (subquery)`** — `AllSublink` and `InSelect` now set
+  `not: true`; `NOT` over `IN` subquery/list is folded correctly. Keyword `NOT IN` often
+  worked via `NOT (IN …)`; the main gap was operator form and explicit `not` on `InSelect`.
+- **NULLS FIRST/LAST in ORDER BY** — `translate_sort_nulls()` maps PG defaults (ASC → NULLS
+  LAST, DESC → NULLS FIRST) and explicit `NULLS FIRST`/`LAST` to Turso `NullsOrder`.
+- **DISTINCT ON** — rewritten via `row_number() OVER (PARTITION BY … ORDER BY …)` subquery
+  (`wrap_distinct_on()`). Requires `ORDER BY`; not supported on VALUES or compound SELECT.
+
+**Remaining:**
+
 - **INTERSECT/EXCEPT ALL lose ALL**, `translator.rs:1405`. Dedups where PG would not.
 - **GREATEST/LEAST → scalar MAX/MIN**, `translator.rs:2002`. SQLite scalar max/min take 2
   args; 3+ args invoke the aggregate → wrong/error. NULL semantics differ too.
@@ -94,11 +101,18 @@ right call.
 
 ### Dialect / schema mechanism
 
-- **`SET LOCAL` ignored** → permanent PRAGMA, `translator.rs:4056`. psycopg2 `SET LOCAL`
-  inside a txn leaks to connection scope.
-- **`RESET name`/`RESET ALL` → error.** Django/frameworks issue these at startup.
-- **`SET search_path` = silent no-op** → unknown PRAGMA swallowed. No search_path stack
-  exists; unqualified names always resolve to public.
+**Partially fixed:**
+
+- **`SET`/`SHOW`/`RESET`/`RESET ALL` for `search_path`** — stored on `Connection.pg_search_path`;
+  `SHOW search_path` and `RESET` (including `RESET ALL`) work. Other `RESET name` is a no-op.
+  **`SET LOCAL search_path`** is accepted but session-scoped (not rolled back with the txn).
+- **Unqualified name resolution** still hardcodes `public` — `search_path` is not wired into
+  table/column lookup yet.
+
+**Remaining:**
+
+- **`SET LOCAL` transaction scope** — values persist for the connection lifetime; psycopg2
+  `SET LOCAL` inside a txn does not restore on rollback.
 - **Cross-schema txns not atomic** — separate ATTACH WAL files, partial commit possible,
   undocumented.
 - **`:memory:` + CREATE SCHEMA** writes a physical file to cwd; sessions collide.
@@ -126,11 +140,11 @@ right call.
 Core engine works and the design is clean — direct-to-AST translation on a real DB is
 genuinely useful, not faked. The gaps cluster in three buckets:
 
-1. **Silent wrong-answer translations** (NOT IN, NULLS ordering, DISTINCT ON, set-op ALL,
-   GREATEST) — violate the project's own "reject loudly over wrong results" principle. Highest
-   priority now that schema file path traversal is fixed.
+1. **Silent wrong-answer translations** (set-op ALL, GREATEST/LEAST, `= ANY(array)`, multi-table
+   TRUNCATE) — violate the project's own "reject loudly over wrong results" principle. Highest
+   priority now that NOT IN, NULLS ordering, DISTINCT ON, and schema path traversal are fixed.
 2. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
-   search_path) — ORMs/typed drivers misbehave; psql mostly survives.
+   search_path resolution) — ORMs/typed drivers misbehave; psql mostly survives.
 3. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; prepared-statement
    schema file cleanup.
 
