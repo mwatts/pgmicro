@@ -107,8 +107,11 @@ impl PostgreSQLTranslator {
         }
     }
 
-    /// Translate a PostgreSQL parse result into Turso's format
-    pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
+    /// Translate a PostgreSQL parse result into one or more Turso statements.
+    pub fn translate_stmts(
+        &self,
+        parse_result: &ParseResult,
+    ) -> Result<Vec<ast::Stmt>, ParseError> {
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string()));
         }
@@ -118,28 +121,40 @@ impl PostgreSQLTranslator {
         match &node.0 {
             NodeRef::SelectStmt(select) => {
                 let select_ast = self.translate_select(select)?;
-                Ok(ast::Stmt::Select(select_ast))
+                Ok(vec![ast::Stmt::Select(select_ast)])
             }
-            NodeRef::InsertStmt(insert) => self.translate_insert(insert),
-            NodeRef::UpdateStmt(update) => self.translate_update(update),
-            NodeRef::DeleteStmt(delete) => self.translate_delete(delete),
-            NodeRef::TransactionStmt(txn) => self.translate_transaction(txn),
-            NodeRef::DropStmt(drop) => self.translate_drop(drop),
+            NodeRef::InsertStmt(insert) => Ok(vec![self.translate_insert(insert)?]),
+            NodeRef::UpdateStmt(update) => Ok(vec![self.translate_update(update)?]),
+            NodeRef::DeleteStmt(delete) => Ok(vec![self.translate_delete(delete)?]),
+            NodeRef::TransactionStmt(txn) => Ok(vec![self.translate_transaction(txn)?]),
+            NodeRef::DropStmt(drop) => Ok(vec![self.translate_drop(drop)?]),
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter),
-            NodeRef::RenameStmt(rename) => self.translate_rename_stmt(rename),
-            NodeRef::IndexStmt(idx) => self.translate_create_index(idx),
-            NodeRef::CreateStmt(create) => self.translate_create_table(create),
-            NodeRef::TruncateStmt(truncate) => self.translate_truncate(truncate),
-            NodeRef::ViewStmt(view) => self.translate_create_view(view),
-            NodeRef::CreateTableAsStmt(ctas) => self.translate_create_table_as(ctas),
-            NodeRef::CreateEnumStmt(enum_stmt) => translate_create_enum(enum_stmt),
-            NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain),
-            NodeRef::CopyStmt(copy) => self.translate_copy(copy),
+            NodeRef::RenameStmt(rename) => Ok(vec![self.translate_rename_stmt(rename)?]),
+            NodeRef::IndexStmt(idx) => Ok(vec![self.translate_create_index(idx)?]),
+            NodeRef::CreateStmt(create) => Ok(vec![self.translate_create_table(create)?]),
+            NodeRef::TruncateStmt(truncate) => Ok(vec![self.translate_truncate(truncate)?]),
+            NodeRef::ViewStmt(view) => Ok(vec![self.translate_create_view(view)?]),
+            NodeRef::CreateTableAsStmt(ctas) => Ok(vec![self.translate_create_table_as(ctas)?]),
+            NodeRef::CreateEnumStmt(enum_stmt) => Ok(vec![translate_create_enum(enum_stmt)?]),
+            NodeRef::CreateDomainStmt(domain) => Ok(vec![self.translate_create_domain(domain)?]),
+            NodeRef::CopyStmt(copy) => Ok(vec![self.translate_copy(copy)?]),
             _ => Err(ParseError::ParseError(format!(
                 "{} is not supported",
                 node_ref_name(&node.0)
             ))),
         }
+    }
+
+    /// Translate a PostgreSQL parse result into a single Turso statement.
+    pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
+        let mut stmts = self.translate_stmts(parse_result)?;
+        if stmts.len() != 1 {
+            return Err(ParseError::ParseError(format!(
+                "expected 1 statement, got {} (use translate_stmts for multi-command input)",
+                stmts.len()
+            )));
+        }
+        Ok(stmts.remove(0))
     }
 
     /// Translate a PostgreSQL CREATE TABLE statement into Turso AST.
@@ -148,8 +163,8 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::ConstrType;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
 
         let relation = create
             .relation
@@ -294,8 +309,8 @@ impl PostgreSQLTranslator {
         has_autoincrement: bool,
         has_table_pk: bool,
     ) -> Result<ast::ColumnDefinition, ParseError> {
-        use pg_query::protobuf::ConstrType;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
 
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
@@ -512,20 +527,37 @@ impl PostgreSQLTranslator {
     fn translate_alter_table(
         &self,
         alter: &pg_query::protobuf::AlterTableStmt,
-    ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::AlterTableType;
-        use pg_query::protobuf::node::Node;
-
+    ) -> Result<Vec<ast::Stmt>, ParseError> {
         let relation = alter
             .relation
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing table name".into()))?;
         let name = self.qualified_name_from_range_var(relation);
 
-        let cmd_node = alter
+        if alter.cmds.is_empty() {
+            return Err(ParseError::ParseError("ALTER TABLE missing command".into()));
+        }
+
+        alter
             .cmds
-            .first()
-            .ok_or_else(|| ParseError::ParseError("ALTER TABLE missing command".into()))?;
+            .iter()
+            .map(|cmd_node| {
+                let body = self.translate_alter_table_cmd(cmd_node)?;
+                Ok(ast::Stmt::AlterTable(ast::AlterTable {
+                    name: name.clone(),
+                    body,
+                }))
+            })
+            .collect()
+    }
+
+    fn translate_alter_table_cmd(
+        &self,
+        cmd_node: &pg_query::Node,
+    ) -> Result<ast::AlterTableBody, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::AlterTableType;
+
         let cmd = match &cmd_node.node {
             Some(Node::AlterTableCmd(cmd)) => cmd,
             _ => {
@@ -538,7 +570,7 @@ impl PostgreSQLTranslator {
         let subtype = AlterTableType::try_from(cmd.subtype)
             .map_err(|_| ParseError::ParseError("ALTER TABLE: invalid subtype".into()))?;
 
-        let body = match subtype {
+        match subtype {
             AlterTableType::AtAddColumn => {
                 let col_def = match &cmd.def {
                     Some(def_node) => match &def_node.node {
@@ -556,14 +588,12 @@ impl PostgreSQLTranslator {
                     }
                 };
                 let col = self.translate_column_def(col_def)?;
-                ast::AlterTableBody::AddColumn(col)
+                Ok(ast::AlterTableBody::AddColumn(col))
             }
-            AlterTableType::AtDropColumn => {
-                ast::AlterTableBody::DropColumn(ast::Name::from_string(&cmd.name))
-            }
+            AlterTableType::AtDropColumn => Ok(ast::AlterTableBody::DropColumn(
+                ast::Name::from_string(&cmd.name),
+            )),
             AlterTableType::AtAlterColumnType => {
-                // ALTER TABLE t ALTER COLUMN c TYPE new_type
-                // Map to AlterColumn with the new column definition
                 let col_def = match &cmd.def {
                     Some(def_node) => match &def_node.node {
                         Some(Node::ColumnDef(cd)) => cd,
@@ -580,40 +610,28 @@ impl PostgreSQLTranslator {
                     }
                 };
                 let col = self.translate_column_def(col_def)?;
-                ast::AlterTableBody::AlterColumn {
+                Ok(ast::AlterTableBody::AlterColumn {
                     old: ast::Name::from_string(&cmd.name),
                     new: col,
-                }
+                })
             }
-            AlterTableType::AtColumnDefault => {
-                return Err(ParseError::ParseError(
-                    "ALTER COLUMN SET/DROP DEFAULT is not supported".into(),
-                ));
-            }
-            AlterTableType::AtDropNotNull => {
-                return Err(ParseError::ParseError(
-                    "ALTER COLUMN DROP NOT NULL is not supported".into(),
-                ));
-            }
-            AlterTableType::AtSetNotNull => {
-                return Err(ParseError::ParseError(
-                    "ALTER COLUMN SET NOT NULL is not supported".into(),
-                ));
-            }
-            AlterTableType::AtAddConstraint => {
-                return Err(ParseError::ParseError(
-                    "ALTER TABLE ADD CONSTRAINT is not supported".into(),
-                ));
-            }
-            _ => {
-                return Err(ParseError::ParseError(format!(
-                    "ALTER TABLE {} is not supported",
-                    alter_subtype_name(subtype)
-                )));
-            }
-        };
-
-        Ok(ast::Stmt::AlterTable(ast::AlterTable { name, body }))
+            AlterTableType::AtColumnDefault => Err(ParseError::ParseError(
+                "ALTER COLUMN SET/DROP DEFAULT is not supported".into(),
+            )),
+            AlterTableType::AtDropNotNull => Err(ParseError::ParseError(
+                "ALTER COLUMN DROP NOT NULL is not supported".into(),
+            )),
+            AlterTableType::AtSetNotNull => Err(ParseError::ParseError(
+                "ALTER COLUMN SET NOT NULL is not supported".into(),
+            )),
+            AlterTableType::AtAddConstraint => Err(ParseError::ParseError(
+                "ALTER TABLE ADD CONSTRAINT is not supported".into(),
+            )),
+            _ => Err(ParseError::ParseError(format!(
+                "ALTER TABLE {} is not supported",
+                alter_subtype_name(subtype)
+            ))),
+        }
     }
 
     fn translate_rename_stmt(
@@ -658,8 +676,8 @@ impl PostgreSQLTranslator {
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
     ) -> Result<ast::ColumnDefinition, ParseError> {
-        use pg_query::protobuf::ConstrType;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
 
         let col_name = ast::Name::from_string(&col_def.colname);
 
@@ -789,8 +807,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_drop(&self, drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::ObjectType;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ObjectType;
 
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
@@ -3707,8 +3725,8 @@ impl PostgreSQLTranslator {
         &self,
         on_conflict: &Option<Box<pg_query::protobuf::OnConflictClause>>,
     ) -> Result<Option<Box<ast::Upsert>>, ParseError> {
-        use pg_query::protobuf::OnConflictAction;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::OnConflictAction;
 
         let clause = match on_conflict {
             Some(c) => c,
@@ -4217,8 +4235,8 @@ impl PostgreSQLTranslator {
         &self,
         domain: &pg_query::protobuf::CreateDomainStmt,
     ) -> Result<ast::Stmt, ParseError> {
-        use pg_query::protobuf::ConstrType;
         use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
 
         // Extract domain name (skip schema qualifiers like "pg_catalog")
         let mut domain_name = String::new();
@@ -4778,8 +4796,8 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
 
 /// Try to extract a RESET statement from a PG parse result.
 pub fn try_extract_reset(parse_result: &ParseResult) -> Option<PgResetStmt> {
-    use pg_query::NodeRef;
     use pg_query::protobuf::VariableSetKind;
+    use pg_query::NodeRef;
 
     if parse_result.protobuf.nodes().is_empty() {
         return None;
@@ -4852,8 +4870,8 @@ pub fn try_extract_create_schema(parse_result: &ParseResult) -> Option<PgCreateS
 
 /// Try to extract a DROP SCHEMA statement from pg_query parse output.
 pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchemaStmt> {
-    use pg_query::NodeRef;
     use pg_query::protobuf::{DropBehavior, ObjectType};
+    use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
     if nodes.is_empty() {
@@ -7074,6 +7092,26 @@ mod tests {
             }
         } else {
             panic!("Expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn test_alter_table_multi_add_column() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "ALTER TABLE t ADD COLUMN a INT, ADD COLUMN b INT";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate_stmts(&parsed).unwrap();
+        assert_eq!(translated.len(), 2);
+
+        for (stmt, expected_col) in translated.iter().zip(["a", "b"]) {
+            let ast::Stmt::AlterTable(alter) = stmt else {
+                panic!("Expected AlterTable");
+            };
+            assert_eq!(alter.name.name.as_str(), "t");
+            let ast::AlterTableBody::AddColumn(col) = &alter.body else {
+                panic!("Expected AddColumn, got: {:?}", alter.body);
+            };
+            assert_eq!(col.col_name.as_str(), expected_col);
         }
     }
 

@@ -2891,8 +2891,11 @@ impl<'a> QueryRunner<'a> {
 
         // Parse and translate through the standard PG path
         match self.conn.parse_postgresql_sql(sql) {
-            Ok(Some(cmd)) => Some(self.conn.run_cmd(cmd, sql)),
-            Ok(None) => Some(Ok(None)),
+            Ok(cmds) if cmds.is_empty() => Some(Ok(None)),
+            Ok(cmds) if cmds.len() > 1 => {
+                Some(self.conn.compile_and_run_cmds(cmds, sql).map(|_| None))
+            }
+            Ok(cmds) => Some(self.conn.run_cmd(cmds.into_iter().next().unwrap(), sql)),
             Err(e) => Some(Err(e)),
         }
     }

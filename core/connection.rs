@@ -646,20 +646,32 @@ impl Connection {
 
     /// Parse SQL using the appropriate parser based on the current sql_dialect setting
     /// Returns the parsed command and the number of bytes consumed
-    fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+    fn parse_sql(&self, sql: &str) -> Result<(Vec<Cmd>, usize)> {
         match self.get_sql_dialect() {
             SqlDialect::Sqlite => {
                 let mut parser = Parser::new(sql.as_bytes());
                 let cmd = parser.next_cmd()?;
                 let offset = parser.offset();
-                Ok((cmd, offset))
+                Ok((cmd.into_iter().collect(), offset))
             }
             SqlDialect::Postgres => {
-                let cmd = self.parse_postgresql_sql(sql)?;
+                let cmds = self.parse_postgresql_sql(sql)?;
                 // For PostgreSQL, we consume the entire input
-                Ok((cmd, sql.len()))
+                Ok((cmds, sql.len()))
             }
         }
+    }
+
+    pub(crate) fn compile_and_run_cmds(
+        self: &Arc<Self>,
+        cmds: Vec<Cmd>,
+        input: &str,
+    ) -> Result<()> {
+        for cmd in cmds {
+            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+        }
+        Ok(())
     }
 
     fn should_retry_cross_process_schema_lookup(
@@ -790,19 +802,22 @@ impl Connection {
                 }
             }
 
-            let (cmd, byte_offset_end) = self.parse_sql(sql)?;
-            let cmd = match cmd {
-                Some(cmd) => cmd,
-                None => {
-                    return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
-                    ));
-                }
-            };
+            let (cmds, byte_offset_end) = self.parse_sql(sql)?;
+            if cmds.is_empty() {
+                return Err(LimboError::InvalidArgument(
+                    "The supplied SQL string contains no statements".to_string(),
+                ));
+            }
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+            if cmds.len() > 1 {
+                self.compile_and_run_cmds(cmds, input)?;
+                return self
+                    .prepare_with_origin("SELECT 0 WHERE 0", StatementOrigin::InternalHelper);
+            }
+            let (program, pager, mode) =
+                self.compile_cmd(cmds.into_iter().next().unwrap(), input)?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1122,13 +1137,12 @@ impl Connection {
         }
 
         // Unified path: parse_sql routes to the right parser by dialect
-        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
-        if let Some(cmd) = cmd {
+        let (cmds, byte_offset_end) = self.parse_sql(sql)?;
+        if !cmds.is_empty() {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+            self.compile_and_run_cmds(cmds, input)?;
         }
         Ok(())
     }
@@ -1148,14 +1162,18 @@ impl Connection {
             }
         }
 
-        let (cmd, byte_offset_end) = self.parse_sql(sql)?;
+        let (cmds, byte_offset_end) = self.parse_sql(sql)?;
         let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        match cmd {
-            Some(cmd) => self.run_cmd(cmd, input),
-            None => Ok(None),
+        if cmds.is_empty() {
+            return Ok(None);
         }
+        if cmds.len() > 1 {
+            self.compile_and_run_cmds(cmds, input)?;
+            return Ok(None);
+        }
+        self.run_cmd(cmds.into_iter().next().unwrap(), input)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -1194,13 +1212,12 @@ impl Connection {
             }
             // PG path: single statement (multi-statement splitting is handled
             // by the PG wire layer's split_statements)
-            let (cmd, byte_offset_end) = self.parse_sql(sql)?;
-            if let Some(cmd) = cmd {
+            let (cmds, byte_offset_end) = self.parse_sql(sql)?;
+            if !cmds.is_empty() {
                 let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                     .unwrap()
                     .trim();
-                let (program, pager, mode) = self.compile_cmd(cmd, input)?;
-                Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+                self.compile_and_run_cmds(cmds, input)?;
             }
             return Ok(());
         }
@@ -1223,14 +1240,19 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, usize)>> {
-        let (cmd, byte_offset_end) = self.parse_sql(sql.as_ref())?;
-        let Some(cmd) = cmd else {
+        let (cmds, byte_offset_end) = self.parse_sql(sql.as_ref())?;
+        if cmds.is_empty() {
             return Ok(None);
-        };
+        }
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input)?;
+        if cmds.len() > 1 {
+            self.compile_and_run_cmds(cmds, input)?;
+            let stmt = self.prepare_internal("SELECT 0 WHERE 0")?;
+            return Ok(Some((stmt, byte_offset_end)));
+        }
+        let (program, pager, mode) = self.compile_cmd(cmds.into_iter().next().unwrap(), input)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
