@@ -3849,3 +3849,41 @@ fn test_postgres_is_true_false_truth_semantics(db: TempDatabase) {
     };
     assert_eq!(*value, 0, "2 IS FALSE should be false");
 }
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_truncate_multi_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t1 (id, value) VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    conn.execute("INSERT INTO t2 (id, value) VALUES (10, 'x'), (20, 'y'), (30, 'z')")
+        .unwrap();
+
+    conn.execute("TRUNCATE t1, t2").unwrap();
+
+    let mut rows = conn.query("SELECT COUNT(*) FROM t1").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row count for t1");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
+        panic!("expected integer count for t1");
+    };
+    assert_eq!(*count, 0);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT COUNT(*) FROM t2").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row count for t2");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
+        panic!("expected integer count for t2");
+    };
+    assert_eq!(*count, 0);
+}
