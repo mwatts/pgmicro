@@ -1301,8 +1301,11 @@ impl PostgreSQLTranslator {
 
         let order_by = self.translate_order_by(&select.sort_clause)?;
 
-        let distinctness = if !select.distinct_clause.is_empty() {
+        let distinct_on = self.distinct_on_exprs(&select.distinct_clause)?;
+        let distinctness = if Self::is_plain_distinct(&select.distinct_clause) {
             Some(ast::Distinctness::Distinct)
+        } else if select.distinct_clause.is_empty() {
+            None
         } else {
             None
         };
@@ -1312,6 +1315,8 @@ impl PostgreSQLTranslator {
         let window_clause = self.translate_window_clause(&select.window_clause)?;
 
         let limit = self.translate_limit(&select.limit_count, &select.limit_offset)?;
+
+        let outer_result_columns = result_columns.clone();
 
         let one_select = ast::OneSelect::Select {
             distinctness,
@@ -1329,12 +1334,18 @@ impl PostgreSQLTranslator {
 
         let with = self.translate_with_clause(&select.with_clause)?;
 
-        Ok(ast::Select {
+        let mut result = ast::Select {
             with,
             body: select_body,
             order_by,
             limit,
-        })
+        };
+
+        if !distinct_on.is_empty() {
+            result = self.wrap_distinct_on(result, distinct_on, outer_result_columns)?;
+        }
+
+        Ok(result)
     }
 
     fn translate_set_operation(
@@ -3383,6 +3394,176 @@ impl PostgreSQLTranslator {
                 }
             }
         }
+    }
+
+    fn is_plain_distinct(distinct_clause: &[pg_query::protobuf::Node]) -> bool {
+        distinct_clause.len() == 1 && distinct_clause[0].node.is_none()
+    }
+
+    fn distinct_on_exprs(
+        &self,
+        distinct_clause: &[pg_query::protobuf::Node],
+    ) -> Result<Vec<Box<ast::Expr>>, ParseError> {
+        if distinct_clause.is_empty() || Self::is_plain_distinct(distinct_clause) {
+            return Ok(vec![]);
+        }
+        distinct_clause
+            .iter()
+            .map(|node| Ok(Box::new(self.translate_expr(node)?)))
+            .collect()
+    }
+
+    fn suggest_expr_alias(expr: &ast::Expr, fallback: &str) -> String {
+        match expr {
+            ast::Expr::Id(name) => name.as_str().to_string(),
+            _ => fallback.to_string(),
+        }
+    }
+
+    fn result_column_matches_expr(col: &ast::ResultColumn, expr: &ast::Expr) -> bool {
+        matches!(col, ast::ResultColumn::Expr(e, _) if **e == *expr)
+    }
+
+    fn ensure_result_column(columns: &mut Vec<ast::ResultColumn>, expr: &ast::Expr, alias: &str) {
+        if columns
+            .iter()
+            .any(|col| Self::result_column_matches_expr(col, expr))
+        {
+            return;
+        }
+        columns.push(ast::ResultColumn::Expr(
+            Box::new(expr.clone()),
+            Some(ast::As::As(ast::Name::from_string(alias))),
+        ));
+    }
+
+    fn qualify_expr_for_subquery(expr: Box<ast::Expr>, sub_alias: &str) -> Box<ast::Expr> {
+        match *expr {
+            ast::Expr::Id(name) => Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(sub_alias),
+                name,
+            )),
+            other => Box::new(other),
+        }
+    }
+
+    fn qualify_result_column(col: ast::ResultColumn, sub_alias: &str) -> ast::ResultColumn {
+        match col {
+            ast::ResultColumn::Expr(expr, alias) => {
+                let col_name = alias.as_ref().map(|a| a.name().clone()).unwrap_or_else(|| {
+                    match *expr {
+                        ast::Expr::Id(name) => name,
+                        _ => ast::Name::from_string("column"),
+                    }
+                });
+                ast::ResultColumn::Expr(
+                    Box::new(ast::Expr::Qualified(
+                        ast::Name::from_string(sub_alias),
+                        col_name,
+                    )),
+                    alias,
+                )
+            }
+            other => other,
+        }
+    }
+
+    /// Rewrite `DISTINCT ON` using `row_number() OVER (PARTITION BY ... ORDER BY ...)`.
+    fn wrap_distinct_on(
+        &self,
+        mut inner: ast::Select,
+        distinct_on: Vec<Box<ast::Expr>>,
+        outer_columns: Vec<ast::ResultColumn>,
+    ) -> Result<ast::Select, ParseError> {
+        const SUB_ALIAS: &str = "__pgmicro_distinct_on";
+        const RN_COL: &str = "__pgmicro_rn";
+
+        if inner.order_by.is_empty() {
+            return Err(ParseError::ParseError(
+                "SELECT DISTINCT ON requires an ORDER BY clause".to_string(),
+            ));
+        }
+
+        let ast::OneSelect::Select {
+            ref mut columns,
+            ref mut distinctness,
+            ..
+        } = inner.body.select
+        else {
+            return Err(ParseError::ParseError(
+                "DISTINCT ON is not supported with VALUES or compound SELECT".to_string(),
+            ));
+        };
+        *distinctness = None;
+
+        for (i, expr) in distinct_on.iter().enumerate() {
+            let alias = Self::suggest_expr_alias(expr, &format!("__pgmicro_on_{i}"));
+            Self::ensure_result_column(columns, expr, &alias);
+        }
+
+        let window = ast::Window {
+            base: None,
+            partition_by: distinct_on,
+            order_by: inner.order_by.clone(),
+            frame_clause: None,
+        };
+        columns.push(ast::ResultColumn::Expr(
+            Box::new(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("row_number"),
+                distinctness: None,
+                args: vec![],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: Some(ast::Over::Window(window)),
+                },
+            }),
+            Some(ast::As::As(ast::Name::from_string(RN_COL))),
+        ));
+
+        let outer_order_by = std::mem::take(&mut inner.order_by)
+            .into_iter()
+            .map(|mut sorted| {
+                sorted.expr = Self::qualify_expr_for_subquery(sorted.expr, SUB_ALIAS);
+                sorted
+            })
+            .collect();
+        let outer_limit = inner.limit.take();
+
+        let rn_filter = ast::Expr::Binary(
+            Box::new(ast::Expr::Qualified(
+                ast::Name::from_string(SUB_ALIAS),
+                ast::Name::from_string(RN_COL),
+            )),
+            ast::Operator::Equals,
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+        );
+
+        Ok(ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: outer_columns
+                        .into_iter()
+                        .map(|col| Self::qualify_result_column(col, SUB_ALIAS))
+                        .collect(),
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Select(
+                            inner,
+                            Some(ast::As::As(ast::Name::from_string(SUB_ALIAS))),
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: Some(Box::new(rn_filter)),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: outer_order_by,
+            limit: outer_limit,
+        })
     }
 
     fn translate_order_by(
