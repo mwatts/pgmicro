@@ -3,7 +3,10 @@ use crate::{
     schema::{BTreeCharacteristics, BTreeTable},
     sync::Arc,
     translate::{
-        aggregation::emit_ungrouped_aggregation,
+        aggregation::{
+            aggregates_need_input_sort, emit_ungrouped_agg_order_accumulate,
+            emit_ungrouped_aggregation, init_ungrouped_agg_order_sorter,
+        },
         emitter::{
             build_rowid_column, init_exists_result_regs, init_limit, Column, CursorID, CursorType,
             MaterializedBuildInput, MaterializedBuildInputMode, MaterializedColumnRef,
@@ -178,6 +181,9 @@ pub fn emit_query<'a>(
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
+        if aggregates_need_input_sort(&plan.aggregates) {
+            init_ungrouped_agg_order_sorter(program, t_ctx, plan)?;
+        }
     } else if let Some(window) = &plan.window {
         EmitWindow::init(
             program,
@@ -282,6 +288,9 @@ pub fn emit_query<'a>(
         group_by_emit_row_phase(program, t_ctx, plan, &mut grouped_output_subqueries)?;
     } else if !plan.aggregates.is_empty() {
         // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
+        if aggregates_need_input_sort(&plan.aggregates) {
+            emit_ungrouped_agg_order_accumulate(program, t_ctx, plan)?;
+        }
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
     } else if plan.window.is_some() {
         emit_window_results(program, t_ctx, plan)?;

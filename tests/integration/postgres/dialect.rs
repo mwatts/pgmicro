@@ -79,6 +79,69 @@ fn test_postgres_arithmetic_expression(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_aggregate_order_by(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t(x INT, y INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 3), (2, 1), (3, 2)")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT array_agg(x ORDER BY y) FROM t")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(array) = row.get_value(0) else {
+        panic!("expected text array, got {:?}", row.get_value(0));
+    };
+    assert_eq!(
+        array.as_str(),
+        "{2,3,1}",
+        "array_agg should order elements by y"
+    );
+    drop(rows);
+
+    conn.execute("CREATE TABLE g(g INT, x INT, y INT)").unwrap();
+    conn.execute("INSERT INTO g VALUES (1, 10, 3), (1, 20, 1), (1, 30, 2), (2, 40, 2), (2, 50, 1)")
+        .unwrap();
+
+    let mut rows = conn
+        .query("SELECT g, array_agg(x ORDER BY y) FROM g GROUP BY g ORDER BY g")
+        .unwrap()
+        .unwrap();
+
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected first row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(g)) = row.get_value(0) else {
+        panic!("expected integer group key");
+    };
+    assert_eq!(*g, 1);
+    let Value::Text(array) = row.get_value(1) else {
+        panic!("expected text array, got {:?}", row.get_value(1));
+    };
+    assert_eq!(array.as_str(), "{20,30,10}");
+
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected second row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(g)) = row.get_value(0) else {
+        panic!("expected integer group key");
+    };
+    assert_eq!(*g, 2);
+    let Value::Text(array) = row.get_value(1) else {
+        panic!("expected text array, got {:?}", row.get_value(1));
+    };
+    assert_eq!(array.as_str(), "{50,40}");
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_greatest_least(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = postgres").unwrap();
