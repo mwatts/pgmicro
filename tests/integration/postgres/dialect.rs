@@ -1,5 +1,5 @@
-use crate::common::{ExecRows, TempDatabase};
-use turso_core::{Numeric, StepResult, Value};
+use crate::common::{limbo_exec_rows_fallible, ExecRows, TempDatabase};
+use turso_core::{LimboError, Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
 fn test_postgres_pragma(db: TempDatabase) {
@@ -178,6 +178,50 @@ fn test_postgres_greatest_least(db: TempDatabase) {
         "expected NULL for GREATEST with NULL arg, got {:?}",
         row.get_value(0)
     );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_gcd_lcm(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    let mut rows = conn.query("SELECT gcd(12, 18)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 6);
+    drop(rows);
+
+    let mut rows = conn.query("SELECT lcm(4, 6)").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
+        panic!("expected integer value, got {:?}", row.get_value(0));
+    };
+    assert_eq!(*value, 12);
+    drop(rows);
+
+    let err = limbo_exec_rows_fallible(
+        &db,
+        &conn,
+        "SELECT gcd((-9223372036854775807::bigint - 1::bigint), 0::bigint)",
+    )
+    .expect_err("gcd(INT_MIN, 0) should raise integer overflow");
+    assert!(matches!(err, LimboError::IntegerOverflow));
+
+    let err = limbo_exec_rows_fallible(
+        &db,
+        &conn,
+        "SELECT lcm(9223372036854775807::bigint, 2::bigint)",
+    )
+    .expect_err("lcm(INT_MAX, 2) should raise integer overflow");
+    assert!(matches!(err, LimboError::IntegerOverflow));
 }
 
 #[turso_macros::test(mvcc)]
