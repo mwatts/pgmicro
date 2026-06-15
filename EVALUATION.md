@@ -7,21 +7,21 @@ server, and a REPL with psql meta-commands.
 
 ## Does it work?
 
-Yes, for core OLTP. ~400 tests, exercised end-to-end (binary stdin/stdout, Connection API,
-wire TCP). Real coverage of SELECT/INSERT/UPDATE/DELETE, DDL, CTEs, UNION, window functions,
-subqueries, arrays, schemas, catalog tables, COPY FROM. Not a demo — the actual execution
-path is sound. The architecture (translate AST directly, never re-serialize SQL) is the
-right call.
+Yes, for core OLTP. ~400+ tests, exercised end-to-end (binary stdin/stdout, Connection API,
+wire TCP). Real coverage of SELECT/INSERT/UPDATE/DELETE, DDL, CTEs, UNION/INTERSECT/EXCEPT
+(including ALL), window functions, subqueries, arrays, schemas, catalog tables, COPY FROM.
+Not a demo — the actual execution path is sound. The architecture (translate AST directly,
+never re-serialize SQL) is the right call.
 
 ## What it actually does
 
 | Layer | Real capability |
 |---|---|
-| Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT |
+| Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT, GREATEST/LEAST, DISTINCT ON |
 | Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; ~12 stubs for psql compat |
 | Wire | Simple + Extended query protocol, multi-statement, trust auth (localhost-only; no TLS) |
 | REPL | 19 `\` meta-commands, all tested |
-| Schemas | CREATE/DROP SCHEMA → ATTACH separate `.db` files |
+| Schemas | CREATE/DROP SCHEMA → ATTACH separate `.db` files; `search_path` drives unqualified resolution |
 
 ## Gaps — by severity
 
@@ -52,26 +52,34 @@ right call.
 **Fixed:**
 
 - **`NOT IN (subquery)` / `<> ALL (subquery)`** — `AllSublink` and `InSelect` now set
-  `not: true`; `NOT` over `IN` subquery/list is folded correctly. Keyword `NOT IN` often
-  worked via `NOT (IN …)`; the main gap was operator form and explicit `not` on `InSelect`.
-- **NULLS FIRST/LAST in ORDER BY** — `translate_sort_nulls()` maps PG defaults (ASC → NULLS
-  LAST, DESC → NULLS FIRST) and explicit `NULLS FIRST`/`LAST` to Turso `NullsOrder`.
-- **DISTINCT ON** — rewritten via `row_number() OVER (PARTITION BY … ORDER BY …)` subquery
-  (`wrap_distinct_on()`). Requires `ORDER BY`; not supported on VALUES or compound SELECT.
+  `not: true`; `NOT` over `IN` subquery/list is folded correctly.
+- **NULLS FIRST/LAST in ORDER BY** — `translate_sort_nulls()` maps PG defaults and explicit
+  `NULLS FIRST`/`LAST` to Turso `NullsOrder`.
+- **DISTINCT ON** — `row_number()` rewrite (`wrap_distinct_on()`). Requires `ORDER BY`; not
+  supported on VALUES or compound SELECT.
+- **INTERSECT ALL / EXCEPT ALL** — rewritten via `row_number()` / `COUNT()` subqueries
+  (`fold_intersect_all`, `fold_except_all`); preserves duplicate multiplicity.
+- **GREATEST / LEAST** — dedicated variadic `greatest`/`least` scalars in
+  `core/functions/postgres.rs` (PG NULL semantics: any NULL arg → NULL).
+- **Multi-table TRUNCATE** — `try_prepare_pg` intercepts multi-relation `TRUNCATE` and runs
+  `DELETE FROM` on each table sequentially.
+- **Multi-command ALTER TABLE** — `translate_stmts()` emits one `AlterTable` per command;
+  `compile_and_run_cmds()` executes all.
+- **`= ANY(array)`** — `expr = ANY(array)` → `array_contains(array, expr)`; subquery form
+  still uses existing `SubLink` path.
+- **`IS TRUE` / `IS FALSE`** — maps to `Literal::True`/`False` so `Insn::IsTrue` applies PG
+  truth semantics (any non-zero number is true).
+
+**Partially fixed:**
+
+- **Aggregate ORDER BY** — `FuncCall.agg_order` is translated into `FunctionCall.order_by`, but
+  `core/translate/planner.rs` still rejects aggregate ORDER BY at execution
+  (`"ORDER BY clause is not supported yet in aggregate functions"`). `array_agg(x ORDER BY y)`
+  parses correctly but does not run end-to-end yet.
 
 **Remaining:**
 
-- **INTERSECT/EXCEPT ALL lose ALL**, `translator.rs:1405`. Dedups where PG would not.
-- **GREATEST/LEAST → scalar MAX/MIN**, `translator.rs:2002`. SQLite scalar max/min take 2
-  args; 3+ args invoke the aggregate → wrong/error. NULL semantics differ too.
-- **Multi-table TRUNCATE / multi-cmd ALTER**: only first item processed silently
-  (`translator.rs:857`, `:503`).
-- **Aggregate ORDER BY dropped** — `array_agg(x ORDER BY y)` loses ordering,
-  `translator.rs:2761`.
-- **`= ANY(array)` stubbed to `0`** (always false), `translator.rs:2228`. Hack for catalog
-  stubs, misfires on real queries.
-- **`IS TRUE` → `IS 1`**: value `2` (truthy in PG) fails the test, `translator.rs:1955`.
-- **MONEY→REAL, INTERVAL→TEXT**: interval arithmetic breaks; money rounds.
+- **MONEY→REAL, INTERVAL→TEXT** — interval arithmetic breaks; money rounds.
 
 ### Wire protocol fidelity
 
@@ -101,23 +109,24 @@ right call.
 
 ### Dialect / schema mechanism
 
-**Partially fixed:**
+**Fixed:**
 
 - **`SET`/`SHOW`/`RESET`/`RESET ALL` for `search_path`** — stored on `Connection.pg_search_path`;
-  `SHOW search_path` and `RESET` (including `RESET ALL`) work. Other `RESET name` is a no-op.
-  **`SET LOCAL search_path`** is accepted but session-scoped (not rolled back with the txn).
-- **Unqualified name resolution** still hardcodes `public` — `search_path` is not wired into
-  table/column lookup yet.
+  `SHOW`/`RESET` work. Other `RESET name` is a no-op.
+- **Unqualified name resolution** — `Resolver` walks `search_path` order in Postgres mode
+  (`public` → main DB, schema names → attached DBs).
+- **`SET LOCAL search_path`** — transaction-scoped; restored on `COMMIT`/`ROLLBACK` via
+  `pg_search_path_local_saved` stack.
 
 **Remaining:**
 
-- **`SET LOCAL` transaction scope** — values persist for the connection lifetime; psycopg2
-  `SET LOCAL` inside a txn does not restore on rollback.
+- **`SET LOCAL` for other GUCs** — only `search_path` has txn-local restore; other `SET LOCAL`
+  still leaks to session scope.
 - **Cross-schema txns not atomic** — separate ATTACH WAL files, partial commit possible,
   undocumented.
 - **`:memory:` + CREATE SCHEMA** writes a physical file to cwd; sessions collide.
-- **`parse_postgresql_sql` translates only `nodes()[0]`** — direct multi-statement `prepare()`
-  silently drops the rest.
+- **Multi-statement `prepare()`** — `translate_stmts()` handles multi-command ALTER; most
+  other statement types still use `nodes()[0]` only.
 
 ### Validation bugs
 
@@ -135,18 +144,32 @@ right call.
 - `information_schema.tables → sqlite_master` map (`translator.rs:81`) is **dead** — schema
   prefix is stripped before it's reached.
 
+## Next wave (queued)
+
+Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash merge.
+
+| # | Branch | Scope | Notes |
+|---|--------|-------|-------|
+| 1 | `fix/aggregate-order-by-exec` | `core/translate/planner.rs` | Enable aggregate ORDER BY in planner/VDBE; completes #9 |
+| 2 | `fix/sqlstate-codes` | `cli/pg_server.rs` | Map `LimboError` variants to PG SQLSTATE (syntax, undefined_table, constraint, etc.) |
+| 3 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
+| 4 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
+| 5 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
+
 ## Bottom line
 
-Core engine works and the design is clean — direct-to-AST translation on a real DB is
-genuinely useful, not faked. The gaps cluster in three buckets:
+Core engine works and the design is clean. The major silent-correctness cluster from the
+original eval (NOT IN, NULLS, DISTINCT ON, set-op ALL, GREATEST/LEAST, ANY(array), TRUNCATE,
+ALTER, IS TRUE, search_path) is now fixed or partially fixed.
 
-1. **Silent wrong-answer translations** (set-op ALL, GREATEST/LEAST, `= ANY(array)`, multi-table
-   TRUNCATE) — violate the project's own "reject loudly over wrong results" principle. Highest
-   priority now that NOT IN, NULLS ordering, DISTINCT ON, and schema path traversal are fixed.
+Remaining gaps cluster in three buckets:
+
+1. **Execution gaps** (aggregate ORDER BY planner, INTERVAL/MONEY types) — translation is
+   often done; runtime/compiler support lags.
 2. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
-   search_path resolution) — ORMs/typed drivers misbehave; psql mostly survives.
+   `pg_database` attached schemas) — ORMs/typed drivers misbehave; psql mostly survives.
 3. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; prepared-statement
    schema file cleanup.
 
-Strongest part: translator breadth + test depth. Weakest: silent-correctness shortcuts in the
-translator and wire-protocol tooling fidelity.
+Strongest part: translator breadth + test depth + rapid correctness fixes on `pgmicro-fixes`.
+Weakest: wire-protocol tooling fidelity and catalog completeness for ORM/framework startup.
