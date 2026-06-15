@@ -1496,6 +1496,7 @@ pub fn emit_from_clause_subquery(
                     .map(|_| None)
                     .collect(),
                 meta_sort: None,
+                meta_agg_order: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
                 reg_result_cols_start: None,
@@ -1582,6 +1583,7 @@ fn emit_indexed_materialized_subquery(
                     .map(|_| None)
                     .collect(),
                 meta_sort: None,
+                meta_agg_order: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
                 reg_result_cols_start: None,
@@ -1675,6 +1677,7 @@ fn emit_materialized_subquery_table(
                     .map(|_| None)
                     .collect(),
                 meta_sort: None,
+                meta_agg_order: None,
                 reg_agg_start: None,
                 reg_nonagg_emit_once_flag: None,
                 reg_result_cols_start: None,

@@ -1,12 +1,14 @@
-use turso_parser::ast;
+use turso_parser::ast::{self, SortOrder};
 
 use crate::{
     function::AggFunc,
-    schema::Table,
-    translate::collate::CollationSeq,
+    schema::{PseudoCursorType, Table},
+    translate::collate::{get_collseq_from_expr, CollationSeq},
+    util::exprs_are_equivalent,
     vdbe::{
-        builder::ProgramBuilder,
+        builder::{CursorType, ProgramBuilder},
         insn::{HashDistinctData, Insn},
+        BranchOffset,
     },
     LimboError, Result,
 };
@@ -17,9 +19,305 @@ use super::{
         resolve_expr, translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
     },
+    order_by::{custom_type_comparator, sorter_insert},
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
+
+/// Metadata for sorting aggregate inputs before accumulation (ungrouped queries).
+#[derive(Debug)]
+pub struct AggOrderMetadata {
+    pub sort_cursor: usize,
+    pub reg_sorter_key: usize,
+    pub sorter_column_count: usize,
+    pub pseudo_cursor: usize,
+    pub reg_row_start: usize,
+    pub label_sort_loop_start: BranchOffset,
+    pub label_sort_loop_end: BranchOffset,
+}
+
+pub fn aggregates_need_input_sort(aggregates: &[Aggregate]) -> bool {
+    aggregates.iter().any(|agg| !agg.order_by.is_empty())
+}
+
+pub(crate) fn aggregate_order_by_sort_key<'a>(
+    aggregates: &'a [Aggregate],
+) -> Result<&'a [(ast::Expr, SortOrder, Option<ast::NullsOrder>)]> {
+    let Some(key) = aggregates
+        .iter()
+        .find(|agg| !agg.order_by.is_empty())
+        .map(|agg| agg.order_by.as_slice())
+    else {
+        return Ok(&[]);
+    };
+
+    for agg in aggregates {
+        if agg.order_by.is_empty() {
+            continue;
+        }
+        if agg.order_by.len() != key.len()
+            || !agg
+                .order_by
+                .iter()
+                .zip(key)
+                .all(|((a, oa, na), (b, ob, nb))| {
+                    exprs_are_equivalent(a, b) && oa == ob && na == nb
+                })
+        {
+            crate::bail_parse_error!("conflicting ORDER BY clauses in aggregate functions");
+        }
+    }
+    Ok(key)
+}
+
+pub fn init_ungrouped_agg_order_sorter(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let sort_key = aggregate_order_by_sort_key(&plan.aggregates)?;
+    let sort_key_len = sort_key.len();
+    let agg_arg_count: usize = plan.aggregates.iter().map(|agg| agg.args.len()).sum();
+    let sorter_column_count = sort_key_len + 1 + agg_arg_count;
+
+    let mut order_collations_nulls: Vec<(
+        SortOrder,
+        Option<CollationSeq>,
+        Option<ast::NullsOrder>,
+    )> = sort_key
+        .iter()
+        .map(|(expr, order, nulls)| {
+            let collation = get_collseq_from_expr(expr, &plan.table_references)?;
+            Ok((*order, collation, *nulls))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    order_collations_nulls.push((SortOrder::Asc, Some(CollationSeq::default()), None));
+
+    let mut comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>> = sort_key
+        .iter()
+        .map(|(expr, _, _)| {
+            custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
+        })
+        .collect();
+    comparators.push(None);
+
+    let sort_cursor = program.alloc_cursor_id(CursorType::Sorter);
+    program.emit_insn(Insn::SorterOpen {
+        cursor_id: sort_cursor,
+        columns: sorter_column_count,
+        order_collations_nulls,
+        comparators,
+    });
+
+    let reg_row_start = program.alloc_registers(sorter_column_count);
+    t_ctx.meta_agg_order = Some(AggOrderMetadata {
+        sort_cursor,
+        reg_sorter_key: program.alloc_register(),
+        sorter_column_count,
+        pseudo_cursor: program.alloc_cursor_id(CursorType::Pseudo(PseudoCursorType {
+            column_count: sorter_column_count,
+        })),
+        reg_row_start,
+        label_sort_loop_start: program.allocate_label(),
+        label_sort_loop_end: program.allocate_label(),
+    });
+    Ok(())
+}
+
+pub fn emit_ungrouped_agg_order_insert(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let meta = t_ctx
+        .meta_agg_order
+        .as_ref()
+        .expect("aggregate ORDER BY metadata must be initialized");
+    let mut cur_reg = meta.reg_row_start;
+
+    for (expr, _, _) in aggregate_order_by_sort_key(&plan.aggregates)? {
+        translate_expr(
+            program,
+            Some(&plan.table_references),
+            expr,
+            cur_reg,
+            &t_ctx.resolver,
+        )?;
+        cur_reg += 1;
+    }
+
+    program.emit_insn(Insn::Sequence {
+        cursor_id: meta.sort_cursor,
+        target_reg: cur_reg,
+    });
+    cur_reg += 1;
+
+    for agg in &plan.aggregates {
+        for arg in &agg.args {
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                arg,
+                cur_reg,
+                &t_ctx.resolver,
+            )?;
+            cur_reg += 1;
+        }
+    }
+
+    sorter_insert(
+        program,
+        meta.reg_row_start,
+        meta.sorter_column_count,
+        meta.sort_cursor,
+        meta.reg_sorter_key,
+    );
+    Ok(())
+}
+
+pub fn emit_ungrouped_agg_order_accumulate(
+    program: &mut ProgramBuilder,
+    t_ctx: &mut TranslateCtx,
+    plan: &SelectPlan,
+) -> Result<()> {
+    let AggOrderMetadata {
+        sort_cursor,
+        reg_sorter_key,
+        sorter_column_count,
+        pseudo_cursor,
+        label_sort_loop_start,
+        label_sort_loop_end,
+        ..
+    } = t_ctx
+        .meta_agg_order
+        .as_ref()
+        .expect("aggregate ORDER BY metadata");
+
+    let sort_key_len = aggregate_order_by_sort_key(&plan.aggregates)?.len();
+
+    program.emit_insn(Insn::OpenPseudo {
+        cursor_id: *pseudo_cursor,
+        content_reg: *reg_sorter_key,
+        num_fields: *sorter_column_count,
+    });
+    program.emit_insn(Insn::SorterSort {
+        cursor_id: *sort_cursor,
+        pc_if_empty: *label_sort_loop_end,
+    });
+    program.preassign_label_to_next_insn(*label_sort_loop_start);
+
+    program.emit_insn(Insn::SorterData {
+        cursor_id: *sort_cursor,
+        dest_reg: *reg_sorter_key,
+        pseudo_cursor: *pseudo_cursor,
+    });
+
+    let mut arg_offset = sort_key_len + 1;
+    for (i, agg) in plan.aggregates.iter().enumerate() {
+        let agg_start_reg = t_ctx
+            .reg_agg_start
+            .expect("aggregate registers must be initialized");
+        let agg_result_reg = agg_start_reg + i;
+
+        let filter_skip_label = if let Some(filter_expr) = &agg.filter_expr {
+            let label = program.allocate_label();
+            let filter_reg = program.alloc_register();
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                filter_expr,
+                filter_reg,
+                &t_ctx.resolver,
+            )?;
+            program.emit_insn(Insn::IfNot {
+                reg: filter_reg,
+                target_pc: label,
+                jump_if_null: true,
+            });
+            Some(label)
+        } else {
+            None
+        };
+
+        let arg_reg = program.alloc_register();
+        program.emit_column_or_rowid(*pseudo_cursor, arg_offset, arg_reg);
+        arg_offset += agg.args.len();
+
+        let agg_arg_source =
+            AggArgumentSource::new_from_expression(&agg.func, &agg.args, &agg.distinctness);
+        handle_distinct(program, agg_arg_source.distinctness(), arg_reg);
+        translate_aggregation_step_from_reg(
+            program,
+            &plan.table_references,
+            agg_arg_source,
+            arg_reg,
+            agg_result_reg,
+            &t_ctx.resolver,
+        )?;
+
+        if let Distinctness::Distinct { ctx } = &agg.distinctness {
+            let ctx = ctx
+                .as_ref()
+                .expect("distinct aggregate context not populated");
+            program.preassign_label_to_next_insn(ctx.label_on_conflict);
+        }
+
+        if let Some(label) = filter_skip_label {
+            program.preassign_label_to_next_insn(label);
+        }
+    }
+
+    program.emit_insn(Insn::SorterNext {
+        cursor_id: *sort_cursor,
+        pc_if_next: *label_sort_loop_start,
+    });
+    program.preassign_label_to_next_insn(*label_sort_loop_end);
+    Ok(())
+}
+
+fn translate_aggregation_step_from_reg(
+    program: &mut ProgramBuilder,
+    referenced_tables: &TableReferences,
+    agg_arg_source: AggArgumentSource,
+    arg_reg: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let func = agg_arg_source.agg_func();
+    let num_args = agg_arg_source.num_args();
+    let delimiter_reg = match func {
+        AggFunc::GroupConcat if num_args == 2 => {
+            agg_arg_source.translate(program, referenced_tables, resolver, 1)?
+        }
+        AggFunc::StringAgg if num_args == 2 => {
+            agg_arg_source.translate(program, referenced_tables, resolver, 1)?
+        }
+        _ => 0,
+    };
+
+    if matches!(func, AggFunc::ArrayAgg) {
+        resolver.require_custom_types("Array features")?;
+    }
+
+    let comparator = match func {
+        AggFunc::Min | AggFunc::Max => {
+            let expr = agg_arg_source.arg_at(0);
+            emit_collseq_if_needed(program, referenced_tables, expr);
+            super::order_by::custom_type_comparator(expr, referenced_tables, resolver.schema())
+        }
+        _ => None,
+    };
+
+    program.emit_insn(Insn::AggStep {
+        acc_reg: target_register,
+        col: arg_reg,
+        delimiter: delimiter_reg,
+        func: func.clone(),
+        comparator,
+    });
+    program.reset_collation();
+    Ok(())
+}
 
 /// Emits the bytecode for processing an aggregate without a GROUP BY clause.
 /// This is called when the main query execution loop has finished processing,

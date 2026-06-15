@@ -2894,6 +2894,8 @@ pub struct Aggregate {
     pub original_expr: ast::Expr,
     pub distinctness: Distinctness,
     pub filter_expr: Option<ast::Expr>,
+    /// ORDER BY terms inside the aggregate (e.g. `array_agg(x ORDER BY y)`).
+    pub order_by: Vec<(ast::Expr, SortOrder, Option<ast::NullsOrder>)>,
 }
 
 impl Aggregate {
@@ -2903,6 +2905,7 @@ impl Aggregate {
         expr: &Expr,
         distinctness: Distinctness,
         filter_expr: Option<ast::Expr>,
+        order_by: Vec<(ast::Expr, SortOrder, Option<ast::NullsOrder>)>,
     ) -> Self {
         Aggregate {
             func,
@@ -2910,6 +2913,7 @@ impl Aggregate {
             original_expr: expr.clone(),
             distinctness,
             filter_expr,
+            order_by,
         }
     }
 

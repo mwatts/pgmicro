@@ -1709,16 +1709,8 @@ fn validate_select_table_no_cross_db(
 }
 
 pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Result<()> {
-    walk_select_expressions(select_stmt, &mut |expr| {
-        if let ast::Expr::FunctionCall { order_by, .. } = expr {
-            if !order_by.is_empty() {
-                crate::bail_parse_error!(
-                    "ORDER BY clause is not supported yet in aggregate functions"
-                );
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
+    let _ = select_stmt;
+    Ok(())
 }
 
 pub fn validate_select_for_views(

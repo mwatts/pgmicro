@@ -70,12 +70,12 @@ never re-serialize SQL) is the right call.
 - **`IS TRUE` / `IS FALSE`** — maps to `Literal::True`/`False` so `Insn::IsTrue` applies PG
   truth semantics (any non-zero number is true).
 
-**Partially fixed:**
+**Fixed (continued):**
 
-- **Aggregate ORDER BY** — `FuncCall.agg_order` is translated into `FunctionCall.order_by`, but
-  `core/translate/planner.rs` still rejects aggregate ORDER BY at execution
-  (`"ORDER BY clause is not supported yet in aggregate functions"`). `array_agg(x ORDER BY y)`
-  parses correctly but does not run end-to-end yet.
+- **Aggregate ORDER BY** — `FuncCall.agg_order` is translated into `FunctionCall.order_by`;
+  planner stores `order_by` on `Aggregate` and emits a sorter path (ungrouped: dedicated
+  `AggOrderMetadata` sorter; grouped: extra sort keys on the GROUP BY sorter) so `AggStep`
+  runs in sorted order. `array_agg(x ORDER BY y)` works end-to-end.
 
 **Remaining:**
 
@@ -150,11 +150,10 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/aggregate-order-by-exec` | `core/translate/planner.rs` | Enable aggregate ORDER BY in planner/VDBE; completes #9 |
-| 2 | `fix/sqlstate-codes` | `cli/pg_server.rs` | Map `LimboError` variants to PG SQLSTATE (syntax, undefined_table, constraint, etc.) |
-| 3 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
-| 4 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
-| 5 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
+| 1 | `fix/sqlstate-codes` | `cli/pg_server.rs` | Map `LimboError` variants to PG SQLSTATE (syntax, undefined_table, constraint, etc.) |
+| 2 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
+| 3 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
+| 4 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
 
 ## Bottom line
 
@@ -164,8 +163,8 @@ ALTER, IS TRUE, search_path) is now fixed or partially fixed.
 
 Remaining gaps cluster in three buckets:
 
-1. **Execution gaps** (aggregate ORDER BY planner, INTERVAL/MONEY types) — translation is
-   often done; runtime/compiler support lags.
+1. **Execution gaps** (INTERVAL/MONEY types) — translation is often done; runtime/compiler
+   support lags.
 2. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
    `pg_database` attached schemas) — ORMs/typed drivers misbehave; psql mostly survives.
 3. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; prepared-statement

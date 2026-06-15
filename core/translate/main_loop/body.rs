@@ -1,6 +1,9 @@
 use crate::translate::plan::SimpleAggregate;
 use crate::translate::{
-    aggregation::emit_collseq_if_needed,
+    aggregation::{
+        aggregate_order_by_sort_key, aggregates_need_input_sort, emit_collseq_if_needed,
+        emit_ungrouped_agg_order_insert,
+    },
     order_by::{custom_type_comparator, EmitOrderBy},
     window::EmitWindow,
 };
@@ -18,6 +21,7 @@ use super::*;
 enum LoopEmitTarget {
     GroupBy,
     OrderBySorter,
+    AggOrderSorter,
     AggStep,
     Window,
     QueryResult,
@@ -101,6 +105,15 @@ impl<'prog, 'ctx, 'plan> LoopBody<'prog, 'ctx, 'plan> {
             return LoopEmitTarget::GroupBy;
         }
         if !self.plan.aggregates.is_empty() {
+            if aggregates_need_input_sort(&self.plan.aggregates)
+                && self
+                    .plan
+                    .group_by
+                    .as_ref()
+                    .is_none_or(|gb| gb.exprs.is_empty())
+            {
+                return LoopEmitTarget::AggOrderSorter;
+            }
             return LoopEmitTarget::AggStep;
         }
         if self.plan.window.is_some() {
@@ -171,6 +184,17 @@ fn emit_loop_source<'a>(
                     reg_sorter_key,
                     ..
                 } => {
+                    for (expr, _, _) in aggregate_order_by_sort_key(&plan.aggregates)? {
+                        let reg = cur_reg;
+                        cur_reg += 1;
+                        translate_expr(
+                            program,
+                            Some(&plan.table_references),
+                            expr,
+                            reg,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                     // Sorter path: store only unique leaf columns from aggregate args.
                     // Full expressions are re-evaluated from the pseudo cursor during aggregation.
                     for leaf_expr in t_ctx.agg_leaf_columns.iter() {
@@ -210,6 +234,10 @@ fn emit_loop_source<'a>(
                 }
             }
 
+            Ok(())
+        }
+        LoopEmitTarget::AggOrderSorter => {
+            emit_ungrouped_agg_order_insert(program, t_ctx, plan)?;
             Ok(())
         }
         LoopEmitTarget::OrderBySorter => {

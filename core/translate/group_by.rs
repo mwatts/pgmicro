@@ -7,7 +7,7 @@ use super::{
     result_row::emit_select_result,
 };
 use crate::translate::{
-    aggregation::{translate_aggregation_step, AggArgumentSource},
+    aggregation::{aggregate_order_by_sort_key, translate_aggregation_step, AggArgumentSource},
     order_by::{custom_type_comparator, EmitOrderBy},
     plan::{Aggregate, NonFromClauseSubquery},
     subquery::emit_non_from_clause_subqueries_for_phase,
@@ -137,13 +137,15 @@ impl EmitGroupBy {
         // END BLOCK
 
         let reg_sorter_key = program.alloc_register();
+        let agg_order_by_key = aggregate_order_by_sort_key(&plan.aggregates)?;
+        let agg_order_by_len = agg_order_by_key.len();
         let column_count = if !group_by.sort_elided {
             // Sorter path: store only unique leaf columns from aggregate args
             // instead of pre-computed expression results.
             t_ctx.agg_leaf_columns = collect_agg_leaf_columns(&plan.aggregates, plan)?;
-            t_ctx.non_aggregate_expressions.len() + t_ctx.agg_leaf_columns.len()
+            t_ctx.non_aggregate_expressions.len() + agg_order_by_len + t_ctx.agg_leaf_columns.len()
         } else {
-            plan.agg_args_count() + t_ctx.non_aggregate_expressions.len()
+            plan.agg_args_count() + t_ctx.non_aggregate_expressions.len() + agg_order_by_len
         };
         let reg_group_by_source_cols_start = program.alloc_registers(column_count);
 
@@ -158,7 +160,7 @@ impl EmitGroupBy {
              * then the collating sequence of the column is used to determine sort order.
              * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
              */
-            let order_collations_nulls: Vec<(
+            let mut order_collations_nulls: Vec<(
                 SortOrder,
                 Option<CollationSeq>,
                 Option<turso_parser::ast::NullsOrder>,
@@ -173,14 +175,26 @@ impl EmitGroupBy {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
+            for (expr, order, nulls) in agg_order_by_key {
+                let collation = get_collseq_from_expr(expr, &plan.table_references)?;
+                order_collations_nulls.push((*order, collation, *nulls));
+            }
+
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
-            let comparators = group_by
+            let mut comparators: Vec<Option<crate::vdbe::insn::SortComparatorType>> = group_by
                 .exprs
                 .iter()
                 .map(|expr| {
                     custom_type_comparator(expr, &plan.table_references, t_ctx.resolver.schema())
                 })
                 .collect();
+            for (expr, _, _) in agg_order_by_key {
+                comparators.push(custom_type_comparator(
+                    expr,
+                    &plan.table_references,
+                    t_ctx.resolver.schema(),
+                ));
+            }
 
             program.emit_insn(Insn::SorterOpen {
                 cursor_id: sort_cursor,
@@ -358,6 +372,9 @@ fn collect_agg_leaf_columns(aggregates: &[Aggregate], plan: &SelectPlan) -> Resu
     for agg in aggregates {
         for arg in &agg.args {
             walk_expr(arg, &mut collect)?;
+        }
+        for (expr, _, _) in &agg.order_by {
+            walk_expr(expr, &mut collect)?;
         }
         if let Some(filter_expr) = &agg.filter_expr {
             walk_expr(filter_expr, &mut collect)?;
@@ -702,7 +719,8 @@ pub fn group_by_process_single_group(
         GroupByRowSource::Sorter { pseudo_cursor, .. } => {
             // Read leaf columns from the pseudo cursor and cache them so that
             // translate_expr can resolve column references during expression evaluation.
-            let leaf_start_idx = t_ctx.non_aggregate_expressions.len();
+            let leaf_start_idx = t_ctx.non_aggregate_expressions.len()
+                + aggregate_order_by_sort_key(&plan.aggregates)?.len();
             let leaf_regs = program.alloc_registers(t_ctx.agg_leaf_columns.len());
             for i in 0..t_ctx.agg_leaf_columns.len() {
                 program.emit_column_or_rowid(*pseudo_cursor, leaf_start_idx + i, leaf_regs + i);

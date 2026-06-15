@@ -275,14 +275,15 @@ expect {
     300
 }
 
-@skip-if sqlite "sqlite supports ORDER BY in aggregate functions"
 @cross-check-integrity
-test view-rejects-aggregate-order-by {
+test view-aggregate-order-by {
     CREATE TABLE t(val INT);
+    INSERT INTO t VALUES (3), (1), (2);
     CREATE VIEW v AS SELECT SUM(val ORDER BY val) FROM t;
+    SELECT * FROM v;
 }
-expect error {
-    ORDER BY clause is not supported yet in aggregate functions
+expect {
+    6
 }
 
 test view-self-circle-detection {

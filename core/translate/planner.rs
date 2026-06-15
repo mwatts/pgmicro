@@ -34,7 +34,7 @@ use crate::{
 use smallvec::SmallVec;
 use turso_parser::ast::Literal::Null;
 use turso_parser::ast::{
-    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select,
+    self, As, Expr, FromClause, JoinType, Materialized, Over, QualifiedName, Select, SortOrder,
     TableInternalId, With,
 };
 
@@ -234,13 +234,18 @@ pub fn resolve_window_and_aggregate_functions(
                 filter_over,
                 order_by,
             } => {
-                if !order_by.is_empty() {
-                    crate::bail_parse_error!(
-                        "ORDER BY clause is not supported yet in aggregate functions"
-                    );
-                }
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
+                let agg_order_by = order_by
+                    .iter()
+                    .map(|col| {
+                        (
+                            *col.expr.clone(),
+                            col.order.unwrap_or(SortOrder::Asc),
+                            col.nulls,
+                        )
+                    })
+                    .collect();
 
                 match Func::resolve_function(name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
@@ -260,6 +265,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 distinctness,
                                 f,
                                 filter_over.filter_clause.as_deref().cloned(),
+                                agg_order_by,
                             )?;
                             contains_aggregates = true;
                         }
@@ -302,6 +308,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         distinctness,
                                         func,
                                         filter_over.filter_clause.as_deref().cloned(),
+                                        agg_order_by,
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -338,6 +345,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 Distinctness::NonDistinct,
                                 f,
                                 filter_over.filter_clause.as_deref().cloned(),
+                                vec![],
                             )?;
                             contains_aggregates = true;
                         }
@@ -395,6 +403,7 @@ pub fn resolve_window_and_aggregate_functions(
                                         Distinctness::NonDistinct,
                                         func,
                                         filter_over.filter_clause.as_deref().cloned(),
+                                        vec![],
                                     )?;
                                     contains_aggregates = true;
                                 }
@@ -473,6 +482,7 @@ fn add_aggregate_if_not_exists(
     distinctness: Distinctness,
     func: AggFunc,
     filter_expr: Option<ast::Expr>,
+    order_by: Vec<(ast::Expr, SortOrder, Option<ast::NullsOrder>)>,
 ) -> Result<()> {
     if distinctness.is_distinct() && args.len() != 1 {
         crate::bail_parse_error!("DISTINCT aggregate functions must have exactly one argument");
@@ -481,7 +491,14 @@ fn add_aggregate_if_not_exists(
         .iter()
         .all(|a| !exprs_are_equivalent(&a.original_expr, expr))
     {
-        aggs.push(Aggregate::new(func, args, expr, distinctness, filter_expr));
+        aggs.push(Aggregate::new(
+            func,
+            args,
+            expr,
+            distinctness,
+            filter_expr,
+            order_by,
+        ));
     }
     Ok(())
 }

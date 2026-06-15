@@ -1,6 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 use super::{
+    aggregation::AggOrderMetadata,
     collate::{get_expr_collation_ctx, CollationSeq},
     compound_select::emit_program_for_compound_select,
     emitter::{
@@ -836,6 +837,8 @@ pub struct TranslateCtx<'a> {
     pub meta_group_by: Option<GroupByMetadata>,
     // metadata for the order by operator
     pub meta_sort: Option<SortMetadata>,
+    // metadata for sorting aggregate inputs (ORDER BY within aggregate functions)
+    pub meta_agg_order: Option<AggOrderMetadata>,
     /// mapping between table loop index and associated metadata (for left joins only)
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
@@ -900,6 +903,7 @@ impl<'a> TranslateCtx<'a> {
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_semi_anti_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
+            meta_agg_order: None,
             hash_table_contexts: HashMap::default(),
             materialized_build_inputs: HashMap::default(),
             resolver,
