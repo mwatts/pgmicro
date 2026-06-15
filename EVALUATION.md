@@ -83,8 +83,13 @@ never re-serialize SQL) is the right call.
 
 ### Wire protocol fidelity
 
-- **All errors = SQLSTATE `XX000`**, `cli/pg_server.rs:672`. ORMs branching on sqlstate
-  (constraint, syntax, serialization-retry `40001`) all broken.
+**Partially fixed:**
+
+- **SQLSTATE codes** — `cli/pg_server.rs` maps `LimboError` variants and message patterns to
+  PostgreSQL SQLSTATE (e.g. `42601` syntax, `42P01` undefined_table, `23505` unique_violation,
+  `40001` serialization_failure, `22P02` invalid_parameter). Unclassified errors still use `XX000`.
+
+**Remaining:**
 - **Binary param format unsupported**, `cli/pg_server.rs:441`. Binary bytes decoded as UTF-8
   → garbage/error. JDBC/psycopg3 binary mode breaks.
 - **NUMERIC = f64** everywhere. Precision silently lost.
@@ -150,10 +155,9 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/sqlstate-codes` | `cli/pg_server.rs` | Map `LimboError` variants to PG SQLSTATE (syntax, undefined_table, constraint, etc.) |
-| 2 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
-| 3 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
-| 4 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
+| 1 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
+| 2 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
+| 3 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
 
 ## Bottom line
 

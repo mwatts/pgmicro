@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{validate_schema_name, Connection, Value};
+use turso_core::{validate_schema_name, Connection, LimboError, Value};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -188,13 +188,13 @@ impl SimpleQueryHandler for TursoPgHandler {
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
         let statements = turso_parser_pg::split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(parse_error_info(&e.to_string()))))?;
 
         let mut responses = Vec::new();
         for sql in &statements {
             let mut stmt = conn
                 .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+                .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
             if stmt.num_columns() == 0 || is_pg_non_query(sql) {
                 responses.push(execute_non_query(&mut stmt, sql)?);
@@ -236,7 +236,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
         let mut stmt = conn
             .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
@@ -263,7 +263,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -286,7 +286,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let stmt = conn
             .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -393,7 +393,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -402,7 +402,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -447,7 +447,7 @@ fn bind_portal_parameters(
 /// Assumes text format encoding (UTF-8 string representations).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
-        PgWireError::UserError(Box::new(error_info(&format!(
+        PgWireError::UserError(Box::new(invalid_parameter_error(format!(
             "invalid UTF-8 in parameter: {e}"
         ))))
     })?;
@@ -455,7 +455,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
             let i: i64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
+                PgWireError::UserError(Box::new(invalid_parameter_error(format!(
                     "invalid integer parameter: {e}"
                 ))))
             })?;
@@ -463,7 +463,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let f: f64 = text.parse().map_err(|e| {
-                PgWireError::UserError(Box::new(error_info(&format!(
+                PgWireError::UserError(Box::new(invalid_parameter_error(format!(
                     "invalid float parameter: {e}"
                 ))))
             })?;
@@ -472,15 +472,15 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
         Type::BOOL => match text {
             "t" | "true" | "TRUE" | "1" | "yes" | "on" => Ok(Value::from_i64(1)),
             "f" | "false" | "FALSE" | "0" | "no" | "off" => Ok(Value::from_i64(0)),
-            _ => Err(PgWireError::UserError(Box::new(error_info(&format!(
-                "invalid boolean parameter: {text}"
-            ))))),
+            _ => Err(PgWireError::UserError(Box::new(invalid_parameter_error(
+                format!("invalid boolean parameter: {text}"),
+            )))),
         },
         Type::BYTEA => {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
                 let data = decode_hex(hex_str).map_err(|e| {
-                    PgWireError::UserError(Box::new(error_info(&format!(
+                    PgWireError::UserError(Box::new(invalid_parameter_error(format!(
                         "invalid bytea hex parameter: {e}"
                     ))))
                 })?;
@@ -676,13 +676,167 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
     }
 }
 
-fn error_info(message: &str) -> ErrorInfo {
-    ErrorInfo::new("ERROR".to_owned(), "XX000".to_owned(), message.to_owned())
+fn pg_error_info(message: String, sqlstate: &str) -> ErrorInfo {
+    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message)
+}
+
+fn parse_error_info(message: &str) -> ErrorInfo {
+    pg_error_info(message.to_owned(), "42601")
+}
+
+fn invalid_parameter_error(message: String) -> ErrorInfo {
+    pg_error_info(message, "22P02")
+}
+
+fn limbo_error_to_pg(error: LimboError) -> ErrorInfo {
+    let message = error.to_string();
+    let sqlstate = match &error {
+        LimboError::ParseError(_)
+        | LimboError::LexerError(_)
+        | LimboError::ParseIntError(_)
+        | LimboError::ParseFloatError(_) => classify_parse_sqlstate(&message),
+        LimboError::PlanningError(_) => classify_planning_sqlstate(&message),
+        LimboError::ForeignKeyConstraint(_) => "23503",
+        LimboError::Constraint(msg) => classify_constraint_sqlstate(msg),
+        LimboError::Busy | LimboError::BusySnapshot | LimboError::WriteWriteConflict => "40001",
+        LimboError::ReadOnly => "25006",
+        LimboError::TableLocked => "55P03",
+        LimboError::Interrupt => "57014",
+        LimboError::IntegerOverflow => "22003",
+        LimboError::TooBig => "54000",
+        LimboError::InvalidArgument(_)
+        | LimboError::InvalidColumnType
+        | LimboError::ConversionError(_)
+        | LimboError::InvalidDate(_)
+        | LimboError::InvalidTime(_)
+        | LimboError::InvalidModifier(_)
+        | LimboError::InvalidFormatter(_)
+        | LimboError::NullValue
+        | LimboError::InvalidBlobSize(_) => "22023",
+        LimboError::DatabaseFull(_) => "53200",
+        LimboError::Corrupt(_) | LimboError::NotADB => "XX001",
+        LimboError::SchemaUpdated | LimboError::SchemaConflict => "40001",
+        LimboError::ExtensionError(_) => "0A000",
+        LimboError::Raise(_, _) => "P0001",
+        LimboError::Conflict(_) => "40001",
+        LimboError::TxError(_) | LimboError::TxTerminated | LimboError::NoSuchTransactionID(_) => {
+            "25P02"
+        }
+        LimboError::InternalError(_)
+        | LimboError::CheckpointFailed(_)
+        | LimboError::Page1NotAlloc
+        | LimboError::CommitDependencyAborted
+        | LimboError::UnsupportedEncoding(_) => "XX000",
+        LimboError::LockingError(_)
+        | LimboError::CompletionError(_)
+        | LimboError::CacheError(_) => classify_by_message(&message),
+        LimboError::EnvVarError(_) | LimboError::RaiseIgnore => "XX000",
+    };
+    pg_error_info(message, sqlstate)
+}
+
+fn classify_parse_sqlstate(message: &str) -> &'static str {
+    classify_by_message(message)
+}
+
+fn classify_planning_sqlstate(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("no such table") || lower.contains("table not found") {
+        "42P01"
+    } else if lower.contains("no such column") {
+        "42703"
+    } else if lower.contains("no such function") {
+        "42883"
+    } else if lower.contains("no such index") {
+        "42704"
+    } else {
+        "42601"
+    }
+}
+
+fn classify_constraint_sqlstate(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unique") || lower.contains("primary key") {
+        "23505"
+    } else if lower.contains("not null") {
+        "23502"
+    } else if lower.contains("check") {
+        "23514"
+    } else if lower.contains("foreign key") {
+        "23503"
+    } else {
+        "23000"
+    }
+}
+
+fn classify_by_message(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("no such table") || lower.contains("table not found") {
+        "42P01"
+    } else if lower.contains("no such column") {
+        "42703"
+    } else if lower.contains("no such function") {
+        "42883"
+    } else if lower.contains("no such index") {
+        "42704"
+    } else if lower.contains("already exists") || lower.contains("duplicate") {
+        "42P07"
+    } else if lower.contains("syntax error") || lower.starts_with("parse error") {
+        "42601"
+    } else if lower.contains("database is busy") || lower.contains("write-write conflict") {
+        "40001"
+    } else if lower.contains("read-only") || lower.contains("readonly") {
+        "25006"
+    } else if lower.contains("interrupt") {
+        "57014"
+    } else {
+        "XX000"
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_limbo_error_sqlstate_mapping() {
+        use turso_core::LimboError;
+
+        assert_eq!(
+            limbo_error_to_pg(LimboError::ParseError("syntax error near foo".into())).code,
+            "42601"
+        );
+        assert_eq!(
+            limbo_error_to_pg(LimboError::ParseError("no such table: missing".into())).code,
+            "42P01"
+        );
+        assert_eq!(
+            limbo_error_to_pg(LimboError::PlanningError("no such column: x".into())).code,
+            "42703"
+        );
+        assert_eq!(
+            limbo_error_to_pg(LimboError::ForeignKeyConstraint("fk failed".into())).code,
+            "23503"
+        );
+        assert_eq!(
+            limbo_error_to_pg(LimboError::Constraint(
+                "UNIQUE constraint failed: t.c".into()
+            ))
+            .code,
+            "23505"
+        );
+        assert_eq!(
+            limbo_error_to_pg(LimboError::Constraint(
+                "NOT NULL constraint failed: t.c".into()
+            ))
+            .code,
+            "23502"
+        );
+        assert_eq!(limbo_error_to_pg(LimboError::Busy).code, "40001");
+        assert_eq!(limbo_error_to_pg(LimboError::ReadOnly).code, "25006");
+        assert_eq!(limbo_error_to_pg(LimboError::Interrupt).code, "57014");
+        assert_eq!(invalid_parameter_error("bad param".into()).code, "22P02");
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {
