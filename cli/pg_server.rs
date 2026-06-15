@@ -111,51 +111,73 @@ struct TursoPgHandler {
 
 impl TursoPgHandler {
     /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
+    fn cleanup_dropped_schema_file(&self, query: &str, portal: Option<&Portal<String>>) {
         if self.db_file == ":memory:" {
             return;
         }
-        // Simple detection: look for DROP SCHEMA pattern
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
+        let bound_params: Vec<Option<&[u8]>> = match portal {
+            Some(p) => (0..p.parameter_len())
+                .map(|i| p.parameters[i].as_deref())
+                .collect(),
+            None => Vec::new(),
+        };
+        let Some(name) = drop_schema_name(query, &bound_params) else {
             return;
+        };
+        delete_schema_file(&self.db_file, &name);
+    }
+}
+
+/// Extract the schema name from a DROP SCHEMA statement.
+/// Resolves `$N` placeholders from bound extended-protocol parameters.
+fn drop_schema_name(query: &str, bound_params: &[Option<&[u8]>]) -> Option<String> {
+    let trimmed = query.trim().trim_end_matches(';').to_lowercase();
+    if !trimmed.starts_with("drop schema") {
+        return None;
+    }
+    let rest = trimmed.strip_prefix("drop schema")?.trim();
+    let rest = rest
+        .strip_prefix("if exists")
+        .map(|s| s.trim())
+        .unwrap_or(rest);
+    let token = rest.split_whitespace().next()?;
+    resolve_drop_schema_token(token, bound_params)
+}
+
+fn resolve_drop_schema_token(token: &str, bound_params: &[Option<&[u8]>]) -> Option<String> {
+    let name = if let Some(idx_str) = token.strip_prefix('$') {
+        let idx: usize = idx_str.parse().ok()?;
+        if idx == 0 {
+            return None;
         }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
+        let bytes = bound_params.get(idx - 1)?.as_ref()?;
+        std::str::from_utf8(bytes).ok()?
+    } else {
+        token
+    };
+    let name = name.trim_matches('"');
+    if name.is_empty() || name.eq_ignore_ascii_case("public") {
+        return None;
+    }
+    validate_schema_name(name).ok()?;
+    Some(name.to_owned())
+}
+
+fn delete_schema_file(db_file: &str, name: &str) {
+    let parent = std::path::Path::new(db_file)
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
+    if schema_file.exists() {
+        if let Err(e) = std::fs::remove_file(&schema_file) {
+            tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
+        } else {
+            tracing::info!("Deleted schema file {:?}", schema_file);
         }
-        if validate_schema_name(name).is_err() {
-            tracing::warn!("Refusing to clean up schema file for invalid name {name:?}");
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
+        let wal = schema_file.with_extension("db-wal");
+        let shm = schema_file.with_extension("db-shm");
+        let _ = std::fs::remove_file(wal);
+        let _ = std::fs::remove_file(shm);
     }
 }
 
@@ -206,7 +228,7 @@ impl SimpleQueryHandler for TursoPgHandler {
             // Only delete the backing schema file once the statement has
             // executed successfully. Deleting before execution risks orphaning
             // schema metadata if execution fails.
-            self.cleanup_dropped_schema_file(sql);
+            self.cleanup_dropped_schema_file(sql, None);
         }
 
         Ok(responses)
@@ -244,7 +266,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
             let response = execute_non_query(&mut stmt, query)?;
             // Delete the backing schema file only after successful execution.
-            self.cleanup_dropped_schema_file(query);
+            self.cleanup_dropped_schema_file(query, Some(portal));
             return Ok(response);
         }
 
@@ -797,6 +819,39 @@ fn classify_by_message(message: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_drop_schema_name_literal() {
+        assert_eq!(
+            drop_schema_name("DROP SCHEMA wireschema", &[]).as_deref(),
+            Some("wireschema")
+        );
+        assert_eq!(
+            drop_schema_name("drop schema if exists myschema cascade", &[]).as_deref(),
+            Some("myschema")
+        );
+        assert_eq!(drop_schema_name("DROP SCHEMA public", &[]), None);
+        assert_eq!(drop_schema_name("CREATE SCHEMA foo", &[]), None);
+    }
+
+    #[test]
+    fn test_drop_schema_name_parameterized() {
+        let param = "prep_schema".as_bytes();
+        let bound = [Some(param)];
+        assert_eq!(
+            drop_schema_name("DROP SCHEMA $1", &bound).as_deref(),
+            Some("prep_schema")
+        );
+        assert_eq!(
+            drop_schema_name("DROP SCHEMA IF EXISTS $1 CASCADE", &bound).as_deref(),
+            Some("prep_schema")
+        );
+    }
+
+    #[test]
+    fn test_drop_schema_name_missing_parameter() {
+        assert_eq!(drop_schema_name("DROP SCHEMA $1", &[]), None);
+    }
 
     #[test]
     fn test_limbo_error_sqlstate_mapping() {
