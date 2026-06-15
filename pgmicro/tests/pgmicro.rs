@@ -977,6 +977,52 @@ impl PgTestClient {
         self.send_query(sql);
         self.read_until_ready()
     }
+
+    fn write_message(&mut self, tag: u8, body: &[u8]) {
+        let len = (4 + body.len()) as i32;
+        self.stream.write_all(&[tag]).unwrap();
+        self.stream.write_all(&len.to_be_bytes()).unwrap();
+        self.stream.write_all(body).unwrap();
+    }
+
+    fn write_cstring(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+    }
+
+    /// Extended query: Parse + Bind + Execute + Sync.
+    fn execute_prepared(&mut self, statement: &str, portal: &str, sql: &str, params: &[&str]) {
+        let mut parse_body = Vec::new();
+        Self::write_cstring(&mut parse_body, statement);
+        Self::write_cstring(&mut parse_body, sql);
+        parse_body.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for _ in params {
+            // TEXT type OID
+            parse_body.extend_from_slice(&25i32.to_be_bytes());
+        }
+        self.write_message(b'P', &parse_body);
+
+        let mut bind_body = Vec::new();
+        Self::write_cstring(&mut bind_body, portal);
+        Self::write_cstring(&mut bind_body, statement);
+        bind_body.extend_from_slice(&0i16.to_be_bytes());
+        bind_body.extend_from_slice(&(params.len() as i16).to_be_bytes());
+        for param in params {
+            let bytes = param.as_bytes();
+            bind_body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+            bind_body.extend_from_slice(bytes);
+        }
+        bind_body.extend_from_slice(&0i16.to_be_bytes());
+        self.write_message(b'B', &bind_body);
+
+        let mut execute_body = Vec::new();
+        Self::write_cstring(&mut execute_body, portal);
+        execute_body.extend_from_slice(&0i32.to_be_bytes());
+        self.write_message(b'E', &execute_body);
+
+        self.write_message(b'S', &[]);
+        self.stream.flush().unwrap();
+    }
 }
 
 /// Returns true if the wire response contains an ErrorResponse ('E') message.
@@ -1112,6 +1158,52 @@ fn wire_drop_schema_keeps_file_on_failure() {
     assert!(
         !schema_file.exists(),
         "schema file should be deleted after successful DROP SCHEMA"
+    );
+
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wire_prepared_drop_schema_deletes_file() {
+    let port = 17432 + (std::process::id() % 1000) as u16;
+    let dir = std::env::temp_dir().join(format!("pgmicro-wire-prep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+    let db_path = dir.join("main.db");
+    let schema_file = dir.join("turso-postgres-schema-prepdrop.db");
+
+    let mut server = start_pgmicro_server_with_db(port, &db_path.to_string_lossy());
+    let mut client = PgTestClient::connect(port);
+
+    let tags = client.query_command_tags("CREATE SCHEMA prepdrop");
+    assert!(
+        tags.iter().any(|t| t.contains("CREATE")),
+        "expected CREATE tag, got: {tags:?}"
+    );
+    assert!(
+        schema_file.exists(),
+        "schema file should exist after CREATE SCHEMA: {}",
+        schema_file.display()
+    );
+
+    let response = {
+        client.execute_prepared("drop_schema", "p1", "DROP SCHEMA prepdrop", &[]);
+        client.read_until_ready()
+    };
+    assert!(
+        !response_has_error(&response),
+        "prepared DROP SCHEMA should succeed, response: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    let tags = extract_command_tags(&response);
+    assert!(
+        tags.iter().any(|t| t.contains("DROP")),
+        "expected DROP tag from extended-protocol DROP SCHEMA, got: {tags:?}"
+    );
+    assert!(
+        !schema_file.exists(),
+        "schema file should be deleted after prepared DROP SCHEMA"
     );
 
     server.kill().ok();

@@ -35,17 +35,15 @@ never re-serialize SQL) is the right call.
   PostgreSQL identifier rules (no dots, Unicode, etc.); documented in `pg_schema.rs`.
 - **Delete-before-execute** — wire server deletes schema `.db` files only after successful
   execution, not after `prepare`. Tested via API and wire protocol.
+- **Prepared DROP SCHEMA cleanup** — extended-protocol drops resolve `$N` schema placeholders
+  from portal parameters before deleting `turso-postgres-schema-<name>.db` files. Literal
+  prepared `DROP SCHEMA name` also triggers cleanup on the extended path.
 
 **Accepted for localhost-only use:**
 
 - **No auth / no TLS** — `NoopHandler` still returns `AuthenticationOk` to any client that
   can reach the port. CLI help and startup stderr warn to bind `127.0.0.1` only. Intended for
   trusted local development, not public network exposure.
-
-**Remaining:**
-
-- **Prepared `DROP SCHEMA $1`** — extended-protocol cleanup still uses string matching on the
-  raw query; parameterized drops do not trigger `.db` file deletion.
 
 ### Correctness — wrong results, silent
 
@@ -69,6 +67,8 @@ never re-serialize SQL) is the right call.
   still uses existing `SubLink` path.
 - **`IS TRUE` / `IS FALSE`** — maps to `Literal::True`/`False` so `Insn::IsTrue` applies PG
   truth semantics (any non-zero number is true).
+- **`gcd` / `lcm` overflow** — return `LimboError::IntegerOverflow` (SQLSTATE 22003) instead
+  of a TEXT `"ERROR: ..."` row value.
 
 **Fixed (continued):**
 
@@ -136,8 +136,6 @@ never re-serialize SQL) is the right call.
 ### Validation bugs
 
 - Date validation accepts Feb 31 / Apr 31, `core/pg_catalog.rs:2958`.
-- `gcd`/`lcm` overflow returns TEXT `"ERROR: ..."` as a row value instead of raising,
-  `core/functions/postgres.rs:156`.
 - `convert_to_postgres_ddl` naive string replace can rename columns containing `INTEGER`,
   `core/pg_catalog.rs:3427`.
 - JSON validation checks bracket balance only, not grammar — `{"a":}` passes.
@@ -155,9 +153,7 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/gcd-lcm-error` | `core/functions/postgres.rs` | Raise on overflow instead of returning TEXT error row |
-| 2 | `fix/prepared-drop-schema` | `cli/pg_server.rs` | Extended-protocol `DROP SCHEMA $1` triggers `.db` cleanup |
-| 3 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
+| 1 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
 
 ## Bottom line
 
