@@ -7233,7 +7233,7 @@ pub fn op_function(
                     .get_value()
                     .as_int()
                     .unwrap_or(0);
-                state.registers[*dest].set_value(exec_gcd(a, b));
+                state.registers[*dest].set_value(exec_gcd(a, b)?);
             }
             ScalarFunc::Lcm => {
                 let a = state.registers[*start_reg]
@@ -7244,7 +7244,7 @@ pub fn op_function(
                     .get_value()
                     .as_int()
                     .unwrap_or(0);
-                state.registers[*dest].set_value(exec_lcm(a, b));
+                state.registers[*dest].set_value(exec_lcm(a, b)?);
             }
             ScalarFunc::Repeat => {
                 let input = state.registers[*start_reg].get_value();

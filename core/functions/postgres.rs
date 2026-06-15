@@ -1,6 +1,6 @@
 use crate::ext::register_scalar_function;
 use crate::types::Value;
-use crate::Connection;
+use crate::{Connection, LimboError};
 use turso_ext::{scalar, ExtensionApi, Value as ExtValue};
 
 /// Register PostgreSQL-compatible scalar functions.
@@ -151,26 +151,23 @@ fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
 }
 
 /// Greatest common divisor.
-pub fn exec_gcd(a: i64, b: i64) -> Value {
+pub fn exec_gcd(a: i64, b: i64) -> Result<Value, LimboError> {
     // PG raises ERROR on overflow (gcd(INT_MIN, 0)), we match that
-    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) {
-        return Value::build_text("ERROR: integer out of range");
+    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) || (a == i64::MIN && b == i64::MIN) {
+        return Err(LimboError::IntegerOverflow);
     }
-    if a == i64::MIN && b == i64::MIN {
-        return Value::build_text("ERROR: integer out of range");
-    }
-    Value::from_i64(gcd_inner(a, b))
+    Ok(Value::from_i64(gcd_inner(a, b)))
 }
 
 /// Least common multiple.
-pub fn exec_lcm(a: i64, b: i64) -> Value {
+pub fn exec_lcm(a: i64, b: i64) -> Result<Value, LimboError> {
     if a == 0 || b == 0 {
-        return Value::from_i64(0);
+        return Ok(Value::from_i64(0));
     }
     let g = gcd_inner(a, b);
     match (a / g).checked_mul(b.wrapping_abs()) {
-        Some(v) => Value::from_i64(v.wrapping_abs()),
-        None => Value::build_text("ERROR: integer out of range"),
+        Some(v) => Ok(Value::from_i64(v.wrapping_abs())),
+        None => Err(LimboError::IntegerOverflow),
     }
 }
 
@@ -354,5 +351,47 @@ pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Value {
                 .collect();
             Value::build_text(format!("{s}{pad}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gcd_normal_cases() {
+        assert_eq!(exec_gcd(12, 18).unwrap(), Value::from_i64(6));
+        assert_eq!(exec_gcd(-12, 18).unwrap(), Value::from_i64(6));
+    }
+
+    #[test]
+    fn gcd_overflow_raises() {
+        assert!(matches!(
+            exec_gcd(i64::MIN, 0),
+            Err(LimboError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            exec_gcd(0, i64::MIN),
+            Err(LimboError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            exec_gcd(i64::MIN, i64::MIN),
+            Err(LimboError::IntegerOverflow)
+        ));
+    }
+
+    #[test]
+    fn lcm_normal_cases() {
+        assert_eq!(exec_lcm(4, 6).unwrap(), Value::from_i64(12));
+        assert_eq!(exec_lcm(0, 5).unwrap(), Value::from_i64(0));
+        assert_eq!(exec_lcm(5, 0).unwrap(), Value::from_i64(0));
+    }
+
+    #[test]
+    fn lcm_overflow_raises() {
+        assert!(matches!(
+            exec_lcm(i64::MAX, 2),
+            Err(LimboError::IntegerOverflow)
+        ));
     }
 }
