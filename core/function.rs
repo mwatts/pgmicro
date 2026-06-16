@@ -539,6 +539,29 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    // Interval type functions
+    IntervalIn,
+    IntervalOut,
+    IntervalPl,
+    IntervalMi,
+    IntervalMul,
+    IntervalDiv,
+    IntervalLt,
+    IntervalEq,
+    JustifyDays,
+    JustifyHours,
+    IntervalExtract,
+    TimestampPlInterval,
+    TimestampMiInterval,
+    // Money type functions
+    MoneyIn,
+    MoneyOut,
+    MoneyPl,
+    MoneyMi,
+    MoneyMul,
+    MoneyDiv,
+    MoneyLt,
+    MoneyEq,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -682,7 +705,28 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::IntervalIn
+            | ScalarFunc::IntervalOut
+            | ScalarFunc::IntervalPl
+            | ScalarFunc::IntervalMi
+            | ScalarFunc::IntervalMul
+            | ScalarFunc::IntervalDiv
+            | ScalarFunc::IntervalLt
+            | ScalarFunc::IntervalEq
+            | ScalarFunc::JustifyDays
+            | ScalarFunc::JustifyHours
+            | ScalarFunc::IntervalExtract
+            | ScalarFunc::TimestampPlInterval
+            | ScalarFunc::TimestampMiInterval
+            | ScalarFunc::MoneyIn
+            | ScalarFunc::MoneyOut
+            | ScalarFunc::MoneyPl
+            | ScalarFunc::MoneyMi
+            | ScalarFunc::MoneyMul
+            | ScalarFunc::MoneyDiv
+            | ScalarFunc::MoneyLt
+            | ScalarFunc::MoneyEq => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -843,6 +887,27 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::IntervalIn => "interval_in",
+            Self::IntervalOut => "interval_out",
+            Self::IntervalPl => "interval_pl",
+            Self::IntervalMi => "interval_mi",
+            Self::IntervalMul => "interval_mul",
+            Self::IntervalDiv => "interval_div",
+            Self::IntervalLt => "interval_lt",
+            Self::IntervalEq => "interval_eq",
+            Self::JustifyDays => "justify_days",
+            Self::JustifyHours => "justify_hours",
+            Self::IntervalExtract => "interval_extract",
+            Self::TimestampPlInterval => "timestamp_pl_interval",
+            Self::TimestampMiInterval => "timestamp_mi_interval",
+            Self::MoneyIn => "money_in",
+            Self::MoneyOut => "money_out",
+            Self::MoneyPl => "money_pl",
+            Self::MoneyMi => "money_mi",
+            Self::MoneyMul => "money_mul",
+            Self::MoneyDiv => "money_div",
+            Self::MoneyLt => "money_lt",
+            Self::MoneyEq => "money_eq",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1003,6 +1068,23 @@ impl ScalarFunc {
             | Self::NumericLt
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
+            Self::IntervalIn | Self::IntervalOut | Self::JustifyDays | Self::JustifyHours => &[1],
+            Self::IntervalPl
+            | Self::IntervalMi
+            | Self::IntervalMul
+            | Self::IntervalDiv
+            | Self::IntervalLt
+            | Self::IntervalEq
+            | Self::IntervalExtract
+            | Self::TimestampPlInterval
+            | Self::TimestampMiInterval => &[2],
+            Self::MoneyIn | Self::MoneyOut => &[1],
+            Self::MoneyPl
+            | Self::MoneyMi
+            | Self::MoneyMul
+            | Self::MoneyDiv
+            | Self::MoneyLt
+            | Self::MoneyEq => &[2],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
@@ -1609,6 +1691,27 @@ impl Func {
             "numeric_div" => Ok(Some(Self::Scalar(ScalarFunc::NumericDiv))),
             "numeric_lt" => Ok(Some(Self::Scalar(ScalarFunc::NumericLt))),
             "numeric_eq" => Ok(Some(Self::Scalar(ScalarFunc::NumericEq))),
+            "interval_in" => Ok(Some(Self::Scalar(ScalarFunc::IntervalIn))),
+            "interval_out" => Ok(Some(Self::Scalar(ScalarFunc::IntervalOut))),
+            "interval_pl" => Ok(Some(Self::Scalar(ScalarFunc::IntervalPl))),
+            "interval_mi" => Ok(Some(Self::Scalar(ScalarFunc::IntervalMi))),
+            "interval_mul" => Ok(Some(Self::Scalar(ScalarFunc::IntervalMul))),
+            "interval_div" => Ok(Some(Self::Scalar(ScalarFunc::IntervalDiv))),
+            "interval_lt" => Ok(Some(Self::Scalar(ScalarFunc::IntervalLt))),
+            "interval_eq" => Ok(Some(Self::Scalar(ScalarFunc::IntervalEq))),
+            "justify_days" => Ok(Some(Self::Scalar(ScalarFunc::JustifyDays))),
+            "justify_hours" => Ok(Some(Self::Scalar(ScalarFunc::JustifyHours))),
+            "interval_extract" => Ok(Some(Self::Scalar(ScalarFunc::IntervalExtract))),
+            "timestamp_pl_interval" => Ok(Some(Self::Scalar(ScalarFunc::TimestampPlInterval))),
+            "timestamp_mi_interval" => Ok(Some(Self::Scalar(ScalarFunc::TimestampMiInterval))),
+            "money_in" => Ok(Some(Self::Scalar(ScalarFunc::MoneyIn))),
+            "money_out" => Ok(Some(Self::Scalar(ScalarFunc::MoneyOut))),
+            "money_pl" => Ok(Some(Self::Scalar(ScalarFunc::MoneyPl))),
+            "money_mi" => Ok(Some(Self::Scalar(ScalarFunc::MoneyMi))),
+            "money_mul" => Ok(Some(Self::Scalar(ScalarFunc::MoneyMul))),
+            "money_div" => Ok(Some(Self::Scalar(ScalarFunc::MoneyDiv))),
+            "money_lt" => Ok(Some(Self::Scalar(ScalarFunc::MoneyLt))),
+            "money_eq" => Ok(Some(Self::Scalar(ScalarFunc::MoneyEq))),
             // Array construction / element access (desugared from syntax)
             "array" => Ok(Some(Self::Scalar(ScalarFunc::Array))),
             "array_element" => Ok(Some(Self::Scalar(ScalarFunc::ArrayElement))),

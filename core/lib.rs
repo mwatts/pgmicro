@@ -41,8 +41,10 @@ mod function;
 mod functions;
 mod incremental;
 mod info;
+mod interval;
 #[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
+mod money;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 mod parameters;

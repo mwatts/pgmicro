@@ -1,0 +1,217 @@
+@database :memory:
+@requires-file custom_types "interval and money builtin types"
+
+# ------------------------------------------------------------------------------
+# INTERVAL: parse, format, storage
+# ------------------------------------------------------------------------------
+
+test interval-in-out-roundtrip {
+    SELECT interval_out(interval_in('1 day'));
+    SELECT interval_out(interval_in('2 mons 3 days'));
+}
+expect {
+    1 day
+    2 mons 3 days
+}
+
+test interval-invalid-input {
+    SELECT interval_in('');
+}
+expect error {
+}
+
+test interval-strict-table-roundtrip {
+    CREATE TABLE t1(iv interval) STRICT;
+    INSERT INTO t1 VALUES ('1 day');
+    INSERT INTO t1 VALUES ('2 mons 3 days');
+    SELECT iv FROM t1;
+}
+expect {
+    1 day
+    2 mons 3 days
+}
+
+test interval-cast-typeof {
+    SELECT typeof(CAST('1 day' AS interval));
+}
+expect {
+    blob
+}
+
+# ------------------------------------------------------------------------------
+# INTERVAL: field-wise arithmetic (calendar semantics)
+# ------------------------------------------------------------------------------
+
+test interval-month-addition-field-wise {
+    SELECT interval_out(interval_pl(interval_in('1 month'), interval_in('1 month')));
+}
+expect {
+    2 mons
+}
+
+test interval-day-addition {
+    SELECT interval_out(interval_pl(interval_in('30 days'), interval_in('30 days')));
+}
+expect {
+    60 days
+}
+
+test interval-subtraction {
+    SELECT interval_out(interval_mi(interval_in('3 days'), interval_in('1 day')));
+}
+expect {
+    2 days
+}
+
+test interval-scale {
+    SELECT interval_out(interval_mul(interval_in('1 day'), 2));
+}
+expect {
+    2 days
+}
+
+# ------------------------------------------------------------------------------
+# INTERVAL: justify_* and extract
+# ------------------------------------------------------------------------------
+
+test interval-justify-days {
+    SELECT interval_out(justify_days(interval_in('1 month')));
+}
+expect {
+    30 days
+}
+
+test interval-justify-hours {
+    SELECT interval_out(justify_hours(interval_in('1 day')));
+}
+expect {
+    24:00:00
+}
+
+test interval-extract-epoch {
+    SELECT interval_extract('epoch', interval_in('1 month'));
+}
+expect {
+    2629800.0
+}
+
+test interval-extract-day-hour {
+    SELECT interval_extract('day', interval_in('2 days 3 hours'));
+    SELECT interval_extract('hour', interval_in('2 days 3 hours'));
+}
+expect {
+    2.0
+    3.0
+}
+
+# ------------------------------------------------------------------------------
+# INTERVAL: timestamp calendar math
+# ------------------------------------------------------------------------------
+
+test timestamp-plus-one-month {
+    SELECT timestamp_pl_interval('2024-01-31 12:00:00', interval_in('1 month'));
+}
+expect {
+    2024-02-29 12:00:00
+}
+
+test timestamp-minus-one-day {
+    SELECT timestamp_mi_interval('2024-03-02 00:00:00', interval_in('1 day'));
+}
+expect {
+    2024-03-01 00:00:00
+}
+
+# ------------------------------------------------------------------------------
+# MONEY: parse, format, storage
+# ------------------------------------------------------------------------------
+
+test money-in-out-roundtrip {
+    SELECT money_out(money_in('$12.34'));
+    SELECT money_out(money_in('$1,234.56'));
+    SELECT money_out(money_in('($1.00)'));
+}
+expect {
+    $12.34
+    $1,234.56
+    ($1.00)
+}
+
+test money-invalid-input {
+    SELECT money_in('abc');
+}
+expect error {
+}
+
+test money-strict-table-roundtrip {
+    CREATE TABLE t1(m money) STRICT;
+    INSERT INTO t1 VALUES ('$12.34');
+    INSERT INTO t1 VALUES ('($1.00)');
+    SELECT m FROM t1;
+}
+expect {
+    $12.34
+    ($1.00)
+}
+
+test money-cast-typeof {
+    SELECT typeof(CAST('$1.00' AS money));
+}
+expect {
+    integer
+}
+
+# ------------------------------------------------------------------------------
+# MONEY: arithmetic
+# ------------------------------------------------------------------------------
+
+test money-add-sub {
+    SELECT money_out(money_pl(money_in('$1.00'), money_in('$0.50')));
+    SELECT money_out(money_mi(money_in('$1.00'), money_in('$0.25')));
+}
+expect {
+    $1.50
+    $0.75
+}
+
+test money-mul-div {
+    SELECT money_out(money_mul(money_in('$1.00'), 1.5));
+    SELECT money_out(money_div(money_in('$3.00'), 2));
+}
+expect {
+    $1.50
+    $1.50
+}
+
+test money-order-by {
+    CREATE TABLE t1(m money) STRICT;
+    INSERT INTO t1 VALUES ('$10.00');
+    INSERT INTO t1 VALUES ('$2.50');
+    INSERT INTO t1 VALUES ('$5.00');
+    SELECT m FROM t1 ORDER BY m;
+}
+expect {
+    $2.50
+    $5.00
+    $10.00
+}
+
+test money-comparison-scalar {
+    SELECT money_lt(money_in('$1.00'), money_in('$2.00'));
+    SELECT money_eq(money_in('$1.00'), money_in('$1.00'));
+}
+expect {
+    1
+    1
+}
+
+# ------------------------------------------------------------------------------
+# Builtin registration
+# ------------------------------------------------------------------------------
+
+test pragma-list-types-includes-interval-money {
+    PRAGMA list_types;
+}
+expect pattern {
+    (?s).*interval\(value text\)\|blob\|interval_in \(value\)\|interval_out \(value\).*money\(value text\)\|integer\|money_in \(value\)\|money_out \(value\).*
+}

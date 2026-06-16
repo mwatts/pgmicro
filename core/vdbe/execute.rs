@@ -76,6 +76,16 @@ use crate::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
         },
+        interval::{
+            exec_interval_div, exec_interval_eq, exec_interval_extract, exec_interval_in,
+            exec_interval_lt, exec_interval_mi, exec_interval_mul, exec_interval_out,
+            exec_interval_pl, exec_justify_days, exec_justify_hours, exec_timestamp_mi_interval,
+            exec_timestamp_pl_interval,
+        },
+        money::{
+            exec_money_div, exec_money_eq, exec_money_in, exec_money_lt, exec_money_mi,
+            exec_money_mul, exec_money_out, exec_money_pl,
+        },
         postgres::{
             exec_gcd, exec_greatest, exec_lcm, exec_least, exec_lpad, exec_pg_encoding_to_char,
             exec_pg_format_type, exec_pg_get_constraintdef, exec_pg_get_indexdef,
@@ -8082,6 +8092,126 @@ pub fn op_function(
                         state.registers[*dest].set_int(cmp_result as i64)
                     }
                 };
+            }
+            ScalarFunc::IntervalIn => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_interval_in(val)?);
+            }
+            ScalarFunc::IntervalOut => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_interval_out(val)?);
+            }
+            ScalarFunc::IntervalPl => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_pl(a, b)?);
+            }
+            ScalarFunc::IntervalMi => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_mi(a, b)?);
+            }
+            ScalarFunc::IntervalMul => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_mul(a, b)?);
+            }
+            ScalarFunc::IntervalDiv => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_div(a, b)?);
+            }
+            ScalarFunc::IntervalLt => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_lt(a, b)?);
+            }
+            ScalarFunc::IntervalEq => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_eq(a, b)?);
+            }
+            ScalarFunc::JustifyDays => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_justify_days(val)?);
+            }
+            ScalarFunc::JustifyHours => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_justify_hours(val)?);
+            }
+            ScalarFunc::IntervalExtract => {
+                check_arg_count!(arg_count, 2);
+                let field = state.registers[*start_reg].get_value();
+                let iv = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_interval_extract(field, iv)?);
+            }
+            ScalarFunc::TimestampPlInterval => {
+                check_arg_count!(arg_count, 2);
+                let ts = state.registers[*start_reg].get_value();
+                let iv = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_timestamp_pl_interval(ts, iv)?);
+            }
+            ScalarFunc::TimestampMiInterval => {
+                check_arg_count!(arg_count, 2);
+                let ts = state.registers[*start_reg].get_value();
+                let iv = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_timestamp_mi_interval(ts, iv)?);
+            }
+            ScalarFunc::MoneyIn => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_money_in(val)?);
+            }
+            ScalarFunc::MoneyOut => {
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value();
+                state.registers[*dest].set_value(exec_money_out(val)?);
+            }
+            ScalarFunc::MoneyPl => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_pl(a, b)?);
+            }
+            ScalarFunc::MoneyMi => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_mi(a, b)?);
+            }
+            ScalarFunc::MoneyMul => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_mul(a, b)?);
+            }
+            ScalarFunc::MoneyDiv => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_div(a, b)?);
+            }
+            ScalarFunc::MoneyLt => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_lt(a, b)?);
+            }
+            ScalarFunc::MoneyEq => {
+                check_arg_count!(arg_count, 2);
+                let a = state.registers[*start_reg].get_value();
+                let b = state.registers[*start_reg + 1].get_value();
+                state.registers[*dest].set_value(exec_money_eq(a, b)?);
             }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);

@@ -691,6 +691,8 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE interval(value text) BASE blob ENCODE interval_in(value) DECODE interval_out(value) OPERATOR '+' interval_pl OPERATOR '-' interval_mi OPERATOR '*' interval_mul OPERATOR '/' interval_div OPERATOR '<' interval_lt OPERATOR '=' interval_eq",
+        "CREATE TYPE money(value text) BASE integer ENCODE money_in(value) DECODE money_out(value) OPERATOR '+' money_pl OPERATOR '-' money_mi OPERATOR '*' money_mul OPERATOR '/' money_div OPERATOR '<' money_lt OPERATOR '=' money_eq",
     ];
 
     for sql in type_sqls {
