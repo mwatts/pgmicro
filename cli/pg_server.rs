@@ -626,6 +626,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "TIME" | "TIMETZ" => Type::TIME,
         "TIMESTAMP" => Type::TIMESTAMP,
         "TIMESTAMPTZ" => Type::TIMESTAMPTZ,
+        "INTERVAL" => Type::INTERVAL,
+        "MONEY" => Type::MONEY,
         "INET" => Type::INET,
         "CIDR" => Type::CIDR,
         "MACADDR" => Type::MACADDR,
@@ -1002,6 +1004,8 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("JSON"), Type::JSON);
         assert_eq!(sqlite_type_to_pg_type("JSONB"), Type::JSONB);
         assert_eq!(sqlite_type_to_pg_type("UUID"), Type::UUID);
+        assert_eq!(sqlite_type_to_pg_type("INTERVAL"), Type::INTERVAL);
+        assert_eq!(sqlite_type_to_pg_type("MONEY"), Type::MONEY);
         // Unknown types map to TEXT
         assert_eq!(sqlite_type_to_pg_type("UNKNOWN"), Type::TEXT);
     }

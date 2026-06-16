@@ -2858,6 +2858,60 @@ impl PostgreSQLTranslator {
             _ => {}
         }
 
+        // Timestamp ± interval → calendar-aware scalar functions (not field-wise interval ops)
+        if matches!(op_name, "+" | "-") {
+            if let (Some(lexpr), Some(rexpr)) = (&a_expr.lexpr, &a_expr.rexpr) {
+                let left_interval = is_pg_interval_node(lexpr);
+                let right_interval = is_pg_interval_node(rexpr);
+                if op_name == "+" {
+                    if left_interval && is_pg_temporal_candidate(rexpr) {
+                        return Ok(ast::Expr::FunctionCall {
+                            name: ast::Name::from_string("timestamp_pl_interval"),
+                            distinctness: None,
+                            args: vec![
+                                Box::new(self.translate_expr(rexpr)?),
+                                Box::new(self.translate_expr(lexpr)?),
+                            ],
+                            order_by: vec![],
+                            filter_over: ast::FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        });
+                    }
+                    if right_interval && is_pg_temporal_candidate(lexpr) {
+                        return Ok(ast::Expr::FunctionCall {
+                            name: ast::Name::from_string("timestamp_pl_interval"),
+                            distinctness: None,
+                            args: vec![
+                                Box::new(self.translate_expr(lexpr)?),
+                                Box::new(self.translate_expr(rexpr)?),
+                            ],
+                            order_by: vec![],
+                            filter_over: ast::FunctionTail {
+                                filter_clause: None,
+                                over_clause: None,
+                            },
+                        });
+                    }
+                } else if op_name == "-" && right_interval && is_pg_temporal_candidate(lexpr) {
+                    return Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("timestamp_mi_interval"),
+                        distinctness: None,
+                        args: vec![
+                            Box::new(self.translate_expr(lexpr)?),
+                            Box::new(self.translate_expr(rexpr)?),
+                        ],
+                        order_by: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    });
+                }
+            }
+        }
+
         // Map PostgreSQL operators to Turso operators
         let binary_op = match op_name {
             "=" => ast::Operator::Equals,
@@ -3212,6 +3266,25 @@ impl PostgreSQLTranslator {
                 name: ast::Name::from_string(func_name),
                 filter_over,
             });
+        }
+
+        // EXTRACT(field FROM interval) → interval_extract(field, source)
+        if func_name.eq_ignore_ascii_case("extract") && func_call.args.len() == 2 {
+            if is_pg_interval_node(&func_call.args[1]) {
+                return Ok(ast::Expr::FunctionCall {
+                    name: ast::Name::from_string("interval_extract"),
+                    distinctness: None,
+                    args: vec![
+                        Box::new(self.translate_expr(&func_call.args[0])?),
+                        Box::new(self.translate_expr(&func_call.args[1])?),
+                    ],
+                    order_by: vec![],
+                    filter_over: ast::FunctionTail {
+                        filter_clause: None,
+                        over_clause: None,
+                    },
+                });
+            }
         }
 
         // Translate function arguments
@@ -4443,15 +4516,15 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
 
-        // PG types without Turso equivalents → base SQLite types
-        "INTERVAL" => "TEXT".into(),
+        // Temporal / monetary custom types
+        "INTERVAL" => "interval".into(),
+        "MONEY" => "money".into(),
         // Network types → custom types for proper PG wire OIDs
         "CIDR" => "cidr".into(),
         "MACADDR" => "macaddr".into(),
         "MACADDR8" => "macaddr8".into(),
         "POINT" | "LINE" | "LSEG" | "BOX" | "PATH" | "POLYGON" | "CIRCLE" => "TEXT".into(),
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
-        "MONEY" => "REAL".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
         "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
@@ -4564,9 +4637,8 @@ fn translate_create_enum(
     })
 }
 
-/// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
-fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+/// Extract the uppercased PG type name from a TypeName node (skipping pg_catalog).
+fn pg_typename_base(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
     use pg_query::protobuf::node::Node;
 
     let mut parts = Vec::new();
@@ -4578,22 +4650,92 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         }
     }
     if parts.is_empty() {
-        return None;
+        None
+    } else {
+        Some(parts.join(" ").to_uppercase())
     }
-    let pg_type = parts.join(" ");
+}
 
-    let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
+fn is_pg_interval_node(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+
+    match &node.node {
+        Some(Node::TypeCast(tc)) => tc
+            .type_name
+            .as_ref()
+            .and_then(pg_typename_base)
+            .is_some_and(|t| t == "INTERVAL"),
+        _ => false,
+    }
+}
+
+fn is_pg_temporal_candidate(node: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::node::Node;
+
+    match &node.node {
+        Some(Node::TypeCast(tc)) => tc
+            .type_name
+            .as_ref()
+            .and_then(pg_typename_base)
+            .is_some_and(|t| {
+                matches!(
+                    t.as_str(),
+                    "TIMESTAMP" | "TIMESTAMPTZ" | "DATE" | "TIME" | "TIMETZ"
+                )
+            }),
+        Some(Node::FuncCall(fc)) => {
+            let func_name = fc
+                .funcname
+                .iter()
+                .rev()
+                .find_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            matches!(
+                func_name.as_str(),
+                "now"
+                    | "current_timestamp"
+                    | "clock_timestamp"
+                    | "transaction_timestamp"
+                    | "statement_timestamp"
+                    | "current_date"
+                    | "localtimestamp"
+                    | "localtime"
+            )
         }
-        // For CAST expressions, map all text-like PG types to TEXT and
-        // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
-        | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
-        | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        Some(Node::ColumnRef(_)) => true,
+        _ => false,
+    }
+}
+
+/// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
+/// Maps PG types to Turso custom types or base SQLite storage types.
+fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+    let pg_type = pg_typename_base(type_name)?;
+
+    let name = match pg_type.as_str() {
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" | "OID"
+        | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "SMALLINT" | "INT2" => "smallint",
+        "BIGINT" | "INT8" => "bigint",
+        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" => "REAL",
+        "BOOLEAN" | "BOOL" => "boolean",
+        "UUID" => "uuid",
+        "DATE" => "date",
+        "TIME" | "TIMETZ" => "time",
+        "TIMESTAMP" => "timestamp",
+        "TIMESTAMPTZ" => "timestamptz",
+        "INTERVAL" => "interval",
+        "MONEY" => "money",
+        "INET" => "inet",
+        "JSON" => "json",
+        "JSONB" => "jsonb",
+        "CIDR" => "cidr",
+        "MACADDR" => "macaddr",
+        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "XML" | "BIT" | "VARBIT" | "TSVECTOR"
+        | "TSQUERY" => "TEXT",
         "BYTEA" | "BLOB" => "BLOB",
         _ => return None,
     };
@@ -5278,6 +5420,8 @@ mod tests {
         assert_eq!(map_pg_type("INET", no_params), Some(s("inet")));
         assert_eq!(map_pg_type("JSON", no_params), Some(s("json")));
         assert_eq!(map_pg_type("JSONB", no_params), Some(s("jsonb")));
+        assert_eq!(map_pg_type("INTERVAL", no_params), Some(s("interval")));
+        assert_eq!(map_pg_type("MONEY", no_params), Some(s("money")));
 
         // Parametric types — base name + params separated
         assert_eq!(
@@ -5339,6 +5483,67 @@ mod tests {
             }
         } else {
             panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_interval_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(span INTERVAL)";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "interval");
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_money_column_type() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t(amount MONEY)";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::CreateTable { body, .. } = &stmt {
+            if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
+                let col = &columns[0];
+                let col_type = col.col_type.as_ref().unwrap();
+                assert_eq!(col_type.name, "money");
+            } else {
+                panic!("expected ColumnsAndConstraints");
+            }
+        } else {
+            panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_plus_interval_translation() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT '2024-01-01'::timestamp + INTERVAL '1 day'";
+        let parse_result = crate::parse(sql).unwrap();
+        let stmt = translator.translate(&parse_result).unwrap();
+        if let ast::Stmt::Select(select) = stmt {
+            let ast::OneSelect::Select { columns, .. } = &select.body.select else {
+                panic!("expected select body");
+            };
+            let ast::ResultColumn::Expr(expr, _) = &columns[0] else {
+                panic!("expected expr column");
+            };
+            let ast::Expr::FunctionCall { name, args, .. } = expr.as_ref() else {
+                panic!("expected FunctionCall, got {expr:?}");
+            };
+            assert_eq!(name.as_str(), "timestamp_pl_interval");
+            assert_eq!(args.len(), 2);
+        } else {
+            panic!("expected Select");
         }
     }
 

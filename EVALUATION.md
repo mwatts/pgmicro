@@ -77,9 +77,14 @@ never re-serialize SQL) is the right call.
   `AggOrderMetadata` sorter; grouped: extra sort keys on the GROUP BY sorter) so `AggStep`
   runs in sorted order. `array_agg(x ORDER BY y)` works end-to-end.
 
-**Remaining:**
+**Fixed (continued):**
 
-- **MONEY→REAL, INTERVAL→TEXT** — interval arithmetic breaks; money rounds.
+- **MONEY→REAL, INTERVAL→TEXT** — Turso builtin `interval` (16-byte blob, calendar
+  semantics) and `money` (int64 cents) types in core; pgmicro maps `INTERVAL`/`MONEY` DDL
+  and casts to custom types, rewrites `timestamp ± interval` and `EXTRACT(... FROM
+  interval)`, and wires catalog OIDs (1186/790) plus wire `Type::INTERVAL`/`Type::MONEY`.
+
+**Remaining:**
 
 ### Wire protocol fidelity
 

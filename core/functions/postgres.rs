@@ -98,6 +98,7 @@ pub fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
         1114 => "timestamp without time zone".to_string(),
         1184 => "timestamp with time zone".to_string(),
         1186 => "interval".to_string(),
+        790 => "money".to_string(),
         1700 => {
             if typemod > 4 {
                 let precision = ((typemod - 4) >> 16) & 0xffff;

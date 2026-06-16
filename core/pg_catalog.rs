@@ -61,6 +61,8 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "TIME" => 1083,
         "TIMESTAMP" => 1114,
         "TIMESTAMPTZ" => 1184,
+        "INTERVAL" => 1186,
+        "MONEY" => 790,
         "INET" => 869,
         "CIDR" => 650,
         "MACADDR" => 829,
@@ -1692,6 +1694,30 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typstorage: "p",
     },
     PgTypeInfo {
+        oid: 1186,
+        name: "interval",
+        typtype: "b",
+        typcategory: "T",
+        typlen: 16,
+        typarray: 1187,
+        typelem: 0,
+        typbyval: false,
+        typalign: "d",
+        typstorage: "p",
+    },
+    PgTypeInfo {
+        oid: 790,
+        name: "money",
+        typtype: "b",
+        typcategory: "M",
+        typlen: 8,
+        typarray: 791,
+        typelem: 0,
+        typbyval: false,
+        typalign: "d",
+        typstorage: "p",
+    },
+    PgTypeInfo {
         oid: 1700,
         name: "numeric",
         typtype: "b",
@@ -1750,6 +1776,8 @@ const PG_ARRAY_TYPES: &[(i64, &str, i64)] = &[
     (1182, "_date", 1082),
     (1183, "_time", 1083),
     (1185, "_timestamptz", 1184),
+    (1187, "_interval", 1186),
+    (791, "_money", 790),
     (1231, "_numeric", 1700),
     (2951, "_uuid", 2950),
     (3807, "_jsonb", 3802),
@@ -3081,6 +3109,26 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type macaddr: \"{input}\""),
+                    "22P02".to_string(),
+                ))
+            }
+        }
+        "interval" => {
+            if crate::interval::Interval::from_text(trimmed).is_ok() {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type interval: \"{input}\""),
+                    "22007".to_string(),
+                ))
+            }
+        }
+        "money" => {
+            if crate::money::Money::from_text(trimmed).is_ok() {
+                None
+            } else {
+                Some((
+                    format!("invalid input syntax for type money: \"{input}\""),
                     "22P02".to_string(),
                 ))
             }

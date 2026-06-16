@@ -70,6 +70,30 @@ expect {
     2 days
 }
 
+test interval-expr-add {
+    SELECT CAST('1 mon' AS interval) + CAST('1 mon' AS interval);
+}
+expect {
+    2 mons
+}
+
+test interval-column-arithmetic {
+    CREATE TABLE t1(iv interval) STRICT;
+    INSERT INTO t1 VALUES ('1 day');
+    SELECT iv + iv FROM t1;
+}
+expect {
+    2 days
+}
+
+test interval-column-where {
+    CREATE TABLE t1(iv interval) STRICT;
+    INSERT INTO t1 VALUES ('1 day'), ('2 days');
+    SELECT iv FROM t1 WHERE iv = '1 day';
+}
+expect {
+    1 day
+}
 # ------------------------------------------------------------------------------
 # INTERVAL: justify_* and extract
 # ------------------------------------------------------------------------------

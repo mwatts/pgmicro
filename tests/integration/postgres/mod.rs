@@ -2,6 +2,7 @@ mod catalog;
 mod copy;
 mod dialect;
 mod domain;
+mod interval;
 mod parse_edge_cases;
 mod table;
 mod type_aliases;

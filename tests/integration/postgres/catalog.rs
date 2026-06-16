@@ -619,6 +619,7 @@ fn test_format_type_expanded(db: TempDatabase) {
         (1114, "timestamp without time zone"),
         (1184, "timestamp with time zone"),
         (1186, "interval"),
+        (790, "money"),
         (2278, "void"),
         (2205, "regclass"),
         (2206, "regtype"),
