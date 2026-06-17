@@ -978,6 +978,75 @@ impl PgTestClient {
         self.read_until_ready()
     }
 
+    fn send_frontend_message(&mut self, tag: u8, body: &[u8]) {
+        let len = (4 + body.len()) as i32;
+        self.stream.write_all(&[tag]).unwrap();
+        self.stream.write_all(&len.to_be_bytes()).unwrap();
+        if !body.is_empty() {
+            self.stream.write_all(body).unwrap();
+        }
+        self.stream.flush().unwrap();
+    }
+
+    fn read_one_message(&mut self) -> (u8, Vec<u8>) {
+        let mut tag = [0u8; 1];
+        self.stream.read_exact(&mut tag).unwrap();
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf).unwrap();
+        let len = i32::from_be_bytes(len_buf) as usize;
+        let mut body = vec![0u8; len.saturating_sub(4)];
+        if !body.is_empty() {
+            self.stream.read_exact(&mut body).unwrap();
+        }
+        (tag[0], body)
+    }
+
+    /// COPY FROM STDIN: send query, stream CopyData chunks, then CopyDone.
+    fn copy_from_stdin(&mut self, sql: &str, data: &str) -> Vec<String> {
+        self.send_query(sql);
+        let mut saw_copy_in = false;
+        let mut tags = Vec::new();
+        loop {
+            let (tag, body) = self.read_one_message();
+            match tag {
+                b'G' => {
+                    saw_copy_in = true;
+                    self.send_frontend_message(b'd', data.as_bytes());
+                    self.send_frontend_message(b'c', &[]);
+                }
+                b'C' => {
+                    let s = String::from_utf8_lossy(&body);
+                    tags.push(s.trim_end_matches('\0').to_string());
+                }
+                b'Z' => {
+                    assert!(saw_copy_in, "expected CopyIn before ReadyForQuery");
+                    return tags;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// COPY TO STDOUT: return command tags and concatenated CopyData payloads.
+    fn copy_to_stdout(&mut self, sql: &str) -> (Vec<String>, String) {
+        self.send_query(sql);
+        let mut copy_data = String::new();
+        let mut tags = Vec::new();
+        loop {
+            let (tag, body) = self.read_one_message();
+            match tag {
+                b'H' | b'c' => {}
+                b'd' => copy_data.push_str(&String::from_utf8_lossy(&body)),
+                b'C' => {
+                    let s = String::from_utf8_lossy(&body);
+                    tags.push(s.trim_end_matches('\0').to_string());
+                }
+                b'Z' => return (tags, copy_data),
+                _ => {}
+            }
+        }
+    }
+
     fn write_message(&mut self, tag: u8, body: &[u8]) {
         let len = (4 + body.len()) as i32;
         self.stream.write_all(&[tag]).unwrap();
@@ -1149,6 +1218,58 @@ fn wire_copy_from_returns_copy_n() {
     );
 
     std::fs::remove_file(&path).ok();
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
+fn wire_copy_from_stdin_returns_copy_n() {
+    let port = 17432 + (std::process::id() % 1000) as u16;
+    let mut server = start_pgmicro_server(port);
+    let mut client = PgTestClient::connect(port);
+
+    let tags = client.query_command_tags("CREATE TABLE wire_stdin(id INT, name TEXT)");
+    assert!(
+        tags.iter().any(|t| t.contains("CREATE")),
+        "expected CREATE tag, got: {tags:?}"
+    );
+
+    let tags = client.copy_from_stdin("COPY wire_stdin FROM STDIN", "1\tAlice\n2\tBob\n");
+    assert!(
+        tags.iter().any(|t| t == "COPY 2"),
+        "expected 'COPY 2' tag, got: {tags:?}"
+    );
+
+    let tags = client.query_command_tags("SELECT id, name FROM wire_stdin ORDER BY id");
+    assert!(
+        tags.iter().any(|t| t.starts_with("SELECT")),
+        "expected SELECT tag, got: {tags:?}"
+    );
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
+fn wire_copy_to_stdout_streams_rows() {
+    let port = 18432 + (std::process::id() % 1000) as u16;
+    let mut server = start_pgmicro_server(port);
+    let mut client = PgTestClient::connect(port);
+
+    client.query_command_tags("CREATE TABLE wire_stdout(id INT, name TEXT)");
+    client.query_command_tags("INSERT INTO wire_stdout VALUES (1, 'Alice'), (2, 'Bob')");
+
+    let (tags, data) = client.copy_to_stdout("COPY wire_stdout TO STDOUT");
+    assert!(
+        tags.iter().any(|t| t == "COPY 2"),
+        "expected COPY 2 tag, got: {tags:?}"
+    );
+    assert!(
+        data.contains("Alice"),
+        "expected Alice in copy data: {data}"
+    );
+    assert!(data.contains("Bob"), "expected Bob in copy data: {data}");
+
     server.kill().ok();
     server.wait().ok();
 }
