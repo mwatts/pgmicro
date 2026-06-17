@@ -1,11 +1,11 @@
-use rand::{RngCore, SeedableRng, rng};
+use rand::{rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
-use turso_core::{Clock, Connection, Database, FromValueRow, IO, Row};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -700,9 +700,9 @@ mod tests {
     }
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
-    use turso_core::{Database, IO, StepResult};
+    use turso_core::{Database, StepResult, IO};
 
-    use crate::common::{ExecRows, do_flush};
+    use crate::common::{do_flush, ExecRows};
 
     use super::TempDatabase;
 
@@ -1104,7 +1104,9 @@ mod tests {
         Ok(())
     }
 
-    fn run_count_div_zero_query(opts: turso_core::DatabaseOpts) -> Vec<Vec<rusqlite::types::Value>> {
+    fn run_count_div_zero_query(
+        opts: turso_core::DatabaseOpts,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
         let db = TempDatabase::builder()
             .with_db_name("count-div-zero.db")
             .with_opts(opts)
@@ -1121,14 +1123,16 @@ mod tests {
         super::limbo_exec_rows(&conn, query)
     }
 
-    fn count_where(opts: turso_core::DatabaseOpts, where_clause: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    fn count_where(
+        opts: turso_core::DatabaseOpts,
+        where_clause: &str,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
         let db = TempDatabase::builder()
             .with_db_name("count-where.db")
             .with_opts(opts)
             .build();
         let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
-            .unwrap();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
         super::limbo_exec_rows(
             &conn,
@@ -1145,8 +1149,7 @@ mod tests {
             .with_opts(opts)
             .build();
         let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
-            .unwrap();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
         let q = "SELECT COUNT(*) FROM t WHERE (0) <> CAST((1.5) AS NUMERIC) <= 0";
         eprintln!("no_custom result: {:?}", super::limbo_exec_rows(&conn, q));
@@ -1166,8 +1169,7 @@ mod tests {
             .with_opts(opts)
             .build();
         let conn = db.connect_limbo();
-        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
-            .unwrap();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)").unwrap();
         conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
         let opts_plain = turso_core::DatabaseOpts::new()
             .with_encryption(true)
@@ -1177,7 +1179,9 @@ mod tests {
             .with_opts(opts_plain)
             .build();
         let plain = db_plain.connect_limbo();
-        plain.execute("CREATE TABLE t(x PRIMARY KEY, y, z)").unwrap();
+        plain
+            .execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
+            .unwrap();
         plain.execute("INSERT INTO t VALUES (1,2,3)").unwrap();
         eprintln!(
             "plain: {:?}",
@@ -1249,9 +1253,7 @@ mod tests {
             ("postgres", base.clone().with_postgres(true)),
             (
                 "index+custom",
-                base.clone()
-                    .with_index_method(true)
-                    .with_custom_types(true),
+                base.clone().with_index_method(true).with_custom_types(true),
             ),
             (
                 "all_fuzz",
