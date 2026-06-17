@@ -88,30 +88,39 @@ never re-serialize SQL) is the right call.
 - **SQLSTATE codes** — `cli/pg_server.rs` maps `LimboError` variants and message patterns to
   PostgreSQL SQLSTATE (e.g. `42601` syntax, `42P01` undefined_table, `23505` unique_violation,
   `40001` serialization_failure, `22P02` invalid_parameter). Unclassified errors still use `XX000`.
+- **Binary portal parameters** — `pg_bytes_to_value_binary()` decodes int/float/bool/bytea,
+  NUMERIC, DATE, TIME, TIMESTAMP/TIMESTAMPTZ, UUID, INTERVAL, and MONEY. Text fallback for
+  VARCHAR and unknown types.
+- **INT4/INT2 result encoding** — integer columns encode with `i32`/`i16` width when the
+  declared PG type is INT4/INT2 (not always i64).
 
 **Remaining:**
 
-- **Binary param format unsupported**, `cli/pg_server.rs:441`. Binary bytes decoded as UTF-8
-  → garbage/error. JDBC/psycopg3 binary mode breaks.
-- **NUMERIC = f64** everywhere. Precision silently lost.
+- **NUMERIC = f64** for parameters and many result paths. Binary decode maps to f64; precision
+  silently lost for decimal workloads.
 - **No row streaming**, `max_rows` ignored. Full result set buffered in memory.
 - **No SSL, no cancellation, no COPY-over-wire, no LISTEN/NOTIFY.**
-- **Type OID vs value mismatch**: INT4 column emits i64-encoded value; bare `NUMERIC`
-  advertised as FLOAT8 but `NUMERIC(10,2)` as NUMERIC — inconsistent.
+- **Bare NUMERIC vs NUMERIC(p,s)** — `sqlite_type_to_pg_type` still maps unqualified NUMERIC to
+  FLOAT8; parameterized `NUMERIC(10,2)` uses Type::NUMERIC.
 
 ### Catalog faithfulness
 
+**Fixed:**
+
+- **`pg_database` rows for ATTACH'd schemas** — `PgDatabaseCursor::load_databases()` includes
+  main db + attached schema databases; `\l` shows them.
+- **`pg_attribute.atttypmod`** — populated from varchar/numeric type modifiers.
+- **`pg_authid` / `pg_user` / `pg_enum` stubs** — single `turso` superuser in auth tables;
+  enum labels from `CREATE TYPE ... AS ENUM` via `pg_enum` + stable enum type OIDs (60000+).
+- **Enum OID assignment** — sequential from `USER_ENUM_OID_BASE` (60000), sorted by type name;
+  no longer hash-mod-10000 colliding with `pg_attrdef` (50000+).
+
 **Remaining:**
 
-- **Single hardcoded `turso` role** everywhere (`pg_roles`, `tableowner`,
-  `pg_get_userbyid`). Multi-user joins all wrong.
-- **`pg_database` = 1 row.** `\l` never shows attached schemas.
-- **No `pg_authid`/`pg_user`/`pg_enum`/`pg_description`/`pg_collation`** populated. `\du`,
-  `\dT+` error or empty.
-- **Enum OID = poly hash mod 10000**, `core/pg_catalog.rs:1887`. ~130 enums → >50% collision
-  chance. OID space collides with `pg_attrdef` (both 50000+).
+- **Single hardcoded `turso` role** — `pg_roles`, `tableowner`, `pg_get_userbyid` still one user.
+  Multi-user joins wrong until real auth.
+- **No `pg_description`/`pg_collation`** populated (still empty stubs).
 - **`pg_proc` OIDs ephemeral** — reassigned 1..n per scan, not stable.
-- **`atttypmod` always -1** — clients can't recover varchar/numeric length.
 - **Every vtab does full scan** — `argv_index: None`, no OID fast path. O(all attributes) per
   catalog query.
 
@@ -131,6 +140,8 @@ never re-serialize SQL) is the right call.
   SQLite tests when built in the same invocation.
 - **`prepare_execute_batch`** — SQLite path loops `Parser::next_cmd()` (matches `execute()`);
   PG path runs all statements from `translate_stmts()`.
+- **`SET sql_dialect` via PG `SET`** — InternalHelper PRAGMA translation no longer restores the
+  pre-SET dialect, so `SET sql_dialect = 'sqlite'` after Postgres mode persists correctly.
 
 **Remaining:**
 
@@ -145,12 +156,11 @@ never re-serialize SQL) is the right call.
 
 ### Validation bugs
 
-**Remaining:**
+**Fixed:**
 
-- Date validation accepts Feb 31 / Apr 31, `core/pg_catalog.rs:2958`.
-- `convert_to_postgres_ddl` naive string replace can rename columns containing `INTEGER`,
-  `core/pg_catalog.rs:3427`.
-- JSON validation checks bracket balance only, not grammar — `{"a":}` passes.
+- **Date validation** — rejects invalid calendar dates (e.g. Feb 31).
+- **DDL string-replace** — word-boundary aware `convert_sqlite_ddl_to_postgres`.
+- **JSON validation** — grammar check beyond bracket balance.
 
 ### Dead code
 
@@ -165,12 +175,16 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/wire-binary-params` | `cli/pg_server.rs` | Binary portal param format (JDBC/psycopg3) |
-| 2 | `fix/pg-database-schemas` | `core/pg_catalog.rs` | `pg_database` rows for ATTACH'd schemas; `\l` |
-| 3 | `fix/catalog-atttypmod` | `core/pg_catalog.rs` | `atttypmod` for varchar/numeric precision |
-| 4 | `fix/pg-catalog-validation` | `core/pg_catalog.rs` | Date, DDL string-replace, JSON validation |
+| 1 | `fix/numeric-precision` | core + `cli/pg_server.rs` | True NUMERIC type on wire; stop f64 loss |
+| 2 | `fix/wire-row-streaming` | `cli/pg_server.rs` | Respect `max_rows`; stream large result sets |
+| 3 | `fix/pg-proc-stable-oids` | `core/pg_catalog.rs` | Stable `pg_proc.oid` across scans |
+| 4 | `fix/catalog-oid-index` | `core/pg_catalog.rs` | OID fast path on pg_attribute/pg_class filters |
+| 5 | `fix/pg-description` | `core/pg_catalog.rs` | `COMMENT ON` storage + `pg_description` rows |
 
-**Completed on `pgmicro-fixes`:** `fix/interval-money-types` (core types + translator + catalog/wire).
+**Completed on `pgmicro-fixes`:** interval/money types; wire binary params (int/bool/float +
+NUMERIC/date/time/UUID/interval/money); `pg_database` schemas; `atttypmod`; catalog validation;
+wire binary types extension + INT4 encoding; `pg_authid`/`pg_user`/`pg_enum` stubs; enum OID
+fix; dialect `SET sql_dialect` persistence.
 
 ## Bottom line
 
@@ -180,11 +194,10 @@ ALTER, IS TRUE, search_path, INTERVAL/MONEY, aggregate ORDER BY) is fixed.
 
 Remaining gaps cluster in two buckets:
 
-1. **PG fidelity for tooling** — binary wire params, catalog stubs (`pg_database`, roles,
-   `atttypmod`, enum OIDs), NUMERIC precision. ORMs and typed drivers misbehave; psql mostly
-   survives.
-2. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; row streaming;
-   COPY/LISTEN/NOTIFY.
+1. **PG fidelity for tooling** — NUMERIC precision, row streaming, stable `pg_proc` OIDs, catalog
+   scan performance, real multi-user roles. ORMs and typed drivers are much closer; psql
+   `\du`/`\dT+`/`\l` work for common cases.
+2. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; COPY/LISTEN/NOTIFY.
 
 Strongest part: translator breadth + test depth + rapid correctness fixes on `pgmicro-fixes`.
-Weakest: wire-protocol tooling fidelity and catalog completeness for ORM/framework startup.
+Weakest: NUMERIC precision and wire-server scale (buffering, auth) for production-adjacent use.

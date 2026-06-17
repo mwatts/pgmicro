@@ -1071,3 +1071,73 @@ fn test_pg_create_table_in_pg_database(db: TempDatabase) {
         "pg_database should include attached schema 'foo', got {datnames:?}"
     );
 }
+
+#[turso_macros::test]
+fn test_pg_authid_and_pg_user_stubs(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT rolname, rolsuper FROM pg_authid")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected pg_authid row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(rolname) = row.get_value(0) else {
+        panic!("expected rolname text");
+    };
+    let Value::Numeric(Numeric::Integer(superuser)) = row.get_value(1) else {
+        panic!("expected rolsuper integer");
+    };
+    assert_eq!(rolname.as_str(), "turso");
+    assert_eq!(*superuser, 1);
+
+    let mut stmt = conn
+        .prepare("SELECT usename, usesuper FROM pg_user")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected pg_user row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(usename) = row.get_value(0) else {
+        panic!("expected usename text");
+    };
+    let Value::Numeric(Numeric::Integer(superuser)) = row.get_value(1) else {
+        panic!("expected usesuper integer");
+    };
+    assert_eq!(usename.as_str(), "turso");
+    assert_eq!(*superuser, 1);
+}
+
+#[turso_macros::test]
+fn test_pg_enum_labels(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    conn.execute("CREATE TYPE mood AS ENUM ('happy', 'sad')")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT enumlabel FROM pg_enum e \
+             JOIN pg_type t ON e.enumtypid = t.oid \
+             WHERE t.typname = 'mood' ORDER BY e.enumsortorder",
+        )
+        .unwrap();
+    let mut labels = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let Value::Text(label) = row.get_value(0) else {
+                    panic!("expected enum label text");
+                };
+                labels.push(label.as_str().to_string());
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(labels, vec!["happy", "sad"]);
+}

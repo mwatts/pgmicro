@@ -828,7 +828,12 @@ impl Connection {
             ))
         })();
         if let Some(d) = saved_dialect {
-            self.set_sql_dialect(d);
+            // SET/SHOW → PRAGMA translation runs as InternalHelper SQL. A PRAGMA
+            // sql_dialect statement must persist its new dialect; restoring the
+            // pre-helper dialect would undo SET sql_dialect = 'sqlite', etc.
+            if !is_pragma_sql_dialect(sql.as_ref()) {
+                self.set_sql_dialect(d);
+            }
         }
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -3405,6 +3410,13 @@ impl std::fmt::Debug for SymbolTable {
             .field("functions", &self.functions)
             .finish()
     }
+}
+
+/// True when `sql` is a PRAGMA that changes the connection SQL dialect.
+fn is_pragma_sql_dialect(sql: &str) -> bool {
+    sql.trim()
+        .to_ascii_lowercase()
+        .starts_with("pragma sql_dialect")
 }
 
 fn is_shared_library(path: &std::path::Path) -> bool {

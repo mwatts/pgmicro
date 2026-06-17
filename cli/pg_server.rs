@@ -516,6 +516,169 @@ fn read_be_f64(bytes: &[u8]) -> Result<f64, String> {
     Ok(f64::from_be_bytes(arr))
 }
 
+fn read_be_u16(bytes: &[u8]) -> Result<u16, String> {
+    let arr: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 2 bytes, got {}", bytes.len()))?;
+    Ok(u16::from_be_bytes(arr))
+}
+
+/// Proleptic Gregorian calendar helpers (Howard Hinnant).
+fn days_from_civil(year: i32, month: u32, day: u32) -> i32 {
+    let mut y = year;
+    y -= if month <= 2 { 1 } else { 0 };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let month_adj: i32 = if month > 2 {
+        i32::try_from(month).unwrap_or(12) - 3
+    } else {
+        i32::try_from(month).unwrap_or(1) + 9
+    };
+    let doy = (153 * month_adj + 2) / 5 + i32::try_from(day).unwrap_or(1) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i32) -> (i32, u32, u32) {
+    let z = i64::from(z);
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    let y = y + if m <= 2 { 1 } else { 0 };
+    (
+        i32::try_from(y).unwrap_or(i32::MAX),
+        u32::try_from(m).unwrap_or(1),
+        u32::try_from(d).unwrap_or(1),
+    )
+}
+
+fn format_pg_date(days_since_2000: i32) -> String {
+    let (y, m, d) = civil_from_days(days_from_civil(2000, 1, 1) + days_since_2000);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn format_pg_time_micros(micros: i64) -> String {
+    let micros = micros.rem_euclid(86_400_000_000);
+    let secs = micros / 1_000_000;
+    let frac = micros % 1_000_000;
+    let hours = secs / 3600;
+    let mins = (secs % 3600) / 60;
+    let secs = secs % 60;
+    if frac == 0 {
+        format!("{hours:02}:{mins:02}:{secs:02}")
+    } else {
+        let frac_str = format!("{frac:06}");
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("{hours:02}:{mins:02}:{secs:02}.{trimmed}")
+    }
+}
+
+fn format_pg_timestamp_micros(micros: i64) -> String {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let day_micros = micros.rem_euclid(MICROS_PER_DAY);
+    format!(
+        "{} {}",
+        format_pg_date(days as i32),
+        format_pg_time_micros(day_micros)
+    )
+}
+
+fn format_uuid(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() != 16 {
+        return Err(format!("expected 16 bytes, got {}", bytes.len()));
+    }
+    Ok(format!(
+        "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        u32::from_be_bytes(bytes[0..4].try_into().unwrap()),
+        u16::from_be_bytes(bytes[4..6].try_into().unwrap()),
+        u16::from_be_bytes(bytes[6..8].try_into().unwrap()),
+        u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+        u64::from_be_bytes([
+            0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    ))
+}
+
+fn format_pg_interval_binary(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() != 16 {
+        return Err(format!("expected 16 bytes, got {}", bytes.len()));
+    }
+    let micros = read_be_i64(&bytes[0..8])?;
+    let days = read_be_i32(&bytes[8..12])?;
+    let months = read_be_i32(&bytes[12..16])?;
+    let mut parts = Vec::new();
+    if months != 0 {
+        parts.push(format!("{months} mons"));
+    }
+    if days != 0 {
+        parts.push(format!("{days} days"));
+    }
+    if micros != 0 {
+        let secs = micros / 1_000_000;
+        let frac = micros % 1_000_000;
+        if frac == 0 {
+            parts.push(format!("{secs} secs"));
+        } else {
+            let frac_str = format!("{frac:06}").trim_end_matches('0').to_string();
+            parts.push(format!("{secs}.{frac_str} secs"));
+        }
+    }
+    if parts.is_empty() {
+        Ok("0".to_string())
+    } else {
+        Ok(parts.join(" "))
+    }
+}
+
+fn format_money_cents(cents: i64) -> String {
+    let negative = cents < 0;
+    let abs = cents.unsigned_abs();
+    let dollars = abs / 100;
+    let frac = abs % 100;
+    if negative {
+        format!("-${dollars}.{frac:02}")
+    } else {
+        format!("${dollars}.{frac:02}")
+    }
+}
+
+fn decode_numeric_binary(bytes: &[u8]) -> Result<f64, String> {
+    if bytes.len() < 8 {
+        return Err(format!("numeric too short: {} bytes", bytes.len()));
+    }
+    let ndigits = read_be_u16(&bytes[0..2])? as usize;
+    let weight = read_be_i16(&bytes[2..4])?;
+    let sign = read_be_u16(&bytes[4..6])?;
+    let _dscale = read_be_i16(&bytes[6..8])?;
+    if sign == 0xC000 {
+        return Err("numeric NaN".to_string());
+    }
+    let negative = sign == 0x4000;
+    let digits_bytes = ndigits
+        .checked_mul(2)
+        .ok_or_else(|| "numeric digit count overflow".to_string())?;
+    if bytes.len() < 8 + digits_bytes {
+        return Err("truncated numeric payload".to_string());
+    }
+    let mut value = 0.0f64;
+    for i in 0..ndigits {
+        let digit = read_be_u16(&bytes[8 + i * 2..10 + i * 2])? as f64;
+        let exp = i64::from(weight) - i as i64;
+        value += digit * 10000f64.powi(exp as i32);
+    }
+    if negative {
+        value = -value;
+    }
+    Ok(value)
+}
+
 /// Decode a parameter sent in PostgreSQL binary format.
 fn pg_bytes_to_value_binary(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     match *pg_type {
@@ -549,9 +712,34 @@ fn pg_bytes_to_value_binary(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value>
             Ok(Value::from_i64(if bytes[0] == 0 { 0 } else { 1 }))
         }
         Type::BYTEA => Ok(Value::from_blob(bytes.to_vec())),
-        Type::NUMERIC => Err(binary_parameter_error(
-            "binary NUMERIC format is not supported",
-        )),
+        Type::NUMERIC => {
+            let f = decode_numeric_binary(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_f64(f))
+        }
+        Type::DATE => {
+            let days = read_be_i32(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(format_pg_date(days)))
+        }
+        Type::TIME => {
+            let micros = read_be_i64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(format_pg_time_micros(micros)))
+        }
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+            let micros = read_be_i64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(format_pg_timestamp_micros(micros)))
+        }
+        Type::UUID => {
+            let text = format_uuid(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(text))
+        }
+        Type::INTERVAL => {
+            let text = format_pg_interval_binary(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(text))
+        }
+        Type::MONEY => {
+            let cents = read_be_i64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(format_money_cents(cents)))
+        }
         Type::UNKNOWN => pg_bytes_to_value_binary_unknown(bytes),
         // TEXT, VARCHAR, and other types: binary is still UTF-8 payload
         _ => {
@@ -682,6 +870,16 @@ fn encode_value(
             if *pg_type == Type::BOOL {
                 encoder
                     .encode_field(&(*i != 0))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT2 {
+                let v = i16::try_from(*i).map_err(|_| turso_core::LimboError::IntegerOverflow)?;
+                encoder
+                    .encode_field(&v)
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::INT4 {
+                let v = i32::try_from(*i).map_err(|_| turso_core::LimboError::IntegerOverflow)?;
+                encoder
+                    .encode_field(&v)
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
                 encoder
@@ -1137,6 +1335,50 @@ mod tests {
     fn test_pg_bytes_to_value_binary_text_fallback() {
         let val = pg_bytes_to_value(b"hello", &Type::TEXT, FieldFormat::Binary).unwrap();
         assert_eq!(val, Value::from_text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_date() {
+        let bytes = 0i32.to_be_bytes();
+        let val = pg_bytes_to_value(&bytes, &Type::DATE, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_text("2000-01-01"));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_money() {
+        let bytes = 1234i64.to_be_bytes();
+        let val = pg_bytes_to_value(&bytes, &Type::MONEY, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_text("$12.34"));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_uuid() {
+        let bytes = [
+            0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
+            0x00, 0x00,
+        ];
+        let val = pg_bytes_to_value(&bytes, &Type::UUID, FieldFormat::Binary).unwrap();
+        assert_eq!(
+            val,
+            Value::from_text("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_numeric() {
+        let bytes = [0, 1, 0, 0, 0, 0, 0, 0, 0, 42];
+        let val = pg_bytes_to_value(&bytes, &Type::NUMERIC, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_f64(42.0));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_interval() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_500_000i64.to_be_bytes());
+        bytes.extend_from_slice(&0i32.to_be_bytes());
+        bytes.extend_from_slice(&0i32.to_be_bytes());
+        let val = pg_bytes_to_value(&bytes, &Type::INTERVAL, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_text("1.5 secs"));
     }
 
     #[test]

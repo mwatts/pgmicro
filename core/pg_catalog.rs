@@ -1,4 +1,4 @@
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, Table, TypeDef};
 use crate::sync::{Arc, LazyLock, RwLock};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
@@ -727,6 +727,97 @@ impl InternalVirtualTableCursor for PgAttributeCursor {
     }
 }
 
+/// OID base for user ENUM types. Starts above pg_attrdef (50000+).
+const USER_ENUM_OID_BASE: i64 = 60_000;
+
+fn is_pg_enum_type(td: &TypeDef) -> bool {
+    if td.is_builtin {
+        return false;
+    }
+    td.sql.to_ascii_uppercase().contains("AS ENUM")
+        || td.sql.contains("invalid input value for enum")
+}
+
+fn user_enum_oid_map(
+    registry: &HashMap<String, Arc<TypeDef>>,
+) -> std::collections::BTreeMap<String, i64> {
+    use std::collections::BTreeMap;
+    let mut names: Vec<&String> = registry
+        .iter()
+        .filter(|(_, td)| is_pg_enum_type(td))
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), USER_ENUM_OID_BASE + i as i64))
+        .collect::<BTreeMap<_, _>>()
+}
+
+fn parse_enum_labels_from_type_def(td: &TypeDef) -> Vec<String> {
+    let upper = td.sql.to_ascii_uppercase();
+    if let Some(idx) = upper.find("AS ENUM") {
+        let rest = &td.sql[idx + 7..];
+        if let (Some(start_paren), Some(end_paren)) = (rest.find('('), rest.rfind(')')) {
+            let inner = &rest[start_paren + 1..end_paren];
+            return inner
+                .split(',')
+                .filter_map(|part| parse_enum_label_token(part))
+                .collect();
+        }
+    }
+
+    // Turso-persisted enum types store labels in ENCODE CASE ... IN ('a','b') ...
+    let Some(in_start) = td.sql.find("IN (") else {
+        return Vec::new();
+    };
+    let rest = &td.sql[in_start + 4..];
+    let Some(in_end) = rest.find(')') else {
+        return Vec::new();
+    };
+    rest[..in_end]
+        .split(',')
+        .filter_map(|part| parse_enum_label_token(part))
+        .collect()
+}
+
+fn parse_enum_label_token(part: &str) -> Option<String> {
+    let trimmed = part.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unquoted = trimmed
+        .trim_start_matches('\'')
+        .trim_end_matches('\'')
+        .trim_start_matches('"')
+        .trim_end_matches('"');
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+/// Stub: single default superuser role shared by pg_roles, pg_authid, and pg_user.
+fn default_pg_role_rows() -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::from_i64(10),        // oid
+        Value::build_text("turso"), // rolname
+        Value::from_i64(1),         // rolsuper
+        Value::from_i64(1),         // rolinherit
+        Value::from_i64(1),         // rolcreaterole
+        Value::from_i64(1),         // rolcreatedb
+        Value::from_i64(1),         // rolcanlogin
+        Value::from_i64(1),         // rolreplication
+        Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
+        Value::Null,                // rolpassword (never exposed)
+        Value::Null,                // rolvaliduntil
+        Value::from_i64(1),         // rolbypassrls
+        Value::Null,                // rolconfig
+    ]]
+}
+
 /// Virtual table implementation for pg_catalog.pg_roles
 /// Stub: returns a single hardcoded "turso" superuser role.
 /// TODO: replace with real role data when authentication is implemented.
@@ -738,24 +829,8 @@ impl PgRolesTable {
         Self
     }
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
     fn roles() -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+        default_pg_role_rows()
     }
 }
 
@@ -848,6 +923,368 @@ impl InternalVirtualTableCursor for PgRolesCursor {
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
         self.rows = PgRolesTable::roles();
+        Ok(!self.rows.is_empty())
+    }
+}
+
+/// Virtual table for pg_catalog.pg_authid (psql `\du`, ORM role lookups).
+#[derive(Debug)]
+struct PgAuthidTable;
+
+impl PgAuthidTable {
+    fn new() -> Self {
+        Self
+    }
+
+    fn authid_rows() -> Vec<Vec<Value>> {
+        default_pg_role_rows()
+            .into_iter()
+            .map(|row| {
+                vec![
+                    row[0].clone(),  // oid
+                    row[1].clone(),  // rolname
+                    row[2].clone(),  // rolsuper
+                    row[3].clone(),  // rolinherit
+                    row[4].clone(),  // rolcreaterole
+                    row[5].clone(),  // rolcreatedb
+                    row[6].clone(),  // rolcanlogin
+                    row[7].clone(),  // rolreplication
+                    row[8].clone(),  // rolconnlimit
+                    row[9].clone(),  // rolpassword
+                    row[10].clone(), // rolvaliduntil
+                    row[11].clone(), // rolbypassrls
+                    row[12].clone(), // rolconfig
+                ]
+            })
+            .collect()
+    }
+}
+
+impl InternalVirtualTable for PgAuthidTable {
+    fn name(&self) -> String {
+        "pg_authid".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgAuthidCursor {
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 1,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_authid (
+            oid INTEGER,
+            rolname TEXT,
+            rolsuper INTEGER,
+            rolinherit INTEGER,
+            rolcreaterole INTEGER,
+            rolcreatedb INTEGER,
+            rolcanlogin INTEGER,
+            rolreplication INTEGER,
+            rolconnlimit INTEGER,
+            rolpassword TEXT,
+            rolvaliduntil TEXT,
+            rolbypassrls INTEGER,
+            rolconfig TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct PgAuthidCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgAuthidCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows = PgAuthidTable::authid_rows();
+        Ok(!self.rows.is_empty())
+    }
+}
+
+/// Virtual table for pg_catalog.pg_user (psql `\du`).
+#[derive(Debug)]
+struct PgUserTable;
+
+impl PgUserTable {
+    fn new() -> Self {
+        Self
+    }
+
+    fn user_rows() -> Vec<Vec<Value>> {
+        default_pg_role_rows()
+            .into_iter()
+            .map(|row| {
+                vec![
+                    row[1].clone(),  // usename
+                    row[0].clone(),  // usesysid
+                    row[5].clone(),  // usecreatedb
+                    row[2].clone(),  // usesuper
+                    row[7].clone(),  // userepl
+                    row[11].clone(), // usebypassrls
+                    row[9].clone(),  // passwd
+                    row[10].clone(), // valuntil
+                    row[12].clone(), // useconfig
+                ]
+            })
+            .collect()
+    }
+}
+
+impl InternalVirtualTable for PgUserTable {
+    fn name(&self) -> String {
+        "pg_user".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgUserCursor {
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 1,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_user (
+            usename TEXT,
+            usesysid INTEGER,
+            usecreatedb INTEGER,
+            usesuper INTEGER,
+            userepl INTEGER,
+            usebypassrls INTEGER,
+            passwd TEXT,
+            valuntil TEXT,
+            useconfig TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct PgUserCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgUserCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows = PgUserTable::user_rows();
+        Ok(!self.rows.is_empty())
+    }
+}
+
+/// Virtual table for pg_catalog.pg_enum (enum labels for `\dT+`).
+#[derive(Debug)]
+struct PgEnumTable;
+
+impl PgEnumTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for PgEnumTable {
+    fn name(&self) -> String {
+        "pg_enum".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgEnumCursor {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 10,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_enum (
+            oid INTEGER,
+            enumtypid INTEGER,
+            enumsortorder REAL,
+            enumlabel TEXT
+        )"
+        .to_string()
+    }
+}
+
+struct PgEnumCursor {
+    conn: Arc<Connection>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl PgEnumCursor {
+    fn load_enums(&mut self) {
+        self.rows.clear();
+        let schema = self.conn.schema.read().clone();
+        let oid_map = user_enum_oid_map(&schema.type_registry);
+        let mut enum_oid_counter = USER_ENUM_OID_BASE + 10_000;
+
+        for (type_name, type_oid) in &oid_map {
+            let Some(td) = schema.type_registry.get(type_name) else {
+                continue;
+            };
+            let labels = parse_enum_labels_from_type_def(td);
+            for (sort_order, label) in labels.into_iter().enumerate() {
+                self.rows.push(vec![
+                    Value::from_i64(enum_oid_counter),
+                    Value::from_i64(*type_oid),
+                    Value::from_f64(sort_order as f64 + 1.0),
+                    Value::build_text(label),
+                ]);
+                enum_oid_counter += 1;
+            }
+        }
+    }
+}
+
+impl InternalVirtualTableCursor for PgEnumCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.load_enums();
         Ok(!self.rows.is_empty())
     }
 }
@@ -2000,19 +2437,17 @@ impl PgTypeCursor {
 
         // Dynamic: user-defined enum types from type_registry
         let schema = self.conn.schema.read().clone();
+        let enum_oids = user_enum_oid_map(&schema.type_registry);
         for (name, td) in &schema.type_registry {
-            if td.is_builtin {
+            if td.is_builtin || !is_pg_enum_type(td) {
                 continue;
             }
+            let Some(enum_oid) = enum_oids.get(name) else {
+                continue;
+            };
             // User-defined enums: typtype='e', typcategory='E'
-            let enum_oid = 50000
-                + (name
-                    .as_bytes()
-                    .iter()
-                    .fold(0u64, |acc, &b| acc.wrapping_mul(31).wrapping_add(b as u64))
-                    % 10000) as i64;
             self.rows.push(vec![
-                Value::from_i64(enum_oid),        // oid
+                Value::from_i64(*enum_oid),       // oid
                 Value::Text(name.clone().into()), // typname
                 Value::from_i64(11),              // typnamespace (pg_catalog)
                 Value::from_i64(10),              // typowner
@@ -2792,6 +3227,33 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
                 Arc::new(RwLock::new(PgRolesTable::new())),
             )
             .expect("pg_roles virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_authid".to_string(),
+                PgAuthidTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgAuthidTable::new())),
+            )
+            .expect("pg_authid virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_user".to_string(),
+                PgUserTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgUserTable::new())),
+            )
+            .expect("pg_user virtual table creation should not fail"),
+        ),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_enum".to_string(),
+                PgEnumTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgEnumTable::new())),
+            )
+            .expect("pg_enum virtual table creation should not fail"),
         ),
         // pg_am virtual table
         Arc::new(
