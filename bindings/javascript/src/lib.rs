@@ -341,6 +341,8 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
     if let Some(query_timeout) = query_timeout {
         conn.set_query_timeout(query_timeout);
     }
+    #[cfg(feature = "default-postgres")]
+    conn.set_sql_dialect(turso_core::SqlDialect::Postgres);
 
     let connect = DatabaseConnect {
         _db: Some(db_core),

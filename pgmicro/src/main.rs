@@ -1,5 +1,5 @@
 // pgmicro — PostgreSQL-compatible micro database CLI
-// Standalone crate with default-postgres feature for compile-time dialect default.
+// Standalone crate with default-postgres feature for PG catalog/type support.
 #![allow(clippy::arc_with_non_send_sync)]
 
 #[path = "../../cli/config/mod.rs"]
@@ -121,6 +121,7 @@ fn open_database(
 
     let (io, db) = Database::open_new(db_path, vfs, flags, db_opts.turso_cli(), None)?;
     let conn = db.connect()?;
+    conn.set_sql_dialect(turso_core::SqlDialect::Postgres);
     Ok((io, conn))
 }
 
