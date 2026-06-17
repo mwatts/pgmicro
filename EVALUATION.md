@@ -18,8 +18,8 @@ never re-serialize SQL) is the right call.
 | Layer | Real capability |
 |---|---|
 | Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT, GREATEST/LEAST, DISTINCT ON, INTERVAL/MONEY |
-| Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; ~12 stubs for psql compat |
-| Wire | Simple + Extended query protocol, multi-statement, trust auth (localhost-only; no TLS) |
+| Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; role registry; `pg_description` from COMMENT ON; ~11 stubs for psql compat |
+| Wire | Simple + Extended query protocol, multi-statement, lazy row streaming, COPY FROM/TO STDIN/STDOUT, trust auth (localhost-only; no TLS) |
 | REPL | 19 `\` meta-commands, all tested |
 | Schemas | CREATE/DROP SCHEMA → ATTACH separate `.db` files; `search_path` drives unqualified resolution |
 
@@ -44,6 +44,8 @@ never re-serialize SQL) is the right call.
 - **No auth / no TLS** — `NoopHandler` still returns `AuthenticationOk` to any client that
   can reach the port. CLI help and startup stderr warn to bind `127.0.0.1` only. Intended for
   trusted local development, not public network exposure.
+- **Role registry in-memory** — `CREATE ROLE` works per connection; not persisted; no password
+  verification or `SET ROLE` yet.
 
 ### Correctness — wrong results, silent
 
@@ -83,7 +85,7 @@ never re-serialize SQL) is the right call.
 
 ### Wire protocol fidelity
 
-**Partially fixed:**
+**Fixed:**
 
 - **SQLSTATE codes** — `cli/pg_server.rs` maps `LimboError` variants and message patterns to
   PostgreSQL SQLSTATE (e.g. `42601` syntax, `42P01` undefined_table, `23505` unique_violation,
@@ -93,15 +95,18 @@ never re-serialize SQL) is the right call.
   VARCHAR and unknown types.
 - **INT4/INT2 result encoding** — integer columns encode with `i32`/`i16` width when the
   declared PG type is INT4/INT2 (not always i64).
+- **NUMERIC precision** — wire binary/text paths preserve decimal text via `BigDecimal`; no
+  silent f64 loss on parameters or NUMERIC-typed results.
+- **Row streaming** — query results stream row-by-row through pgwire instead of buffering the
+  full result set.
+- **COPY wire protocol** — `COPY FROM STDIN` / `COPY TO STDOUT` via `CopyHandler` and inline
+  copy-out in `cli/pg_server.rs` (text format).
 
 **Remaining:**
 
-- **NUMERIC = f64** for parameters and many result paths. Binary decode maps to f64; precision
-  silently lost for decimal workloads.
-- **No row streaming**, `max_rows` ignored. Full result set buffered in memory.
-- **No SSL, no cancellation, no COPY-over-wire, no LISTEN/NOTIFY.**
-- **Bare NUMERIC vs NUMERIC(p,s)** — `sqlite_type_to_pg_type` still maps unqualified NUMERIC to
-  FLOAT8; parameterized `NUMERIC(10,2)` uses Type::NUMERIC.
+- **No SSL, no cancellation, no LISTEN/NOTIFY.**
+- **Bare NUMERIC vs NUMERIC(p,s)** — unqualified NUMERIC columns may still map to FLOAT8 in
+  some catalog metadata paths; parameterized `NUMERIC(10,2)` uses Type::NUMERIC.
 
 ### Catalog faithfulness
 
@@ -110,19 +115,22 @@ never re-serialize SQL) is the right call.
 - **`pg_database` rows for ATTACH'd schemas** — `PgDatabaseCursor::load_databases()` includes
   main db + attached schema databases; `\l` shows them.
 - **`pg_attribute.atttypmod`** — populated from varchar/numeric type modifiers.
-- **`pg_authid` / `pg_user` / `pg_enum` stubs** — single `turso` superuser in auth tables;
-  enum labels from `CREATE TYPE ... AS ENUM` via `pg_enum` + stable enum type OIDs (60000+).
+- **`pg_authid` / `pg_user` / `pg_enum`** — role registry + enum labels from `CREATE TYPE ...
+  AS ENUM` via `pg_enum` + stable enum type OIDs (60000+).
 - **Enum OID assignment** — sequential from `USER_ENUM_OID_BASE` (60000), sorted by type name;
   no longer hash-mod-10000 colliding with `pg_attrdef` (50000+).
+- **`pg_proc` stable OIDs** — sorted name map from base 80000; alias names (`char_length`,
+  `btrim`, etc.) included.
+- **Catalog index fast paths** — `pg_class` OID/relname equality; `pg_attribute` attrelid filter.
+- **Multi-user roles** — in-memory `CREATE ROLE` / `DROP ROLE`; `pg_roles` / `pg_authid` /
+  `pg_user` / `pg_get_userbyid` read live registry.
+- **`pg_description`** — `COMMENT ON TABLE/COLUMN/TYPE` stored per connection; exposed via
+  `pg_description` virtual table.
 
 **Remaining:**
 
-- **Single hardcoded `turso` role** — `pg_roles`, `tableowner`, `pg_get_userbyid` still one user.
-  Multi-user joins wrong until real auth.
-- **No `pg_description`/`pg_collation`** populated (still empty stubs).
-- **`pg_proc` OIDs ephemeral** — reassigned 1..n per scan, not stable.
-- **Every vtab does full scan** — `argv_index: None`, no OID fast path. O(all attributes) per
-  catalog query.
+- **No `pg_collation`** populated (still empty stub).
+- **Role persistence** — registry resets on reconnect; no password/TLS/`GRANT`.
 
 ### Dialect / schema mechanism
 
@@ -142,6 +150,8 @@ never re-serialize SQL) is the right call.
   PG path runs all statements from `translate_stmts()`.
 - **`SET sql_dialect` via PG `SET`** — InternalHelper PRAGMA translation no longer restores the
   pre-SET dialect, so `SET sql_dialect = 'sqlite'` after Postgres mode persists correctly.
+- **SQL-level PREPARE / EXECUTE / DEALLOCATE** — session registry in `pg_prepared`; `EXECUTE`
+  binds parameters and returns a runnable statement.
 
 **Remaining:**
 
@@ -175,29 +185,28 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/numeric-precision` | core + `cli/pg_server.rs` | True NUMERIC type on wire; stop f64 loss |
-| 2 | `fix/wire-row-streaming` | `cli/pg_server.rs` | Respect `max_rows`; stream large result sets |
-| 3 | `fix/pg-proc-stable-oids` | `core/pg_catalog.rs` | Stable `pg_proc.oid` across scans |
-| 4 | `fix/catalog-oid-index` | `core/pg_catalog.rs` | OID fast path on pg_attribute/pg_class filters |
-| 5 | `fix/pg-description` | `core/pg_catalog.rs` | `COMMENT ON` storage + `pg_description` rows |
+| 1 | `fix/auth-persist` | `core/pg_role.rs` + storage | Persist roles; wire startup user; `SET ROLE` |
+| 2 | `fix/pg-collation` | `core/pg_catalog.rs` | Populate `pg_collation` stub |
+| 3 | `fix/wire-tls` | `cli/pg_server.rs` | TLS for non-localhost (optional) |
+| 4 | `fix/listen-notify` | wire + async | LISTEN/NOTIFY stubs or real pub/sub |
 
-**Completed on `pgmicro-fixes`:** interval/money types; wire binary params (int/bool/float +
-NUMERIC/date/time/UUID/interval/money); `pg_database` schemas; `atttypmod`; catalog validation;
-wire binary types extension + INT4 encoding; `pg_authid`/`pg_user`/`pg_enum` stubs; enum OID
-fix; dialect `SET sql_dialect` persistence.
+**Completed on `pgmicro-fixes`:** interval/money types; wire binary params; `pg_database` schemas;
+`atttypmod`; catalog validation; `pg_authid`/`pg_user`/`pg_enum`; dialect `SET sql_dialect`
+persistence; NUMERIC wire precision; row streaming; stable `pg_proc` OIDs; catalog OID fast
+paths; multi-user role registry; `pg_description` + COMMENT ON; COPY wire STDIN/STDOUT;
+SQL-level PREPARE/EXECUTE/DEALLOCATE; `pg_proc` PG alias names.
 
 ## Bottom line
 
 Core engine works and the design is clean. The major silent-correctness cluster from the
-original eval (NOT IN, NULLS, DISTINCT ON, set-op ALL, GREATEST/LEAST, ANY(array), TRUNCATE,
-ALTER, IS TRUE, search_path, INTERVAL/MONEY, aggregate ORDER BY) is fixed.
+original eval is fixed. Tooling fidelity (catalog, wire COPY, comments, roles, streaming,
+NUMERIC) is substantially improved — psql `\du`, `\d+`, `\l`, and COPY workflows work for
+common cases.
 
 Remaining gaps cluster in two buckets:
 
-1. **PG fidelity for tooling** — NUMERIC precision, row streaming, stable `pg_proc` OIDs, catalog
-   scan performance, real multi-user roles. ORMs and typed drivers are much closer; psql
-   `\du`/`\dT+`/`\l` work for common cases.
-2. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; COPY/LISTEN/NOTIFY.
+1. **Production auth** — persist roles, password verification, TLS, `GRANT`/`REVOKE`.
+2. **Wire server extras** — cancellation, LISTEN/NOTIFY, COPY binary format.
 
 Strongest part: translator breadth + test depth + rapid correctness fixes on `pgmicro-fixes`.
-Weakest: NUMERIC precision and wire-server scale (buffering, auth) for production-adjacent use.
+Weakest: durable multi-session auth for anything beyond localhost dev.
