@@ -920,6 +920,48 @@ fn test_pg_create_table_visible_in_pg_class(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_attribute_atttypmod(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    conn.execute("CREATE TABLE typmod_test (name varchar(100), amount numeric(10,2))")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT a.attname, a.atttypmod \
+             FROM pg_attribute a \
+             JOIN pg_class c ON a.attrelid = c.oid \
+             WHERE c.relname = 'typmod_test' AND a.attnum > 0 AND a.attisdropped = 0 \
+             ORDER BY a.attnum",
+        )
+        .unwrap();
+
+    let mut columns = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let name = row.get_value(0).to_string();
+                let typmod = match row.get_value(1) {
+                    Value::Numeric(Numeric::Integer(n)) => *n,
+                    other => panic!("expected integer atttypmod, got {other:?}"),
+                };
+                columns.push((name, typmod));
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+
+    assert_eq!(columns.len(), 2, "expected 2 columns, got {columns:?}");
+    assert_eq!(columns[0].0, "name");
+    assert_eq!(columns[0].1, 104, "varchar(100) -> atttypmod 104");
+    assert_eq!(columns[1].0, "amount");
+    assert_eq!(columns[1].1, 655366, "numeric(10,2) -> atttypmod 655366");
+}
+
+#[turso_macros::test]
 fn test_pg_create_table_columns_in_pg_attribute(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();

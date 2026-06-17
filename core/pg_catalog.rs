@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{Expr, RefAct};
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
@@ -70,6 +70,67 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "MACADDR" => 829,
         "OID" => 26,
         _ => 25, // default to text
+    }
+}
+
+/// Parse `(precision, scale)` or `(length)` modifiers from a type string such as
+/// `varchar(100)` or `numeric(10,2)`.
+fn parse_type_modifiers_from_str(ty_str: &str) -> (String, Vec<i64>) {
+    let trimmed = ty_str.trim();
+    let Some(pos) = trimmed.find('(') else {
+        return (trimmed.to_string(), Vec::new());
+    };
+
+    let base = trimmed[..pos].trim().to_string();
+    let mod_str = trimmed[pos + 1..].trim_end_matches(')').trim();
+    if mod_str.is_empty() {
+        return (base, Vec::new());
+    }
+
+    let params = mod_str
+        .split(',')
+        .filter_map(|part| part.trim().parse::<i64>().ok())
+        .collect();
+    (base, params)
+}
+
+fn typmod_param_as_i64(expr: &Expr) -> Option<i64> {
+    match crate::util::parse_signed_number(expr) {
+        Ok(Value::Numeric(Numeric::Integer(n))) => Some(n),
+        _ => None,
+    }
+}
+
+/// Compute PostgreSQL `pg_attribute.atttypmod` from a column type.
+///
+/// Matches PostgreSQL conventions used by `format_type()`:
+/// - `varchar(N)` / `char(N)`: `N + 4`
+/// - `numeric(P,S)` / `decimal(P,S)`: `((P << 16) | S) + 4`
+/// - unmodified types: `-1`
+fn pg_atttypmod(ty_str: &str, ty_params: &[Box<Expr>]) -> i64 {
+    let (base_from_str, params_from_str) = parse_type_modifiers_from_str(ty_str);
+    let params: Vec<i64> = if !params_from_str.is_empty() {
+        params_from_str
+    } else {
+        ty_params
+            .iter()
+            .filter_map(|param| typmod_param_as_i64(param))
+            .collect()
+    };
+
+    if params.is_empty() {
+        return -1;
+    }
+
+    let base = base_from_str.to_uppercase();
+    match base.as_str() {
+        "VARCHAR" | "CHARACTER VARYING" | "NVARCHAR" | "CHAR" | "CHARACTER" | "NCHAR"
+        | "BPCHAR" => params.first().map(|n| n + 4).unwrap_or(-1),
+        "NUMERIC" | "DECIMAL" => match (params.first(), params.get(1)) {
+            (Some(&precision), Some(&scale)) => ((precision << 16) | (scale & 0xffff)) + 4,
+            _ => -1,
+        },
+        _ => -1,
     }
 }
 
@@ -596,6 +657,7 @@ impl PgAttributeCursor {
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let atttypmod = pg_atttypmod(&col.ty_str, &col.ty_params);
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -609,7 +671,7 @@ impl PgAttributeCursor {
                     Value::from_i64(attnum),      // attnum
                     Value::from_i64(0),           // attndims
                     Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(-1),          // atttypmod
+                    Value::from_i64(atttypmod),   // atttypmod
                     Value::from_i64(1),           // attbyval
                     Value::Text("p".into()),      // attstorage (plain)
                     Value::Text("i".into()),      // attalign (int)
@@ -3877,6 +3939,34 @@ mod tests {
     use super::*;
     use crate::{Database, PlatformIO, StepResult};
     use tempfile::tempdir;
+    use turso_parser::ast::{Expr, Literal};
+
+    #[test]
+    fn test_pg_atttypmod_varchar() {
+        assert_eq!(pg_atttypmod("varchar(100)", &[]), 104);
+        assert_eq!(pg_atttypmod("character varying(50)", &[]), 54);
+        assert_eq!(pg_atttypmod("char(8)", &[]), 12);
+        assert_eq!(pg_atttypmod("varchar", &[]), -1);
+    }
+
+    #[test]
+    fn test_pg_atttypmod_numeric() {
+        assert_eq!(pg_atttypmod("numeric(10,2)", &[]), 655366);
+        assert_eq!(pg_atttypmod("decimal(5,0)", &[]), ((5 << 16) | 0) + 4);
+        assert_eq!(pg_atttypmod("numeric", &[]), -1);
+    }
+
+    #[test]
+    fn test_pg_atttypmod_from_ty_params() {
+        let params = vec![Box::new(Expr::Literal(Literal::Numeric("100".to_string())))];
+        assert_eq!(pg_atttypmod("varchar", &params), 104);
+
+        let params = vec![
+            Box::new(Expr::Literal(Literal::Numeric("10".to_string()))),
+            Box::new(Expr::Literal(Literal::Numeric("2".to_string()))),
+        ];
+        assert_eq!(pg_atttypmod("numeric", &params), 655366);
+    }
 
     #[test]
     fn test_parse_timestamp_rejects_invalid_calendar_dates() {
