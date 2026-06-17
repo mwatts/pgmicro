@@ -9,7 +9,9 @@ cargo build                                      # build everything
 cargo build -p pgmicro                           # build pgmicro binary only
 cargo test -p pgmicro                            # pgmicro integration tests
 cargo test -p turso_parser_pg                    # PG parser/translator tests
-cargo test --test integration -- postgres        # PG integration tests (catalog, dialect, table)
+cargo test -p core_tester --test integration_tests integration::postgres  # PG integration tests
+./runtests.sh                                    # pgmicro-focused regression (lib + PG + fuzz)
+QUICK=1 ./runtests.sh                            # skip fuzz phase (~2.5 min saved)
 cargo fmt                                        # format (required)
 cargo clippy --workspace --all-features --all-targets -- --deny=warnings  # lint
 
@@ -170,8 +172,13 @@ Implemented in `core/pg_catalog.rs` as `InternalVirtualTable` impls, registered 
 ## Dialect Mechanism
 
 - `SqlDialect` enum: `Sqlite` (0) or `Postgres` (1), stored per-connection as `AtomicSqlDialect`
-- `default-postgres` Cargo feature on `turso_core`: makes `SqlDialect::default()` return `Postgres`
-- pgmicro enables this feature; tursodb does not — same engine, different default
+- New connections default to **SQLite** dialect (`SqlDialect::default()` always returns `Sqlite`)
+- PG entry points set Postgres dialect explicitly at connect time:
+  - `pgmicro` REPL: `conn.set_sql_dialect(Postgres)` in `open_database()`
+  - PG wire server: `cli/pg_server.rs`
+  - NAPI with `default-postgres`: `bindings/javascript/src/lib.rs`
+- `default-postgres` Cargo feature on `turso_core` is for **pgmicro/NAPI packaging** (bundles `with_postgres(true)` opts). It does **not** change the default SQL parser — avoids Cargo feature unification breaking `core_tester` SQLite tests when built alongside pgmicro
+- `DatabaseOpts::with_postgres(true)` enables PG catalog virtual tables and PG type support; it does **not** switch the SQL parser (tests use SQLite SQL with PG features enabled)
 - `prepare_internal()` temporarily forces SQLite dialect for internal schema queries
 - `PRAGMA sql_dialect = 'postgres'` / `'sqlite'` toggles at runtime
 

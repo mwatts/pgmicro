@@ -38,6 +38,7 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
+# Bundled by pgmicro/NAPI; dialect is set at connect time, not via SqlDialect::default().
 default-postgres = []
 fts = ["dep:tantivy"]
 codspeed = ["bench"]

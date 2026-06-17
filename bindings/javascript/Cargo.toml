@@ -24,6 +24,7 @@ chrono = { workspace = true, default-features = false, features = ["clock"] }
 
 [features]
 browser = []
+# Enables PG catalog opts and sets Postgres dialect at connect (see lib.rs connect_sync).
 default-postgres = ["turso_core/default-postgres"]
 tracing_release = ["turso_core/tracing_release"]
 [build-dependencies]
