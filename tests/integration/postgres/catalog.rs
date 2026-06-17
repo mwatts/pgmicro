@@ -1378,3 +1378,34 @@ fn test_pg_bare_numeric_type_oid(db: TempDatabase) {
     assert_eq!(typname.as_str(), "numeric");
     assert_eq!(*oid, 1700);
 }
+
+#[turso_macros::test]
+fn test_pg_listen_notify_delivery(db: TempDatabase) {
+    let listener = db.connect_limbo();
+    let notifier = db.connect_limbo();
+    listener.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    notifier.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    listener.execute("LISTEN alerts").unwrap();
+    notifier.execute("NOTIFY alerts, 'hello'").unwrap();
+
+    let received = listener.drain_pg_notifications();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].channel, "alerts");
+    assert_eq!(received[0].payload, "hello");
+
+    listener.execute("UNLISTEN alerts").unwrap();
+    listener.execute("UNLISTEN *").unwrap();
+}
+
+#[turso_macros::test]
+fn test_pg_listen_notify_self_delivery(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("LISTEN alerts").unwrap();
+    conn.execute("NOTIFY alerts, 'ping'").unwrap();
+
+    let received = conn.drain_pg_notifications();
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].payload, "ping");
+}

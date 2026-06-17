@@ -238,6 +238,10 @@ pub struct Connection {
     pub(super) pg_comments: RwLock<crate::pg_comment::PgCommentRegistry>,
     /// SQL-level PREPARE / EXECUTE / DEALLOCATE registry.
     pub(super) pg_prepared: RwLock<crate::pg_prepared::PgPreparedStatementRegistry>,
+    /// LISTEN channel registry for this connection.
+    pub(super) pg_listen: RwLock<crate::pg_listen::PgListenRegistry>,
+    /// Subscriber id in `Database.pg_notify_hub`.
+    pub(super) pg_notify_subscriber_id: RwLock<Option<u64>>,
     /// Session `search_path` saved on the first `SET LOCAL search_path` in a
     /// transaction; restored when the transaction ends (COMMIT or ROLLBACK).
     pub(super) pg_search_path_local_saved: RwLock<Option<Vec<String>>>,
@@ -1745,7 +1749,21 @@ impl Connection {
                 self.get_sync_mode(),
             )?;
         };
+        crate::pg_listen::unregister_connection(self);
         Ok(())
+    }
+
+    pub fn pg_notify_hub(&self) -> Arc<crate::PgNotifyHub> {
+        self.db.pg_notify_hub()
+    }
+
+    /// Drain NOTIFY events queued for this connection since the last drain.
+    pub fn drain_pg_notifications(&self) -> Vec<crate::PgNotification> {
+        let sub_id = *self.pg_notify_subscriber_id.read();
+        let Some(id) = sub_id else {
+            return Vec::new();
+        };
+        self.db.pg_notify_hub.drain_inbox(id)
     }
 
     pub fn wal_auto_checkpoint_disable(&self) {

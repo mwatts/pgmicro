@@ -12,14 +12,18 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 use futures::stream;
-use futures::SinkExt;
+use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
 use tracing::{error, info};
 use turso_core::copy::encode_copy_binary_file;
-use turso_core::{validate_schema_name, Connection, LimboError, StepResult, Value};
+use turso_core::{
+    validate_schema_name, Connection, LimboError, PgNotification, PgNotifyHub, StepResult, Value,
+};
 use turso_parser_pg::translator::{
-    try_extract_copy_stdin, try_extract_copy_stdout, PgCopyFormat, PgCopyStdinStmt,
-    PgCopyStdoutStmt,
+    try_extract_copy_stdin, try_extract_copy_stdout, try_extract_listen, try_extract_notify,
+    try_extract_unlisten, PgCopyFormat, PgCopyStdinStmt, PgCopyStdoutStmt,
 };
 
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -33,15 +37,15 @@ use pgwire::api::results::{
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, ErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::response::CommandComplete;
+use pgwire::messages::response::{CommandComplete, NotificationResponse};
 use pgwire::messages::startup::SecretKey;
 use pgwire::messages::PgWireBackendMessage;
-use pgwire::tokio::process_socket;
+use pgwire::tokio::server::{negotiate_tls, process_error, process_message};
 use pgwire::types::format::FormatOptions;
 
 pub struct TursoPgServer {
@@ -96,14 +100,19 @@ impl TursoPgServer {
         );
 
         let tls_acceptor = self.tls_acceptor.clone();
+        let notify_hub = self.conn.lock().unwrap().pg_notify_hub();
+        let notify_registry = Arc::new(TursoPgNotifyRegistry::new(notify_hub));
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
                 db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
                 copy_in: Arc::new(Mutex::new(CopyInSession::default())),
+                notify_registry: notify_registry.clone(),
             }),
             cancel_registry: self.cancel_registry.clone(),
+            notify_registry: notify_registry.clone(),
+            notify_delivery_tx: Arc::new(Mutex::new(None)),
         });
 
         loop {
@@ -112,10 +121,20 @@ impl TursoPgServer {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let factory_ref =
+                                factory.with_notify_delivery_tx(Arc::new(Mutex::new(None)));
                             let tls = tls_acceptor.clone();
+                            let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+                            *factory_ref.notify_delivery_tx.lock().unwrap() = Some(notify_tx);
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, tls, factory_ref).await {
+                                if let Err(e) = process_socket_with_notify(
+                                    socket,
+                                    tls,
+                                    factory_ref,
+                                    notify_rx,
+                                )
+                                .await
+                                {
                                     error!("Error processing connection from {}: {}", addr, e);
                                 }
                             });
@@ -152,6 +171,37 @@ impl TursoCancelRegistry {
     }
 }
 
+struct TursoPgNotifyRegistry {
+    hub: Arc<PgNotifyHub>,
+    wire_subscribers: Mutex<HashMap<i32, u64>>,
+}
+
+impl TursoPgNotifyRegistry {
+    fn new(hub: Arc<PgNotifyHub>) -> Self {
+        Self {
+            hub,
+            wire_subscribers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register_wire_session(&self, pid: i32, delivery: turso_core::PgNotifyDelivery) -> u64 {
+        let id = self.hub.register_subscriber(Some(pid));
+        self.hub.set_delivery(id, delivery);
+        self.wire_subscribers.lock().unwrap().insert(pid, id);
+        id
+    }
+
+    fn unregister_wire_session(&self, pid: i32) {
+        if let Some(id) = self.wire_subscribers.lock().unwrap().remove(&pid) {
+            self.hub.unregister_subscriber(id);
+        }
+    }
+
+    fn subscriber_for_pid(&self, pid: i32) -> Option<u64> {
+        self.wire_subscribers.lock().unwrap().get(&pid).copied()
+    }
+}
+
 struct TursoCancelHandler {
     registry: Arc<TursoCancelRegistry>,
 }
@@ -169,6 +219,8 @@ impl CancelHandler for TursoCancelHandler {
 struct TursoStartupHandler {
     conn: Arc<Connection>,
     registry: Arc<TursoCancelRegistry>,
+    notify_registry: Arc<TursoPgNotifyRegistry>,
+    notify_delivery_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PgNotification>>>>,
 }
 
 #[async_trait]
@@ -185,6 +237,18 @@ impl NoopStartupHandler for TursoStartupHandler {
     {
         let (pid, secret) = client.pid_and_secret_key();
         self.registry.register(pid, secret, self.conn.clone());
+        let tx = self
+            .notify_delivery_tx
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| PgWireError::ApiError("notify delivery channel missing".into()))?;
+        self.notify_registry.register_wire_session(
+            pid,
+            Arc::new(move |notification| {
+                let _ = tx.send(notification);
+            }),
+        );
         Ok(())
     }
 }
@@ -200,6 +264,7 @@ struct TursoPgHandler {
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
     copy_in: Arc<Mutex<CopyInSession>>,
+    notify_registry: Arc<TursoPgNotifyRegistry>,
 }
 
 impl TursoPgHandler {
@@ -277,6 +342,22 @@ fn delete_schema_file(db_file: &str, name: &str) {
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
     cancel_registry: Arc<TursoCancelRegistry>,
+    notify_registry: Arc<TursoPgNotifyRegistry>,
+    notify_delivery_tx: Arc<Mutex<Option<mpsc::UnboundedSender<PgNotification>>>>,
+}
+
+impl TursoPgFactory {
+    fn with_notify_delivery_tx(
+        self: &Arc<Self>,
+        tx: Arc<Mutex<Option<mpsc::UnboundedSender<PgNotification>>>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            handler: self.handler.clone(),
+            cancel_registry: self.cancel_registry.clone(),
+            notify_registry: self.notify_registry.clone(),
+            notify_delivery_tx: tx,
+        })
+    }
 }
 
 impl PgWireServerHandlers for TursoPgFactory {
@@ -292,6 +373,8 @@ impl PgWireServerHandlers for TursoPgFactory {
         Arc::new(TursoStartupHandler {
             conn: self.handler.conn.lock().unwrap().clone(),
             registry: self.cancel_registry.clone(),
+            notify_registry: self.notify_registry.clone(),
+            notify_delivery_tx: self.notify_delivery_tx.clone(),
         })
     }
 
@@ -343,6 +426,7 @@ impl SimpleQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
+        flush_pending_wire_notifications(&self.notify_registry, client).await?;
         let conn = self.conn.lock().unwrap().clone();
 
         // Per the PostgreSQL simple query protocol, a query string may contain
@@ -363,6 +447,12 @@ impl SimpleQueryHandler for TursoPgHandler {
             }
             if let Some(copy) = parse_copy_stdout(sql) {
                 responses.extend(handle_copy_stdout(client, &conn, &copy).await?);
+                continue;
+            }
+            if let Some(response) =
+                try_handle_wire_notify_command(&self.notify_registry, client, sql)?
+            {
+                responses.push(response);
                 continue;
             }
 
@@ -408,6 +498,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
+        flush_pending_wire_notifications(&self.notify_registry, client).await?;
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
@@ -424,6 +515,11 @@ impl ExtendedQueryHandler for TursoPgHandler {
             return responses
                 .pop()
                 .ok_or_else(|| PgWireError::ApiError("COPY TO produced no response".into()));
+        }
+        if let Some(response) =
+            try_handle_wire_notify_command(&self.notify_registry, client, query)?
+        {
+            return Ok(response);
         }
 
         let mut stmt = conn
@@ -1393,6 +1489,161 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
             }
         }
     }
+}
+
+fn try_handle_wire_notify_command<C>(
+    registry: &TursoPgNotifyRegistry,
+    client: &C,
+    sql: &str,
+) -> PgWireResult<Option<Response>>
+where
+    C: ClientInfo,
+{
+    let parse_result = match turso_parser_pg::parse(sql) {
+        Ok(result) => result,
+        Err(_) => return Ok(None),
+    };
+    let pid = client.pid_and_secret_key().0;
+    let Some(sub_id) = registry.subscriber_for_pid(pid) else {
+        return Ok(None);
+    };
+    let hub = &registry.hub;
+    if let Some(stmt) = try_extract_listen(&parse_result) {
+        hub.listen(sub_id, &stmt.channel);
+        return Ok(Some(Response::Execution(Tag::new("LISTEN"))));
+    }
+    if let Some(stmt) = try_extract_notify(&parse_result) {
+        hub.notify(sub_id, &stmt.channel, stmt.payload.as_deref().unwrap_or(""));
+        return Ok(Some(Response::Execution(Tag::new("NOTIFY"))));
+    }
+    if let Some(stmt) = try_extract_unlisten(&parse_result) {
+        hub.unlisten(sub_id, stmt.channel.as_deref());
+        return Ok(Some(Response::Execution(Tag::new("UNLISTEN"))));
+    }
+    Ok(None)
+}
+
+async fn flush_pending_wire_notifications<C>(
+    registry: &TursoPgNotifyRegistry,
+    client: &mut C,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+{
+    let pid = client.pid_and_secret_key().0;
+    let Some(sub_id) = registry.subscriber_for_pid(pid) else {
+        return Ok(());
+    };
+    for notification in registry.hub.drain_inbox(sub_id) {
+        send_wire_notification(client, notification).await?;
+    }
+    Ok(())
+}
+
+async fn send_wire_notification<C>(client: &mut C, notification: PgNotification) -> PgWireResult<()>
+where
+    C: ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+{
+    client
+        .send(PgWireBackendMessage::NotificationResponse(
+            NotificationResponse::new(notification.pid, notification.channel, notification.payload),
+        ))
+        .await?;
+    client.flush().await?;
+    Ok(())
+}
+
+const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
+
+async fn process_socket_with_notify(
+    tcp_socket: tokio::net::TcpStream,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    handlers: Arc<TursoPgFactory>,
+    mut notify_rx: mpsc::UnboundedReceiver<PgNotification>,
+) -> Result<(), std::io::Error> {
+    let startup_timeout = sleep(Duration::from_millis(STARTUP_TIMEOUT_MILLIS));
+    tokio::pin!(startup_timeout);
+
+    let socket = tokio::select! {
+        _ = &mut startup_timeout => {
+            return Ok(())
+        },
+        socket = negotiate_tls(tcp_socket, tls_acceptor) => {
+            socket?
+        }
+    };
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    let startup_handler = handlers.startup_handler();
+    let simple_query_handler = handlers.simple_query_handler();
+    let extended_query_handler = handlers.extended_query_handler();
+    let copy_handler = handlers.copy_handler();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+    let notify_registry = handlers.notify_registry.clone();
+
+    let socket = &mut socket;
+    loop {
+        let msg = if matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                notify = notify_rx.recv() => {
+                    if let Some(notification) = notify {
+                        send_wire_notification(socket, notification).await?;
+                    }
+                    continue;
+                }
+                msg = socket.next() => msg,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                notify = notify_rx.recv() => {
+                    if let Some(notification) = notify {
+                        send_wire_notification(socket, notification).await?;
+                    }
+                    continue;
+                }
+                msg = socket.next() => msg,
+            }
+        };
+
+        if let Some(Ok(msg)) = msg {
+            let is_extended_query = match socket.state() {
+                PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+                _ => msg.is_extended_query(),
+            };
+            if let Err(mut e) = process_message(
+                msg,
+                socket,
+                startup_handler.clone(),
+                simple_query_handler.clone(),
+                extended_query_handler.clone(),
+                copy_handler.clone(),
+                cancel_handler.clone(),
+            )
+            .await
+            {
+                error_handler.on_error(socket, &mut e);
+                process_error(socket, e, is_extended_query).await?;
+            }
+        } else {
+            break;
+        }
+    }
+
+    notify_registry.unregister_wire_session(socket.pid_and_secret_key().0);
+    Ok(())
 }
 
 /// PG statements handled by `try_prepare_pg()` that return a dummy SELECT

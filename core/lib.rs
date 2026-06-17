@@ -32,7 +32,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod connection;
-mod copy;
+pub mod copy;
 mod error;
 mod ext;
 mod fast_lock;
@@ -51,6 +51,7 @@ mod parameters;
 mod pg_catalog;
 mod pg_comment;
 mod pg_dispatch;
+mod pg_listen;
 mod pg_prepared;
 mod pg_role;
 mod pg_schema;
@@ -146,6 +147,7 @@ pub use io::{
 #[cfg(feature = "cli_only")]
 pub use numeric::decimal::{pg_wire_numeric_binary_to_text, value_to_pg_numeric_text};
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use pg_listen::{PgNotification, PgNotifyDelivery, PgNotifyHub};
 pub use pg_schema::validate_schema_name;
 pub use statement::{Statement, StatementStatusCounter};
 pub use storage::{
@@ -617,6 +619,9 @@ pub struct Database {
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
+
+    /// Cross-connection LISTEN/NOTIFY pub/sub.
+    pg_notify_hub: Arc<PgNotifyHub>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -680,6 +685,10 @@ impl Database {
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
+    }
+
+    pub fn pg_notify_hub(&self) -> Arc<PgNotifyHub> {
+        self.pg_notify_hub.clone()
     }
 
     fn new(
@@ -749,6 +758,8 @@ impl Database {
             ),
 
             durable_storage: None,
+
+            pg_notify_hub: Arc::new(PgNotifyHub::new()),
         };
 
         db.register_global_builtin_extensions()
@@ -1828,6 +1839,8 @@ impl Database {
             pg_roles: RwLock::new(pg_role::PgRoleRegistry::bootstrap()),
             pg_comments: RwLock::new(pg_comment::PgCommentRegistry::new()),
             pg_prepared: RwLock::new(pg_prepared::PgPreparedStatementRegistry::new()),
+            pg_listen: RwLock::new(pg_listen::PgListenRegistry::new()),
+            pg_notify_subscriber_id: RwLock::new(None),
             pg_search_path_local_saved: RwLock::new(None),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),

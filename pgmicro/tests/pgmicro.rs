@@ -1251,6 +1251,64 @@ fn wire_copy_from_stdin_returns_copy_n() {
 }
 
 #[test]
+fn wire_notify_delivers_to_listener() {
+    let port = 19432 + (std::process::id() % 1000) as u16;
+    let mut server = start_pgmicro_server(port);
+
+    let mut listener = PgTestClient::connect(port);
+    let mut notifier = PgTestClient::connect(port);
+
+    let tags = listener.query_command_tags("LISTEN alerts");
+    assert!(
+        tags.iter().any(|t| t == "LISTEN"),
+        "expected LISTEN tag, got: {tags:?}"
+    );
+
+    let tags = notifier.query_command_tags("NOTIFY alerts, 'hello'");
+    assert!(
+        tags.iter().any(|t| t == "NOTIFY"),
+        "expected NOTIFY tag, got: {tags:?}"
+    );
+
+    // Drain the async notification (may arrive before or during the next query).
+    let response = listener.query_raw("SELECT 1");
+    assert!(
+        response.iter().any(|&b| b == b'A'),
+        "expected NotificationResponse in: {:?}",
+        response
+    );
+    let mut pos = 0;
+    while pos < response.len() {
+        let tag = response[pos];
+        pos += 1;
+        if pos + 4 > response.len() {
+            break;
+        }
+        let len = i32::from_be_bytes([
+            response[pos],
+            response[pos + 1],
+            response[pos + 2],
+            response[pos + 3],
+        ]) as usize;
+        pos += 4;
+        let body_len = len.saturating_sub(4);
+        if tag == b'A' && pos + body_len <= response.len() {
+            let body = &response[pos..pos + body_len];
+            let mut parts = body[4..].split(|&b| b == 0);
+            let channel = String::from_utf8_lossy(parts.next().unwrap_or(&[])).to_string();
+            let payload = String::from_utf8_lossy(parts.next().unwrap_or(&[])).to_string();
+            assert_eq!(channel, "alerts");
+            assert_eq!(payload, "hello");
+            break;
+        }
+        pos += body_len;
+    }
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
 fn wire_copy_to_stdout_streams_rows() {
     let port = 18432 + (std::process::id() % 1000) as u16;
     let mut server = start_pgmicro_server(port);
