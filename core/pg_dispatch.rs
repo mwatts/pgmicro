@@ -284,22 +284,40 @@ impl Connection {
         let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
             LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
         })?;
+        self.handle_pg_copy_data(
+            &stmt.table_name,
+            stmt.schema_name.as_deref(),
+            stmt.columns.as_deref(),
+            stmt.delimiter.as_deref(),
+            stmt.header,
+            stmt.null_string.as_deref(),
+            &data,
+        )
+    }
 
-        // Determine column info from table
-        let table_name = match &stmt.schema_name {
-            Some(schema) => format!("\"{schema}\".\"{name}\"", name = stmt.table_name),
-            None => format!("\"{}\"", stmt.table_name),
+    /// Insert COPY text-format rows into a table. Used by COPY FROM file and STDIN.
+    pub fn handle_pg_copy_data(
+        self: &Arc<Self>,
+        table_name: &str,
+        schema_name: Option<&str>,
+        columns: Option<&[String]>,
+        delimiter: Option<&str>,
+        header: bool,
+        null_string: Option<&str>,
+        data: &str,
+    ) -> Result<usize> {
+        let qualified_table = match schema_name {
+            Some(schema) => format!("\"{schema}\".\"{table_name}\""),
+            None => format!("\"{table_name}\""),
         };
-        let column_names = self.get_table_columns(&stmt.table_name, stmt.schema_name.as_deref())?;
+        let column_names = self.get_table_columns(table_name, schema_name)?;
         if column_names.is_empty() {
             return Err(LimboError::ParseError(format!(
-                "COPY FROM: table '{}' not found or has no columns",
-                stmt.table_name
+                "COPY FROM: table '{table_name}' not found or has no columns"
             )));
         }
 
-        // If specific columns are listed, use those; otherwise use all table columns
-        let (insert_cols, num_columns) = match &stmt.columns {
+        let (insert_cols, num_columns) = match columns {
             Some(cols) => {
                 let col_list = cols
                     .iter()
@@ -312,25 +330,18 @@ impl Connection {
         };
 
         let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-        let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
+        let insert_sql =
+            format!("INSERT INTO {qualified_table}{insert_cols} VALUES ({placeholders})");
 
-        let delimiter = stmt
-            .delimiter
-            .as_ref()
-            .and_then(|d| d.chars().next())
-            .unwrap_or('\t');
-        let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
+        let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('\t');
+        let null_string = null_string.unwrap_or("\\N");
 
-        let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-
-        // Skip header row if requested
-        if stmt.header && !rows.is_empty() {
+        let mut rows = parse_copy_text_format(data, delimiter, null_string, num_columns)?;
+        if header && !rows.is_empty() {
             rows.remove(0);
         }
-
         let rows_inserted = rows.len();
 
-        // Execute inserts with SQLite dialect, wrapped in a transaction
         let saved_dialect = self.get_sql_dialect();
         self.set_sql_dialect(SqlDialect::Sqlite);
         let result = (|| {
@@ -338,7 +349,6 @@ impl Connection {
             begin.run_ignore_rows()?;
 
             let mut insert_stmt = self.prepare_with_origin(&insert_sql, StatementOrigin::Root)?;
-
             for row in &rows {
                 for (i, val) in row.iter().enumerate() {
                     let index = NonZero::new(i + 1).unwrap();

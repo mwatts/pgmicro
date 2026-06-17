@@ -4,23 +4,33 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use std::fmt::Debug;
+
 use async_trait::async_trait;
 use futures::stream;
+use futures::SinkExt;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use turso_core::{validate_schema_name, Connection, LimboError, StepResult, Value};
+use turso_parser_pg::translator::{
+    try_extract_copy_stdin, try_extract_copy_stdout, PgCopyStdinStmt, PgCopyStdoutStmt,
+};
 
 use pgwire::api::auth::StartupHandler;
+use pgwire::api::copy::{send_copy_out_response, CopyHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    QueryResponse, Response, Tag,
+    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::data::DataRow;
+use pgwire::messages::response::CommandComplete;
+use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
@@ -66,6 +76,7 @@ impl TursoPgServer {
                 conn: self.conn.clone(),
                 db_file: self.db_file.clone(),
                 query_parser: Arc::new(NoopQueryParser::new()),
+                copy_in: Arc::new(Mutex::new(CopyInSession::default())),
             }),
         });
 
@@ -103,10 +114,17 @@ impl TursoPgServer {
     }
 }
 
+#[derive(Default)]
+struct CopyInSession {
+    stmt: Option<PgCopyStdinStmt>,
+    buffer: String,
+}
+
 struct TursoPgHandler {
     conn: Arc<Mutex<Arc<Connection>>>,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
+    copy_in: Arc<Mutex<CopyInSession>>,
 }
 
 impl TursoPgHandler {
@@ -197,13 +215,20 @@ impl PgWireServerHandlers for TursoPgFactory {
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::new(NoopHandler)
     }
+
+    fn copy_handler(&self) -> Arc<impl CopyHandler> {
+        self.handler.clone()
+    }
 }
 
 #[async_trait]
 impl SimpleQueryHandler for TursoPgHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + Unpin + Send + Sync,
+        C: futures::Sink<PgWireBackendMessage> + Unpin,
+        C::Error: Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         let conn = self.conn.lock().unwrap().clone();
 
@@ -214,6 +239,20 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         let mut responses = Vec::new();
         for sql in &statements {
+            if let Some(copy) = parse_copy_stdin(sql) {
+                let cols = copy_column_count(&conn, &copy)?;
+                *self.copy_in.lock().unwrap() = CopyInSession {
+                    stmt: Some(copy),
+                    buffer: String::new(),
+                };
+                responses.push(Response::CopyIn(CopyResponse::new(0, cols, vec![0; cols])));
+                continue;
+            }
+            if let Some(copy) = parse_copy_stdout(sql) {
+                responses.extend(handle_copy_stdout(client, &conn, &copy).await?);
+                continue;
+            }
+
             let mut stmt = conn
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
@@ -246,15 +285,33 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + Unpin + Send + Sync,
+        C: futures::Sink<PgWireBackendMessage> + Unpin,
+        C::Error: Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
+
+        if let Some(copy) = parse_copy_stdin(query) {
+            let cols = copy_column_count(&conn, &copy)?;
+            *self.copy_in.lock().unwrap() = CopyInSession {
+                stmt: Some(copy),
+                buffer: String::new(),
+            };
+            return Ok(Response::CopyIn(CopyResponse::new(0, cols, vec![0; cols])));
+        }
+        if let Some(copy) = parse_copy_stdout(query) {
+            let mut responses = handle_copy_stdout(client, &conn, &copy).await?;
+            return responses
+                .pop()
+                .ok_or_else(|| PgWireError::ApiError("COPY TO produced no response".into()));
+        }
 
         let mut stmt = conn
             .prepare(query)
@@ -392,6 +449,203 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
         Type::FLOAT4_ARRAY
     } else {
         Type::TEXT_ARRAY
+    }
+}
+
+fn parse_copy_stdin(sql: &str) -> Option<PgCopyStdinStmt> {
+    turso_parser_pg::parse(sql)
+        .ok()
+        .and_then(|parsed| try_extract_copy_stdin(&parsed))
+}
+
+fn parse_copy_stdout(sql: &str) -> Option<PgCopyStdoutStmt> {
+    turso_parser_pg::parse(sql)
+        .ok()
+        .and_then(|parsed| try_extract_copy_stdout(&parsed))
+}
+
+fn copy_column_count(conn: &Arc<Connection>, copy: &PgCopyStdinStmt) -> PgWireResult<usize> {
+    if let Some(cols) = &copy.columns {
+        return Ok(cols.len());
+    }
+    let count = conn
+        .get_table_columns(&copy.table_name, copy.schema_name.as_deref())
+        .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?
+        .len();
+    if count == 0 {
+        return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+            LimboError::ParseError(format!(
+                "COPY: table '{}' not found or has no columns",
+                copy.table_name
+            )),
+        ))));
+    }
+    Ok(count)
+}
+
+async fn handle_copy_stdout<C>(
+    client: &mut C,
+    conn: &Arc<Connection>,
+    copy: &PgCopyStdoutStmt,
+) -> PgWireResult<Vec<Response>>
+where
+    C: futures::Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+{
+    let columns = if let Some(cols) = &copy.columns {
+        cols.clone()
+    } else {
+        conn.get_table_columns(&copy.table_name, copy.schema_name.as_deref())
+            .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?
+    };
+    if columns.is_empty() {
+        return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+            LimboError::ParseError(format!(
+                "COPY: table '{}' not found or has no columns",
+                copy.table_name
+            )),
+        ))));
+    }
+
+    let qualified = match &copy.schema_name {
+        Some(schema) => format!("\"{schema}\".\"{}\"", copy.table_name),
+        None => format!("\"{}\"", copy.table_name),
+    };
+    let col_list = columns
+        .iter()
+        .map(|c| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!("SELECT {col_list} FROM {qualified}");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
+
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::Row) => {
+                let row = stmt.row().expect("row after StepResult::Row");
+                let values: Vec<String> = row
+                    .get_values()
+                    .map(|v| format_copy_field(v, &copy.null_string))
+                    .collect();
+                rows.push(values);
+            }
+            Ok(StepResult::IO) => stmt
+                .get_pager()
+                .io
+                .step()
+                .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?,
+            Ok(StepResult::Done) => break,
+            Ok(StepResult::Interrupt) => {
+                return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+                    LimboError::Interrupt,
+                ))));
+            }
+            Ok(StepResult::Busy) => {
+                return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+                    LimboError::Busy,
+                ))));
+            }
+            Err(e) => {
+                return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(e))));
+            }
+        }
+    }
+
+    send_copy_out_response(
+        client,
+        CopyResponse::new(0, columns.len(), vec![0; columns.len()]),
+    )
+    .await?;
+
+    for row in &rows {
+        let mut line = String::new();
+        for (i, val) in row.iter().enumerate() {
+            if i > 0 {
+                line.push(copy.delimiter);
+            }
+            line.push_str(val);
+        }
+        line.push('\n');
+        client
+            .send(PgWireBackendMessage::CopyData(CopyData::new(
+                line.into_bytes().into(),
+            )))
+            .await?;
+    }
+    client
+        .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+        .await?;
+
+    Ok(vec![Response::Execution(
+        Tag::new("COPY").with_rows(rows.len()),
+    )])
+}
+
+fn format_copy_field(val: &Value, null_string: &str) -> String {
+    match val {
+        Value::Null => null_string.to_string(),
+        Value::Text(t) => t.as_str().to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[async_trait]
+impl CopyHandler for TursoPgHandler {
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let chunk = String::from_utf8(copy_data.data.to_vec()).map_err(|e| {
+            PgWireError::UserError(Box::new(invalid_parameter_error(format!(
+                "invalid COPY data encoding: {e}"
+            ))))
+        })?;
+        self.copy_in.lock().unwrap().buffer.push_str(&chunk);
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+        C: futures::Sink<PgWireBackendMessage> + Unpin,
+        C::Error: Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (copy, data) = {
+            let mut session = self.copy_in.lock().unwrap();
+            let Some(copy) = session.stmt.take() else {
+                return Err(PgWireError::UserError(Box::new(pg_error_info(
+                    "COPY FROM STDIN without active copy session".into(),
+                    "57014",
+                ))));
+            };
+            let data = std::mem::take(&mut session.buffer);
+            (copy, data)
+        };
+
+        let conn = self.conn.lock().unwrap().clone();
+        let rows = conn
+            .handle_pg_copy_data(
+                &copy.table_name,
+                copy.schema_name.as_deref(),
+                copy.columns.as_deref(),
+                copy.delimiter.as_deref(),
+                copy.header,
+                copy.null_string.as_deref(),
+                &data,
+            )
+            .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
+
+        client
+            .send(PgWireBackendMessage::CommandComplete(CommandComplete::new(
+                format!("COPY {rows}"),
+            )))
+            .await?;
+        Ok(())
     }
 }
 
