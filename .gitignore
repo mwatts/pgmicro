@@ -58,6 +58,7 @@ stress-go/stress-go
 &1
 bisected.sql
 *.log
+./test-logs
 
 *.db-log
 settings.local.json
