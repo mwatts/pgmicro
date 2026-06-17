@@ -44,7 +44,11 @@ fn ungrouped_agg_can_emit_inline_result(plan: &SelectPlan, t_ctx: &TranslateCtx<
     {
         return false;
     }
-    plan.result_columns.iter().all(|rc| rc.contains_aggregates)
+    plan.result_columns.iter().all(|rc| {
+        plan.aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, &rc.expr))
+    })
 }
 
 fn emit_ungrouped_agg_inline_result(
