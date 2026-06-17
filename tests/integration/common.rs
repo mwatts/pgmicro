@@ -1,11 +1,11 @@
-use rand::{rng, RngCore, SeedableRng};
+use rand::{RngCore, SeedableRng, rng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Clock, Connection, Database, FromValueRow, Row, IO};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use turso_core::{Clock, Connection, Database, FromValueRow, IO, Row};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -670,11 +670,39 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_statement_prepare_execute_batch() {
+        let db = TempDatabase::builder()
+            .with_db_name("debug-multi-table.db")
+            .with_opts(
+                turso_core::DatabaseOpts::new()
+                    .with_index_method(true)
+                    .with_encryption(true)
+                    .with_attach(true)
+                    .with_generated_columns(true)
+                    .with_custom_types(true)
+                    .with_postgres(true),
+            )
+            .build();
+        let conn = db.connect_limbo();
+        let schema = r#"
+        CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);"#;
+        conn.prepare_execute_batch(schema).unwrap();
+        let tables: Vec<String> = conn
+            .exec_rows("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .into_iter()
+            .map(|(name,): (String,)| name)
+            .collect();
+        assert_eq!(tables, vec!["t1", "t2", "t3", "t4"], "tables: {tables:?}");
+    }
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
-    use turso_core::{Database, StepResult, IO};
+    use turso_core::{Database, IO, StepResult};
 
-    use crate::common::{do_flush, ExecRows};
+    use crate::common::{ExecRows, do_flush};
 
     use super::TempDatabase;
 

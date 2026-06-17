@@ -1,34 +1,34 @@
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::Page;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::YieldInjector;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
     Arc, RwLock,
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, Ordering},
 };
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
-#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
-use crate::Page;
 use crate::{
-    ast, function,
-    io::{MemoryIO, IO},
-    parse_schema_rows,
-    progress::{ProgressHandler, ProgressHandlerCallback},
-    refresh_analyze_stats, translate,
-    util::IOExt,
-    vdbe, AllViewsTxState, AtomicCipherMode, AtomicSqlDialect, AtomicSyncMode, AtomicTempStore,
+    AllViewsTxState, AtomicCipherMode, AtomicSqlDialect, AtomicSyncMode, AtomicTempStore,
     BusyHandler, BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult,
     CipherMode, Cmd, Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts,
     Duration, EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
     Pager, Parser, Program, QueryMode, QueryRunner, Result, Schema, SqlDialect, Statement,
-    SyncMode, TransactionMode, Trigger, Value, VirtualTable,
+    SyncMode, TransactionMode, Trigger, Value, VirtualTable, ast, function,
+    io::{IO, MemoryIO},
+    parse_schema_rows,
+    progress::{ProgressHandler, ProgressHandlerCallback},
+    refresh_analyze_stats, translate,
+    util::IOExt,
+    vdbe,
 };
-use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
+use crate::{is_memory_like, turso_assert};
 use arc_swap::ArcSwap;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smallvec::SmallVec;
@@ -38,8 +38,8 @@ use std::ops::Deref;
 use std::path::Path;
 #[cfg(not(target_family = "wasm"))]
 use tempfile::TempDir;
-use tracing::{instrument, Level};
-use turso_macros::{turso_assert_ne, AtomicEnum};
+use tracing::{Level, instrument};
+use turso_macros::{AtomicEnum, turso_assert_ne};
 
 #[cfg(feature = "simulator")]
 fn db_identity_for_testing(db_path: &Path) -> Result<(u32, u32)> {
@@ -1136,13 +1136,26 @@ impl Connection {
             }
         }
 
-        // Unified path: parse_sql routes to the right parser by dialect
-        let (cmds, byte_offset_end) = self.parse_sql(sql)?;
-        if !cmds.is_empty() {
+        if self.get_sql_dialect() == SqlDialect::Postgres {
+            let (cmds, byte_offset_end) = self.parse_sql(sql)?;
+            if !cmds.is_empty() {
+                let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                    .unwrap()
+                    .trim();
+                self.compile_and_run_cmds(cmds, input)?;
+            }
+            return Ok(());
+        }
+
+        // SQLite path: loop to handle multiple semicolon-separated statements,
+        // matching `execute()` behavior. `parse_sql` only consumes one stmt.
+        let mut parser = Parser::new(sql.as_bytes());
+        while let Some(cmd) = parser.next_cmd()? {
+            let byte_offset_end = parser.offset();
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            self.compile_and_run_cmds(cmds, input)?;
+            self.compile_and_run_cmds(vec![cmd], input)?;
         }
         Ok(())
     }
