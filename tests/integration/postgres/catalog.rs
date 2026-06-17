@@ -1323,3 +1323,28 @@ fn test_pg_proc_alias_names(db: TempDatabase) {
         assert_eq!(name.as_str(), alias);
     }
 }
+
+#[turso_macros::test]
+fn test_pg_collation_builtin_rows(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT collname FROM pg_collation ORDER BY oid")
+        .unwrap();
+    let mut names = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let Value::Text(name) = row.get_value(0) else {
+                    panic!("expected collname text");
+                };
+                names.push(name.as_str().to_string());
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(names, vec!["default", "ucs_basic", "C", "POSIX"]);
+}

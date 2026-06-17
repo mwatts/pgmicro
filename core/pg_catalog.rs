@@ -2073,6 +2073,125 @@ impl InternalVirtualTableCursor for PgDescriptionCursor {
     }
 }
 
+/// Built-in PostgreSQL collations exposed through pg_collation.
+const PG_COLLATIONS: &[(i64, &str, &str)] = &[
+    (100, "default", "c"),
+    (950, "C", "c"),
+    (951, "POSIX", "c"),
+    (851, "ucs_basic", "c"),
+];
+
+/// Virtual table for pg_catalog.pg_collation.
+#[derive(Debug)]
+struct PgCollationTable;
+
+impl PgCollationTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for PgCollationTable {
+    fn name(&self) -> String {
+        "pg_collation".to_string()
+    }
+
+    fn open(
+        &self,
+        _conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgCollationCursor {
+            rows: Self::rows(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: PG_COLLATIONS.len() as u32,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)"
+            .to_string()
+    }
+}
+
+impl PgCollationTable {
+    fn rows() -> Vec<Vec<Value>> {
+        PG_COLLATIONS
+            .iter()
+            .map(|(oid, name, provider)| {
+                vec![
+                    Value::from_i64(*oid),
+                    Value::build_text(*name),
+                    Value::from_i64(11), // pg_catalog namespace
+                    Value::from_i64(10), // bootstrap superuser
+                    Value::build_text(*provider),
+                    Value::from_i64(1),  // deterministic
+                    Value::from_i64(-1), // database encoding
+                    Value::Null,         // collcollate
+                    Value::Null,         // collctype
+                    Value::Null,         // colliculocale
+                    Value::Null,         // collicurules
+                    Value::Null,         // collversion
+                ]
+            })
+            .collect()
+    }
+}
+
+struct PgCollationCursor {
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgCollationCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        Ok(!self.rows.is_empty())
+    }
+}
+
 fn empty_catalog_table(name: &str, create_sql: &str) -> Arc<crate::vtab::VirtualTable> {
     use crate::vtab::VirtualTable;
     let table = EmptyPgCatalogTable {
@@ -3572,7 +3691,15 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
             )
             .expect("pg_type virtual table creation should not fail"),
         ),
-        empty_catalog_table("pg_collation", "CREATE TABLE pg_collation (oid INTEGER, collname TEXT, collnamespace INTEGER, collowner INTEGER, collprovider TEXT, collisdeterministic INTEGER, collencoding INTEGER, collcollate TEXT, collctype TEXT, colliculocale TEXT, collicurules TEXT, collversion TEXT)"),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_collation".to_string(),
+                PgCollationTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgCollationTable::new())),
+            )
+            .expect("pg_collation virtual table creation should not fail"),
+        ),
         // pg_attrdef virtual table
         Arc::new(
             VirtualTable::new_internal(
