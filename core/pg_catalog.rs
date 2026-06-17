@@ -50,7 +50,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
 
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
-fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
@@ -1940,6 +1940,96 @@ impl InternalVirtualTableCursor for EmptyPgCatalogCursor {
     }
 }
 
+/// Virtual table for pg_catalog.pg_description (COMMENT ON metadata).
+#[derive(Debug)]
+struct PgDescriptionTable;
+
+impl PgDescriptionTable {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl InternalVirtualTable for PgDescriptionTable {
+    fn name(&self) -> String {
+        "pg_description".to_string()
+    }
+
+    fn open(
+        &self,
+        conn: Arc<Connection>,
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
+        Ok(Arc::new(RwLock::new(PgDescriptionCursor {
+            conn,
+            rows: Vec::new(),
+            current_row: 0,
+        })))
+    }
+
+    fn best_index(
+        &self,
+        constraints: &[ConstraintInfo],
+        _order_by: &[OrderByInfo],
+    ) -> Result<IndexInfo, ResultCode> {
+        let constraint_usages = constraints
+            .iter()
+            .map(|_| turso_ext::ConstraintUsage {
+                argv_index: None,
+                omit: false,
+            })
+            .collect();
+        Ok(IndexInfo {
+            idx_num: 0,
+            idx_str: None,
+            order_by_consumed: false,
+            estimated_cost: 10.0,
+            estimated_rows: 1,
+            constraint_usages,
+        })
+    }
+
+    fn sql(&self) -> String {
+        "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)"
+            .to_string()
+    }
+}
+
+struct PgDescriptionCursor {
+    conn: Arc<Connection>,
+    rows: Vec<Vec<Value>>,
+    current_row: usize,
+}
+
+impl InternalVirtualTableCursor for PgDescriptionCursor {
+    fn next(&mut self) -> Result<bool, LimboError> {
+        self.current_row += 1;
+        Ok(self.current_row < self.rows.len())
+    }
+
+    fn rowid(&self) -> i64 {
+        self.current_row as i64
+    }
+
+    fn column(&self, column: usize) -> Result<Value, LimboError> {
+        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
+            Ok(self.rows[self.current_row][column].clone())
+        } else {
+            Ok(Value::Null)
+        }
+    }
+
+    fn filter(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> Result<bool, LimboError> {
+        self.current_row = 0;
+        self.rows = crate::pg_comment::pg_description_rows(&self.conn);
+        Ok(!self.rows.is_empty())
+    }
+}
+
 fn empty_catalog_table(name: &str, create_sql: &str) -> Arc<crate::vtab::VirtualTable> {
     use crate::vtab::VirtualTable;
     let table = EmptyPgCatalogTable {
@@ -3450,7 +3540,15 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<crate::vtab::VirtualTable>> {
             )
             .expect("pg_attrdef virtual table creation should not fail"),
         ),
-        empty_catalog_table("pg_description", "CREATE TABLE pg_description (objoid INTEGER, classoid INTEGER, objsubid INTEGER, description TEXT)"),
+        Arc::new(
+            VirtualTable::new_internal(
+                "pg_description".to_string(),
+                PgDescriptionTable::new().sql(),
+                VTabKind::VirtualTable,
+                Arc::new(RwLock::new(PgDescriptionTable::new())),
+            )
+            .expect("pg_description virtual table creation should not fail"),
+        ),
         empty_catalog_table("pg_publication", "CREATE TABLE pg_publication (oid INTEGER, pubname TEXT, pubowner INTEGER, puballtables INTEGER, pubinsert INTEGER, pubupdate INTEGER, pubdelete INTEGER, pubtruncate INTEGER, pubviaroot INTEGER)"),
         empty_catalog_table("pg_publication_namespace", "CREATE TABLE pg_publication_namespace (oid INTEGER, pnpubid INTEGER, pnnspid INTEGER)"),
         empty_catalog_table("pg_publication_rel", "CREATE TABLE pg_publication_rel (oid INTEGER, prpubid INTEGER, prrelid INTEGER, prqual TEXT, prattrs TEXT)"),

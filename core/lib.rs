@@ -49,7 +49,9 @@ mod money;
 mod numeric;
 mod parameters;
 mod pg_catalog;
+mod pg_comment;
 mod pg_dispatch;
+mod pg_prepared;
 mod pg_role;
 mod pg_schema;
 mod pragma;
@@ -1824,6 +1826,8 @@ impl Database {
             sql_dialect: AtomicSqlDialect::new(SqlDialect::default()),
             pg_search_path: RwLock::new(vec!["public".to_string()]),
             pg_roles: RwLock::new(pg_role::PgRoleRegistry::bootstrap()),
+            pg_comments: RwLock::new(pg_comment::PgCommentRegistry::new()),
+            pg_prepared: RwLock::new(pg_prepared::PgPreparedStatementRegistry::new()),
             pg_search_path_local_saved: RwLock::new(None),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),

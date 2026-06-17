@@ -15,10 +15,12 @@ use crate::statement::StatementOrigin;
 use crate::types::Text;
 use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
-    is_refresh_matview, try_extract_copy_from, try_extract_create_role, try_extract_create_schema,
-    try_extract_drop_role, try_extract_drop_schema, try_extract_reset, try_extract_set,
-    try_extract_show, try_extract_truncate, PgCopyFromStmt, PgCreateRoleStmt, PgCreateSchemaStmt,
-    PgDropRoleStmt, PgDropSchemaStmt, PgResetStmt, PgSetStmt, PgTruncateStmt, PostgreSQLTranslator,
+    is_refresh_matview, try_extract_comment, try_extract_copy_from, try_extract_create_role,
+    try_extract_create_schema, try_extract_deallocate, try_extract_drop_role,
+    try_extract_drop_schema, try_extract_execute, try_extract_prepare, try_extract_reset,
+    try_extract_set, try_extract_show, try_extract_truncate, PgCopyFromStmt, PgCreateRoleStmt,
+    PgCreateSchemaStmt, PgDeallocateStmt, PgDropRoleStmt, PgDropSchemaStmt, PgExecuteStmt,
+    PgPrepareStmt, PgResetStmt, PgSetStmt, PgTruncateStmt, PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -71,6 +73,25 @@ impl Connection {
             }
             let pragma_sql = format!("PRAGMA {}", show_stmt.name);
             return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
+        }
+
+        if let Some(comment_stmt) = try_extract_comment(&parse_result) {
+            crate::pg_comment::apply_comment_stmt(self, &comment_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(prepare_stmt) = try_extract_prepare(&parse_result) {
+            self.handle_pg_prepare(&prepare_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(execute_stmt) = try_extract_execute(&parse_result) {
+            return Ok(Some(self.handle_pg_execute(&execute_stmt)?));
+        }
+
+        if let Some(deallocate_stmt) = try_extract_deallocate(&parse_result) {
+            self.handle_pg_deallocate(&deallocate_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
         }
 
         if let Some(role_stmt) = try_extract_create_role(&parse_result) {
@@ -333,15 +354,51 @@ impl Connection {
 
             let mut commit = self.prepare_with_origin("COMMIT", StatementOrigin::Root)?;
             commit.run_ignore_rows()?;
-
             Ok(rows_inserted)
         })();
         self.set_sql_dialect(saved_dialect);
         result
     }
 
+    fn handle_pg_prepare(self: &Arc<Self>, stmt: &PgPrepareStmt) -> Result<()> {
+        self.pg_prepared
+            .write()
+            .prepare(&stmt.name, &stmt.query_sql)
+    }
+
+    fn handle_pg_execute(self: &Arc<Self>, stmt: &PgExecuteStmt) -> Result<Statement> {
+        let sql = self.pg_prepared.read().get(&stmt.name)?;
+        if stmt.params.is_empty() {
+            return self.prepare(sql.as_str());
+        }
+        let mut prepared_sql = sql;
+        for (i, param) in stmt.params.iter().enumerate() {
+            let placeholder = format!("${}", i + 1);
+            if !prepared_sql.contains(&placeholder) {
+                return Err(LimboError::ParseError(format!(
+                    "prepared statement has no placeholder {placeholder}"
+                )));
+            }
+            prepared_sql = prepared_sql.replacen(&placeholder, param, 1);
+        }
+        self.prepare(prepared_sql.as_str())
+    }
+
+    fn handle_pg_deallocate(self: &Arc<Self>, stmt: &PgDeallocateStmt) -> Result<()> {
+        let mut registry = self.pg_prepared.write();
+        if stmt.all {
+            registry.deallocate_all();
+            Ok(())
+        } else {
+            let name = stmt.name.as_deref().ok_or_else(|| {
+                LimboError::ParseError("DEALLOCATE missing statement name".into())
+            })?;
+            registry.deallocate(name)
+        }
+    }
+
     /// Get column names for a table using PRAGMA table_info.
-    fn get_table_columns(
+    pub fn get_table_columns(
         self: &Arc<Self>,
         table_name: &str,
         schema_name: Option<&str>,

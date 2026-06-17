@@ -234,6 +234,10 @@ pub struct Connection {
     pub(super) pg_search_path: RwLock<Vec<String>>,
     /// PostgreSQL role registry (CREATE ROLE / DROP ROLE).
     pub(super) pg_roles: RwLock<crate::pg_role::PgRoleRegistry>,
+    /// COMMENT ON metadata exposed through pg_description.
+    pub(super) pg_comments: RwLock<crate::pg_comment::PgCommentRegistry>,
+    /// SQL-level PREPARE / EXECUTE / DEALLOCATE registry.
+    pub(super) pg_prepared: RwLock<crate::pg_prepared::PgPreparedStatementRegistry>,
     /// Session `search_path` saved on the first `SET LOCAL search_path` in a
     /// transaction; restored when the transaction ends (COMMIT or ROLLBACK).
     pub(super) pg_search_path_local_saved: RwLock<Option<Vec<String>>>,

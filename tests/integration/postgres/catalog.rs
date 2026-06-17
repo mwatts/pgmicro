@@ -1257,3 +1257,69 @@ fn test_pg_class_oid_index_filter(db: TempDatabase) {
     };
     assert_eq!(relname.as_str(), "oid_filter_test");
 }
+
+#[turso_macros::test]
+fn test_pg_comment_on_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE comment_me (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("COMMENT ON TABLE comment_me IS 'hello table'")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.description FROM pg_description d \
+             JOIN pg_class c ON c.oid = d.objoid \
+             WHERE c.relname = 'comment_me' AND d.objsubid = 0",
+        )
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected comment row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(desc) = row.get_value(0) else {
+        panic!("expected description text");
+    };
+    assert_eq!(desc.as_str(), "hello table");
+}
+
+#[turso_macros::test]
+fn test_pg_prepare_execute_deallocate(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    conn.execute("PREPARE sel AS SELECT 7 + $1").unwrap();
+
+    let mut stmt = conn.prepare("EXECUTE sel(5)").unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected execute row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(v)) = row.get_value(0) else {
+        panic!("expected integer result");
+    };
+    assert_eq!(*v, 12);
+
+    conn.execute("DEALLOCATE sel").unwrap();
+    assert!(conn.prepare("EXECUTE sel(1)").is_err());
+}
+
+#[turso_macros::test]
+fn test_pg_proc_alias_names(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    for alias in ["char_length", "btrim", "strpos"] {
+        let sql = format!("SELECT proname FROM pg_proc WHERE proname = '{alias}'");
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let StepResult::Row = stmt.step().unwrap() else {
+            panic!("expected pg_proc row for {alias}");
+        };
+        let row = stmt.row().unwrap();
+        let Value::Text(name) = row.get_value(0) else {
+            panic!("expected proname text");
+        };
+        assert_eq!(name.as_str(), alias);
+    }
+}
