@@ -1820,6 +1820,72 @@ impl Func {
 
         funcs
     }
+
+    /// Additional PostgreSQL-visible names that resolve to built-in functions.
+    pub fn pg_proc_alias_entries() -> Vec<FunctionListEntry> {
+        vec![
+            FunctionListEntry {
+                name: "char_length".into(),
+                func_type: "s",
+                narg: 1,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "character_length".into(),
+                func_type: "s",
+                narg: 1,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "btrim".into(),
+                func_type: "s",
+                narg: -1,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "chr".into(),
+                func_type: "s",
+                narg: 1,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "iif".into(),
+                func_type: "s",
+                narg: 3,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "strpos".into(),
+                func_type: "s",
+                narg: 2,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "position".into(),
+                func_type: "s",
+                narg: 2,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "reverse".into(),
+                func_type: "s",
+                narg: 1,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "array_overlaps".into(),
+                func_type: "s",
+                narg: 2,
+                deterministic: true,
+            },
+            FunctionListEntry {
+                name: "substr".into(),
+                func_type: "s",
+                narg: 3,
+                deterministic: true,
+            },
+        ]
+    }
 }
 
 pub struct FunctionListEntry {

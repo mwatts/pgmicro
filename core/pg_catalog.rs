@@ -1458,6 +1458,7 @@ fn stable_proc_oid_map(conn: &Connection) -> HashMap<String, i64> {
 
     let mut names: Vec<String> = Func::builtin_function_list()
         .into_iter()
+        .chain(Func::pg_proc_alias_entries().into_iter())
         .map(|e| e.name.to_string())
         .collect();
     for (name, _, _) in conn.get_syms_functions() {
@@ -1521,6 +1522,48 @@ impl PgProcCursor {
                 Value::Null,                        // prosqlbody
                 Value::Null,                        // proconfig
                 Value::Null,                        // proacl
+            ]);
+        }
+
+        for entry in Func::pg_proc_alias_entries() {
+            let oid = *oid_map
+                .get(&entry.name)
+                .expect("pg_proc alias missing from stable OID map");
+            let prokind = match entry.func_type {
+                "a" => "a",
+                "w" => "w",
+                _ => "f",
+            };
+            let provolatile = if entry.deterministic { "i" } else { "v" };
+            self.rows.push(vec![
+                Value::from_i64(oid),
+                Value::build_text(entry.name),
+                Value::from_i64(2200),
+                Value::from_i64(10),
+                Value::from_i64(14),
+                Value::from_f64(1.0),
+                Value::from_f64(0.0),
+                Value::from_i64(0),
+                Value::build_text(prokind),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::build_text(provolatile),
+                Value::build_text("u"),
+                Value::from_i64(entry.narg as i64),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
             ]);
         }
 
