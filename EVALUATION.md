@@ -19,7 +19,7 @@ never re-serialize SQL) is the right call.
 |---|---|
 | Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT, GREATEST/LEAST, DISTINCT ON, INTERVAL/MONEY |
 | Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; role registry; `pg_description` from COMMENT ON; ~11 stubs for psql compat |
-| Wire | Simple + Extended query protocol, multi-statement, lazy row streaming, COPY FROM/TO STDIN/STDOUT, trust auth (localhost-only; no TLS) |
+| Wire | Simple + Extended query protocol, multi-statement, lazy row streaming, COPY FROM/TO STDIN/STDOUT (text + binary), optional TLS, query cancellation, LISTEN/NOTIFY pub/sub, trust auth (localhost-only) |
 | REPL | 19 `\` meta-commands, all tested |
 | Schemas | CREATE/DROP SCHEMA → ATTACH separate `.db` files; `search_path` drives unqualified resolution |
 
@@ -100,13 +100,16 @@ never re-serialize SQL) is the right call.
 - **Row streaming** — query results stream row-by-row through pgwire instead of buffering the
   full result set.
 - **COPY wire protocol** — `COPY FROM STDIN` / `COPY TO STDOUT` via `CopyHandler` and inline
-  copy-out in `cli/pg_server.rs` (text format).
+  copy-out in `cli/pg_server.rs` (text + binary); wire integration tests in `pgmicro/tests/pgmicro.rs`.
+- **Optional TLS** — `--tls-cert` / `--tls-key` on pgmicro wire server (`rustls` acceptor).
+- **Query cancellation** — cancel request handler maps `(pid, secret)` → `Connection::interrupt()`.
+- **LISTEN/NOTIFY pub/sub** — database-scoped hub delivers NOTIFY to all listening sessions;
+  wire server pushes `NotificationResponse` asynchronously to connected clients.
 
 **Remaining:**
 
-- **No SSL, no cancellation, no LISTEN/NOTIFY.**
-- **Bare NUMERIC vs NUMERIC(p,s)** — unqualified NUMERIC columns may still map to FLOAT8 in
-  some catalog metadata paths; parameterized `NUMERIC(10,2)` uses Type::NUMERIC.
+- **Wire session isolation** — wire server still shares one `Connection` for SQL execution;
+  LISTEN/NOTIFY routing is per wire client PID.
 
 ### Catalog faithfulness
 
@@ -126,11 +129,13 @@ never re-serialize SQL) is the right call.
   `pg_user` / `pg_get_userbyid` read live registry.
 - **`pg_description`** — `COMMENT ON TABLE/COLUMN/TYPE` stored per connection; exposed via
   `pg_description` virtual table.
+- **`pg_collation`** — built-in rows (`default`, `C`, `POSIX`, `ucs_basic`).
+- **Bare `NUMERIC` catalog** — unqualified `NUMERIC` DDL maps to `numeric(38,19)`; `pg_type` /
+  `pg_attribute` report OID 1700 / `numeric`.
 
 **Remaining:**
 
-- **No `pg_collation`** populated (still empty stub).
-- **Role persistence** — registry resets on reconnect; no password/TLS/`GRANT`.
+- **Role persistence** — registry resets on reconnect; no password verification / `GRANT`.
 
 ### Dialect / schema mechanism
 
@@ -186,15 +191,12 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
 | 1 | `fix/auth-persist` | `core/pg_role.rs` + storage | Persist roles; wire startup user; `SET ROLE` |
-| 2 | `fix/pg-collation` | `core/pg_catalog.rs` | Populate `pg_collation` stub |
-| 3 | `fix/wire-tls` | `cli/pg_server.rs` | TLS for non-localhost (optional) |
-| 4 | `fix/listen-notify` | wire + async | LISTEN/NOTIFY stubs or real pub/sub |
-
 **Completed on `pgmicro-fixes`:** interval/money types; wire binary params; `pg_database` schemas;
 `atttypmod`; catalog validation; `pg_authid`/`pg_user`/`pg_enum`; dialect `SET sql_dialect`
 persistence; NUMERIC wire precision; row streaming; stable `pg_proc` OIDs; catalog OID fast
-paths; multi-user role registry; `pg_description` + COMMENT ON; COPY wire STDIN/STDOUT;
-SQL-level PREPARE/EXECUTE/DEALLOCATE; `pg_proc` PG alias names.
+paths; multi-user role registry; `pg_description` + COMMENT ON; COPY wire STDIN/STDOUT (text +
+binary); COPY wire tests; optional TLS; query cancellation; LISTEN/NOTIFY pub/sub; `pg_collation`;
+bare NUMERIC catalog metadata; SQL-level PREPARE/EXECUTE/DEALLOCATE; `pg_proc` PG alias names.
 
 ## Bottom line
 
@@ -205,8 +207,8 @@ common cases.
 
 Remaining gaps cluster in two buckets:
 
-1. **Production auth** — persist roles, password verification, TLS, `GRANT`/`REVOKE`.
-2. **Wire server extras** — cancellation, LISTEN/NOTIFY, COPY binary format.
+1. **Production auth** — persist roles, password verification, `GRANT`/`REVOKE`.
+2. **Wire session isolation** — per-client SQL connections instead of one shared `Connection`.
 
 Strongest part: translator breadth + test depth + rapid correctness fixes on `pgmicro-fixes`.
 Weakest: durable multi-session auth for anything beyond localhost dev.
