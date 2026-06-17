@@ -10,15 +10,16 @@
 use std::num::NonZero;
 
 use crate::connection::Connection;
-use crate::copy::parse_copy_text_format;
+use crate::copy::{parse_copy_binary_format, parse_copy_text_format};
 use crate::statement::StatementOrigin;
 use crate::types::Text;
 use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
     is_refresh_matview, try_extract_comment, try_extract_copy_from, try_extract_create_role,
     try_extract_create_schema, try_extract_deallocate, try_extract_drop_role,
-    try_extract_drop_schema, try_extract_execute, try_extract_prepare, try_extract_reset,
-    try_extract_set, try_extract_show, try_extract_truncate, PgCopyFromStmt, PgCreateRoleStmt,
+    try_extract_drop_schema, try_extract_execute, try_extract_listen, try_extract_notify,
+    try_extract_prepare, try_extract_reset, try_extract_set, try_extract_show,
+    try_extract_truncate, try_extract_unlisten, PgCopyFormat, PgCopyFromStmt, PgCreateRoleStmt,
     PgCreateSchemaStmt, PgDeallocateStmt, PgDropRoleStmt, PgDropSchemaStmt, PgExecuteStmt,
     PgPrepareStmt, PgResetStmt, PgSetStmt, PgTruncateStmt, PostgreSQLTranslator,
 };
@@ -91,6 +92,25 @@ impl Connection {
 
         if let Some(deallocate_stmt) = try_extract_deallocate(&parse_result) {
             self.handle_pg_deallocate(&deallocate_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(listen_stmt) = try_extract_listen(&parse_result) {
+            crate::pg_listen::handle_listen(self, &listen_stmt.channel)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(notify_stmt) = try_extract_notify(&parse_result) {
+            crate::pg_listen::handle_notify(
+                self,
+                &notify_stmt.channel,
+                notify_stmt.payload.as_deref(),
+            )?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(unlisten_stmt) = try_extract_unlisten(&parse_result) {
+            crate::pg_listen::handle_unlisten(self, unlisten_stmt.channel.as_deref())?;
             return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
         }
 
@@ -288,23 +308,25 @@ impl Connection {
             &stmt.table_name,
             stmt.schema_name.as_deref(),
             stmt.columns.as_deref(),
+            PgCopyFormat::Text,
             stmt.delimiter.as_deref(),
             stmt.header,
             stmt.null_string.as_deref(),
-            &data,
+            data.as_bytes(),
         )
     }
 
-    /// Insert COPY text-format rows into a table. Used by COPY FROM file and STDIN.
+    /// Insert COPY rows into a table. Used by COPY FROM file and STDIN.
     pub fn handle_pg_copy_data(
         self: &Arc<Self>,
         table_name: &str,
         schema_name: Option<&str>,
         columns: Option<&[String]>,
+        format: PgCopyFormat,
         delimiter: Option<&str>,
         header: bool,
         null_string: Option<&str>,
-        data: &str,
+        data: &[u8],
     ) -> Result<usize> {
         let qualified_table = match schema_name {
             Some(schema) => format!("\"{schema}\".\"{table_name}\""),
@@ -333,13 +355,21 @@ impl Connection {
         let insert_sql =
             format!("INSERT INTO {qualified_table}{insert_cols} VALUES ({placeholders})");
 
-        let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('\t');
-        let null_string = null_string.unwrap_or("\\N");
-
-        let mut rows = parse_copy_text_format(data, delimiter, null_string, num_columns)?;
-        if header && !rows.is_empty() {
-            rows.remove(0);
-        }
+        let rows = match format {
+            PgCopyFormat::Text => {
+                let data = std::str::from_utf8(data).map_err(|e| {
+                    LimboError::ParseError(format!("COPY FROM: invalid UTF-8 data: {e}"))
+                })?;
+                let delimiter = delimiter.and_then(|d| d.chars().next()).unwrap_or('\t');
+                let null_string = null_string.unwrap_or("\\N");
+                let mut rows = parse_copy_text_format(data, delimiter, null_string, num_columns)?;
+                if header && !rows.is_empty() {
+                    rows.remove(0);
+                }
+                rows
+            }
+            PgCopyFormat::Binary => parse_copy_binary_format(data, num_columns)?,
+        };
         let rows_inserted = rows.len();
 
         let saved_dialect = self.get_sql_dialect();

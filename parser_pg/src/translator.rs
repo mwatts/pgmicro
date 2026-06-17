@@ -5273,12 +5273,20 @@ pub fn try_extract_truncate(parse_result: &ParseResult) -> Option<PgTruncateStmt
     Some(PgTruncateStmt { tables })
 }
 
+/// COPY data format (text or PostgreSQL binary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgCopyFormat {
+    Text,
+    Binary,
+}
+
 /// COPY FROM STDIN metadata for the wire protocol / connection layer.
 #[derive(Debug, Clone)]
 pub struct PgCopyStdinStmt {
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
+    pub format: PgCopyFormat,
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
@@ -5325,6 +5333,7 @@ pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyStdinS
         Some(cols)
     };
 
+    let mut format = PgCopyFormat::Text;
     let mut delimiter = None;
     let mut header = false;
     let mut null_string = None;
@@ -5335,9 +5344,11 @@ pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyStdinS
         match def.defname.as_str() {
             "format" => {
                 if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return None;
-                    }
+                    format = match val.to_lowercase().as_str() {
+                        "text" => PgCopyFormat::Text,
+                        "binary" => PgCopyFormat::Binary,
+                        _ => return None,
+                    };
                 }
             }
             "delimiter" => delimiter = def_elem_string_val(def),
@@ -5351,6 +5362,7 @@ pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyStdinS
         table_name,
         schema_name,
         columns,
+        format,
         delimiter,
         header,
         null_string,
@@ -5363,6 +5375,7 @@ pub struct PgCopyStdoutStmt {
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
+    pub format: PgCopyFormat,
     pub delimiter: char,
     pub null_string: String,
 }
@@ -5408,6 +5421,7 @@ pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdou
         Some(cols)
     };
 
+    let mut format = PgCopyFormat::Text;
     let mut delimiter = '\t';
     let mut null_string = "\\N".to_string();
     for opt in &copy.options {
@@ -5417,9 +5431,11 @@ pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdou
         match def.defname.as_str() {
             "format" => {
                 if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return None;
-                    }
+                    format = match val.to_lowercase().as_str() {
+                        "text" => PgCopyFormat::Text,
+                        "binary" => PgCopyFormat::Binary,
+                        _ => return None,
+                    };
                 }
             }
             "delimiter" => {
@@ -5440,6 +5456,7 @@ pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdou
         table_name,
         schema_name,
         columns,
+        format,
         delimiter,
         null_string,
     })
@@ -5633,6 +5650,86 @@ pub fn try_extract_deallocate(parse_result: &ParseResult) -> Option<PgDeallocate
             Some(stmt.name.clone())
         },
         all: stmt.isall,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PgListenStmt {
+    pub channel: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgNotifyStmt {
+    pub channel: String,
+    pub payload: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgUnlistenStmt {
+    pub channel: Option<String>,
+}
+
+/// Try to extract LISTEN from pg_query parse output.
+pub fn try_extract_listen(parse_result: &ParseResult) -> Option<PgListenStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::ListenStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    if stmt.conditionname.is_empty() {
+        return None;
+    }
+    Some(PgListenStmt {
+        channel: stmt.conditionname.clone(),
+    })
+}
+
+/// Try to extract NOTIFY from pg_query parse output.
+pub fn try_extract_notify(parse_result: &ParseResult) -> Option<PgNotifyStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::NotifyStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    if stmt.conditionname.is_empty() {
+        return None;
+    }
+    let payload = if stmt.payload.is_empty() {
+        None
+    } else {
+        Some(stmt.payload.clone())
+    };
+    Some(PgNotifyStmt {
+        channel: stmt.conditionname.clone(),
+        payload,
+    })
+}
+
+/// Try to extract UNLISTEN from pg_query parse output.
+pub fn try_extract_unlisten(parse_result: &ParseResult) -> Option<PgUnlistenStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::UnlistenStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    Some(PgUnlistenStmt {
+        channel: if stmt.conditionname.is_empty() {
+            None
+        } else {
+            Some(stmt.conditionname.clone())
+        },
     })
 }
 

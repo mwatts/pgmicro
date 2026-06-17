@@ -92,6 +92,103 @@ fn unescape_copy_field(field: &str) -> String {
     result
 }
 
+/// PostgreSQL COPY binary file header.
+pub const COPY_BINARY_HEADER: &[u8] = b"PGCOPY\n\xFF\r\n\0";
+
+fn read_i16_be(data: &[u8], pos: &mut usize) -> Result<i16> {
+    if *pos + 2 > data.len() {
+        return Err(LimboError::ParseError("COPY binary: unexpected EOF".into()));
+    }
+    let val = i16::from_be_bytes([data[*pos], data[*pos + 1]]);
+    *pos += 2;
+    Ok(val)
+}
+
+fn read_i32_be(data: &[u8], pos: &mut usize) -> Result<i32> {
+    if *pos + 4 > data.len() {
+        return Err(LimboError::ParseError("COPY binary: unexpected EOF".into()));
+    }
+    let val = i32::from_be_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+    *pos += 4;
+    Ok(val)
+}
+
+/// Parse PostgreSQL COPY binary format into rows of optional UTF-8 field values.
+pub fn parse_copy_binary_format(data: &[u8], num_columns: usize) -> Result<Vec<CopyRow>> {
+    let mut pos = 0usize;
+    if data.len() >= COPY_BINARY_HEADER.len()
+        && &data[..COPY_BINARY_HEADER.len()] == COPY_BINARY_HEADER
+    {
+        pos = COPY_BINARY_HEADER.len();
+    }
+
+    let mut rows = Vec::new();
+    loop {
+        let field_count = read_i16_be(data, &mut pos)?;
+        if field_count == -1 {
+            break;
+        }
+        if usize::try_from(field_count).unwrap_or(0) != num_columns {
+            return Err(LimboError::ParseError(format!(
+                "COPY binary: expected {num_columns} columns, got {field_count}"
+            )));
+        }
+
+        let mut row = Vec::with_capacity(num_columns);
+        for _ in 0..num_columns {
+            let len = read_i32_be(data, &mut pos)?;
+            if len < 0 {
+                row.push(None);
+                continue;
+            }
+            let len = usize::try_from(len)
+                .map_err(|_| LimboError::ParseError("COPY binary: invalid field length".into()))?;
+            if pos + len > data.len() {
+                return Err(LimboError::ParseError(
+                    "COPY binary: truncated field".into(),
+                ));
+            }
+            let bytes = &data[pos..pos + len];
+            pos += len;
+            let text = String::from_utf8(bytes.to_vec()).map_err(|e| {
+                LimboError::ParseError(format!("COPY binary: invalid UTF-8 field: {e}"))
+            })?;
+            row.push(Some(text));
+        }
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Encode rows into PostgreSQL COPY binary format (without file header).
+pub fn encode_copy_binary_rows(rows: &[Vec<Option<String>>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for row in rows {
+        let ncols = i16::try_from(row.len()).unwrap_or(0);
+        out.extend_from_slice(&ncols.to_be_bytes());
+        for val in row {
+            match val {
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(s) => {
+                    let bytes = s.as_bytes();
+                    let len = i32::try_from(bytes.len()).unwrap_or(0);
+                    out.extend_from_slice(&len.to_be_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+    out.extend_from_slice(&(-1i16).to_be_bytes());
+    out
+}
+
+/// Full COPY binary payload including the standard file header.
+pub fn encode_copy_binary_file(rows: &[Vec<Option<String>>]) -> Vec<u8> {
+    let mut out = COPY_BINARY_HEADER.to_vec();
+    out.extend_from_slice(&encode_copy_binary_rows(rows));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +262,16 @@ mod tests {
         let data = "id\tname\n1\thello\n";
         let rows = parse_copy_text_format(data, '\t', "\\N", 2).unwrap();
         assert_eq!(rows.len(), 2); // Parser doesn't skip headers
+    }
+
+    #[test]
+    fn test_copy_binary_roundtrip() {
+        let rows = vec![
+            vec![Some("1".into()), Some("Alice".into())],
+            vec![Some("2".into()), None],
+        ];
+        let encoded = encode_copy_binary_file(&rows);
+        let parsed = parse_copy_binary_format(&encoded, 2).unwrap();
+        assert_eq!(parsed, rows);
     }
 }
