@@ -1103,4 +1103,202 @@ mod tests {
 
         Ok(())
     }
+
+    fn run_count_div_zero_query(opts: turso_core::DatabaseOpts) -> Vec<Vec<rusqlite::types::Value>> {
+        let db = TempDatabase::builder()
+            .with_db_name("count-div-zero.db")
+            .with_opts(opts)
+            .build();
+        let conn = db.connect_limbo();
+        conn.prepare_execute_batch(
+            "CREATE TABLE t(x PRIMARY KEY, y, z);
+             CREATE INDEX idx_y ON t(y);
+             CREATE INDEX idx_z ON t(z);",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+        let query = "SELECT COUNT(*) FROM t WHERE ((NOT (1 / 0) IS (1 / 0) < (CASE ( -0.5 ) WHEN ( 0 ) THEN ( (1 / 0) ) ELSE ( -2.0 ) END)) <> CAST ( ( 1.5 ) AS  NUMERIC ) <= 0)";
+        super::limbo_exec_rows(&conn, query)
+    }
+
+    fn count_where(opts: turso_core::DatabaseOpts, where_clause: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let db = TempDatabase::builder()
+            .with_db_name("count-where.db")
+            .with_opts(opts)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+        super::limbo_exec_rows(
+            &conn,
+            &format!("SELECT COUNT(*) FROM t WHERE {where_clause}"),
+        )
+    }
+
+    #[test]
+    #[ignore = "bisect helper"]
+    fn explain_count_div_zero_where_no_custom() {
+        let opts = turso_core::DatabaseOpts::new().with_encryption(true);
+        let db = TempDatabase::builder()
+            .with_db_name("explain-count-no-custom.db")
+            .with_opts(opts)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+        let q = "SELECT COUNT(*) FROM t WHERE (0) <> CAST((1.5) AS NUMERIC) <= 0";
+        eprintln!("no_custom result: {:?}", super::limbo_exec_rows(&conn, q));
+        for row in super::limbo_exec_rows(&conn, &format!("EXPLAIN {q}")) {
+            eprintln!("{row:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "bisect helper"]
+    fn explain_count_div_zero_where() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_encryption(true)
+            .with_custom_types(true);
+        let db = TempDatabase::builder()
+            .with_db_name("explain-count.db")
+            .with_opts(opts)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE t(x PRIMARY KEY, y, z)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+        let opts_plain = turso_core::DatabaseOpts::new()
+            .with_encryption(true)
+            .with_custom_types(true);
+        let db_plain = TempDatabase::builder()
+            .with_db_name("plain.db")
+            .with_opts(opts_plain)
+            .build();
+        let plain = db_plain.connect_limbo();
+        plain.execute("CREATE TABLE t(x PRIMARY KEY, y, z)").unwrap();
+        plain.execute("INSERT INTO t VALUES (1,2,3)").unwrap();
+        eprintln!(
+            "plain: {:?}",
+            super::limbo_exec_rows(
+                &plain,
+                "SELECT COUNT(*) FROM t WHERE (0) <> CAST((1.5) AS NUMERIC) <= 0"
+            )
+        );
+
+        for q in [
+            "EXPLAIN SELECT (0) <> CAST((1.5) AS NUMERIC) <= 0",
+            "EXPLAIN SELECT COUNT(*) FROM t WHERE (0) <> CAST((1.5) AS NUMERIC) <= 0",
+        ] {
+            eprintln!("--- {q} ---");
+            for row in super::limbo_exec_rows(&conn, q) {
+                eprintln!("{row:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "bisect helper"]
+    fn bisect_count_div_zero_exprs() {
+        let opts = turso_core::DatabaseOpts::new()
+            .with_encryption(true)
+            .with_custom_types(true);
+        let cases = [
+            ("a", "NOT (1 / 0) IS (1 / 0)"),
+            ("b", "(1 / 0) IS (1 / 0) < -2.0"),
+            ("c", "NOT ((1 / 0) IS (1 / 0) < -2.0)"),
+            ("d", "CAST((1.5) AS NUMERIC) <= 0"),
+            ("e", "(0) <> CAST((1.5) AS NUMERIC) <= 0"),
+            ("e2", "SELECT (0) <> CAST((1.5) AS NUMERIC) <= 0"),
+            ("h", "(0) <> 1.5"),
+            ("i", "CAST((1.5) AS NUMERIC) <= 0"),
+            ("f", "(NOT ((1 / 0) IS (1 / 0) < -2.0)) <> 1"),
+            (
+                "g",
+                "((NOT (1 / 0) IS (1 / 0) < -2.0) <> CAST((1.5) AS NUMERIC) <= 0)",
+            ),
+        ];
+        for (name, clause) in cases {
+            let rows = if clause.strip_prefix("SELECT ").is_some() {
+                let db = TempDatabase::builder()
+                    .with_db_name("count-expr.db")
+                    .with_opts(opts.clone())
+                    .build();
+                let conn = db.connect_limbo();
+                super::limbo_exec_rows(&conn, clause)
+            } else {
+                count_where(opts.clone(), clause)
+            };
+            eprintln!("{name}: {rows:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "bisect helper"]
+    fn bisect_count_div_zero_opts() {
+        let base = turso_core::DatabaseOpts::new().with_encryption(true);
+        let cases: &[(&str, turso_core::DatabaseOpts)] = &[
+            ("index_method", base.clone().with_index_method(true)),
+            ("attach", base.clone().with_attach(true)),
+            (
+                "generated_columns",
+                base.clone().with_generated_columns(true),
+            ),
+            ("custom_types", base.clone().with_custom_types(true)),
+            ("postgres", base.clone().with_postgres(true)),
+            (
+                "index+custom",
+                base.clone()
+                    .with_index_method(true)
+                    .with_custom_types(true),
+            ),
+            (
+                "all_fuzz",
+                base.clone()
+                    .with_index_method(true)
+                    .with_attach(true)
+                    .with_generated_columns(true)
+                    .with_custom_types(true)
+                    .with_postgres(true),
+            ),
+        ];
+        for (name, opts) in cases {
+            let rows = run_count_div_zero_query(opts.clone());
+            eprintln!("{name}: {rows:?}");
+            assert_eq!(
+                rows,
+                vec![vec![rusqlite::types::Value::Integer(0)]],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_with_div_by_zero_is_expr_returns_zero_default_opts() {
+        let rows = run_count_div_zero_query(turso_core::DatabaseOpts::new().with_encryption(true));
+        assert_eq!(
+            rows,
+            vec![vec![rusqlite::types::Value::Integer(0)]],
+            "default encrypted opts"
+        );
+    }
+
+    #[test]
+    fn count_with_div_by_zero_is_expr_returns_zero() {
+        let rows = run_count_div_zero_query(
+            turso_core::DatabaseOpts::new()
+                .with_index_method(true)
+                .with_encryption(true)
+                .with_attach(true)
+                .with_generated_columns(true)
+                .with_custom_types(true)
+                .with_postgres(true),
+        );
+        assert_eq!(
+            rows,
+            vec![vec![rusqlite::types::Value::Integer(0)]],
+            "COUNT(*) must be 0, not NULL"
+        );
+    }
 }
