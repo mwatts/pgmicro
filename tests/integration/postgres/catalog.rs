@@ -1348,3 +1348,33 @@ fn test_pg_collation_builtin_rows(db: TempDatabase) {
     }
     assert_eq!(names, vec!["default", "ucs_basic", "C", "POSIX"]);
 }
+
+#[turso_macros::test]
+fn test_pg_bare_numeric_type_oid(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("CREATE TABLE num_test (amount NUMERIC)")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.typname, a.atttypid \
+             FROM pg_attribute a \
+             JOIN pg_class c ON a.attrelid = c.oid \
+             JOIN pg_type t ON a.atttypid = t.oid \
+             WHERE c.relname = 'num_test' AND a.attname = 'amount'",
+        )
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected numeric column metadata");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(typname) = row.get_value(0) else {
+        panic!("expected typname");
+    };
+    let Value::Numeric(Numeric::Integer(oid)) = row.get_value(1) else {
+        panic!("expected atttypid");
+    };
+    assert_eq!(typname.as_str(), "numeric");
+    assert_eq!(*oid, 1700);
+}

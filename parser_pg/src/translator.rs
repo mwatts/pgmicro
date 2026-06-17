@@ -4504,7 +4504,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                _ => Some(PgTypeMapping::scalar("REAL")),
+                _ => Some(PgTypeMapping::with_params("numeric", vec![38, 19])),
             };
         }
 
@@ -5868,7 +5868,10 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        assert_eq!(
+            map_pg_type("NUMERIC", no_params),
+            Some(PgTypeMapping::with_params("numeric", vec![38, 19]))
+        );
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
