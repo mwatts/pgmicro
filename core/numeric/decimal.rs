@@ -212,6 +212,100 @@ pub fn validate_precision_scale(
     Ok(rounded)
 }
 
+/// Decode a PostgreSQL wire-protocol NUMERIC binary payload to text.
+#[cfg(feature = "cli_only")]
+pub fn pg_wire_numeric_binary_to_text(bytes: &[u8]) -> crate::Result<String> {
+    let bd = pg_wire_binary_to_bigdecimal(bytes)?;
+    Ok(format_numeric(&bd))
+}
+
+/// Format a [`Value`] for PostgreSQL NUMERIC wire/text output.
+#[cfg(feature = "cli_only")]
+pub fn value_to_pg_numeric_text(val: &crate::Value) -> crate::Result<String> {
+    use crate::types::Value;
+    use crate::Numeric;
+    match val {
+        Value::Null => Ok(String::new()),
+        Value::Text(t) => Ok(t.as_str().to_string()),
+        Value::Numeric(Numeric::Integer(i)) => Ok(i.to_string()),
+        Value::Numeric(Numeric::Float(f)) => Ok(format_float_for_numeric_wire(f64::from(*f))),
+        Value::Blob(b) if !b.is_empty() && b[0] == NUMERIC_BLOB_VERSION => {
+            Ok(format_numeric(&blob_to_bigdecimal(b)?))
+        }
+        Value::Blob(b) => {
+            let text = std::str::from_utf8(b)
+                .map_err(|e| LimboError::Constraint(format!("invalid numeric blob: {e}")))?;
+            Ok(text.to_string())
+        }
+    }
+}
+
+#[cfg(feature = "cli_only")]
+fn format_float_for_numeric_wire(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        format!("{f}")
+    }
+}
+
+#[cfg(feature = "cli_only")]
+fn pg_wire_binary_to_bigdecimal(bytes: &[u8]) -> crate::Result<BigDecimal> {
+    use num_bigint::Sign;
+
+    if bytes.len() < 8 {
+        return Err(LimboError::Constraint(format!(
+            "numeric too short: {} bytes",
+            bytes.len()
+        )));
+    }
+    let ndigits = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
+    let weight = i16::from_be_bytes([bytes[2], bytes[3]]);
+    let sign = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let dscale = i16::from_be_bytes([bytes[6], bytes[7]]);
+    if sign == 0xC000 {
+        return Err(LimboError::Constraint("numeric NaN".to_string()));
+    }
+    let digits_bytes = ndigits
+        .checked_mul(2)
+        .ok_or_else(|| LimboError::Constraint("numeric digit count overflow".to_string()))?;
+    if bytes.len() < 8 + digits_bytes {
+        return Err(LimboError::Constraint(
+            "truncated numeric payload".to_string(),
+        ));
+    }
+    let mut digits = Vec::with_capacity(ndigits);
+    for i in 0..ndigits {
+        let digit = u16::from_be_bytes([bytes[8 + i * 2], bytes[9 + i * 2]]);
+        digits.push(digit);
+    }
+
+    if digits.is_empty() {
+        return Ok(BigDecimal::new(BigInt::from(0), i64::from(dscale)));
+    }
+
+    let mut mantissa = BigInt::from(0);
+    for digit in digits {
+        mantissa = mantissa * 10000 + BigInt::from(digit);
+    }
+    let bigint_sign = if sign == 0x4000 {
+        Sign::Minus
+    } else {
+        Sign::Plus
+    };
+    let scale = i64::from(dscale) - (i64::from(weight) + 1 - ndigits as i64) * 4;
+    Ok(BigDecimal::new(
+        BigInt::new(bigint_sign, mantissa.to_u32_digits().1),
+        scale,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

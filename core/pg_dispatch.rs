@@ -15,10 +15,10 @@ use crate::statement::StatementOrigin;
 use crate::types::Text;
 use crate::{validate_schema_name, Cmd, LimboError, Result, SqlDialect, Statement, Value};
 use turso_parser_pg::translator::{
-    is_refresh_matview, try_extract_copy_from, try_extract_create_schema, try_extract_drop_schema,
-    try_extract_reset, try_extract_set, try_extract_show, try_extract_truncate, PgCopyFromStmt,
-    PgCreateSchemaStmt, PgDropSchemaStmt, PgResetStmt, PgSetStmt, PgTruncateStmt,
-    PostgreSQLTranslator,
+    is_refresh_matview, try_extract_copy_from, try_extract_create_role, try_extract_create_schema,
+    try_extract_drop_role, try_extract_drop_schema, try_extract_reset, try_extract_set,
+    try_extract_show, try_extract_truncate, PgCopyFromStmt, PgCreateRoleStmt, PgCreateSchemaStmt,
+    PgDropRoleStmt, PgDropSchemaStmt, PgResetStmt, PgSetStmt, PgTruncateStmt, PostgreSQLTranslator,
 };
 
 use crate::sync::Arc;
@@ -71,6 +71,16 @@ impl Connection {
             }
             let pragma_sql = format!("PRAGMA {}", show_stmt.name);
             return Ok(Some(self.prepare_sqlite_sql(&pragma_sql)?));
+        }
+
+        if let Some(role_stmt) = try_extract_create_role(&parse_result) {
+            self.handle_pg_create_role(&role_stmt)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
+        }
+
+        if let Some(drop_role) = try_extract_drop_role(&parse_result) {
+            self.handle_pg_drop_role(&drop_role)?;
+            return Ok(Some(self.prepare_sqlite_sql("SELECT 0 WHERE 0")?));
         }
 
         // CREATE SCHEMA → ATTACH database
@@ -429,5 +439,17 @@ impl Connection {
         let display = Self::pg_search_path_display(&path);
         let sql = format!("SELECT '{display}'");
         self.prepare_sqlite_sql(&sql)
+    }
+
+    fn handle_pg_create_role(self: &Arc<Self>, stmt: &PgCreateRoleStmt) -> Result<()> {
+        self.pg_roles.write().create_role(&stmt.role)
+    }
+
+    fn handle_pg_drop_role(self: &Arc<Self>, stmt: &PgDropRoleStmt) -> Result<()> {
+        let mut registry = self.pg_roles.write();
+        for role in &stmt.roles {
+            registry.drop_role(role, stmt.missing_ok)?;
+        }
+        Ok(())
     }
 }

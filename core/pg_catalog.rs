@@ -1,3 +1,4 @@
+use crate::pg_role::{pg_role_registry_rows, PgRoleCatalogKind};
 use crate::schema::{Schema, Table, TypeDef};
 use crate::sync::{Arc, LazyLock, RwLock};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
@@ -13,6 +14,16 @@ use turso_parser::ast::{Expr, RefAct};
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
+
+/// Stable OID base for pg_proc rows.
+const PG_PROC_OID_BASE: i64 = 80_000;
+
+/// pg_class best_index: bit 0 = oid equality, bit 1 = relname equality.
+const PG_CLASS_IDX_OID: i32 = 1;
+const PG_CLASS_IDX_RELNAME: i32 = 2;
+
+/// pg_attribute best_index: bit 0 = attrelid equality.
+const PG_ATTRIBUTE_IDX_ATTRELID: i32 = 1;
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
@@ -183,21 +194,68 @@ impl InternalVirtualTable for PgClassTable {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
-        // Create constraint usages for each constraint
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+
+        let mut idx_num = 0;
+        let mut oid_idx = None;
+        let mut relname_idx = None;
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.usable || c.op != ConstraintOp::Eq {
+                continue;
+            }
+            match c.column_index {
+                0 => {
+                    oid_idx = Some(i);
+                    idx_num |= PG_CLASS_IDX_OID;
+                }
+                1 => {
+                    relname_idx = Some(i);
+                    idx_num |= PG_CLASS_IDX_RELNAME;
+                }
+                _ => {}
+            }
+        }
+
+        let mut argv_next = 1u32;
+        let oid_argv = oid_idx.map(|_| {
+            let idx = argv_next;
+            argv_next += 1;
+            idx
+        });
+        let relname_argv = relname_idx.map(|_| {
+            let idx = argv_next;
+            argv_next += 1;
+            idx
+        });
+
         let constraint_usages = constraints
             .iter()
-            .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None, // We'll handle filtering ourselves
-                omit: false,
+            .enumerate()
+            .map(|(i, _)| {
+                let argv_index = if Some(i) == oid_idx {
+                    oid_argv
+                } else if Some(i) == relname_idx {
+                    relname_argv
+                } else {
+                    None
+                };
+                ConstraintUsage {
+                    argv_index,
+                    omit: argv_index.is_some(),
+                }
             })
             .collect();
 
         Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
+            idx_num,
+            idx_str: if idx_num == 0 {
+                None
+            } else {
+                Some(idx_num.to_string())
+            },
             order_by_consumed: false,
-            estimated_cost: 1000.0,
-            estimated_rows: 100,
+            estimated_cost: if idx_num == 0 { 1000.0 } else { 10.0 },
+            estimated_rows: if idx_num == 0 { 100 } else { 1 },
             constraint_usages,
         })
     }
@@ -243,6 +301,11 @@ impl InternalVirtualTable for PgClassTable {
     }
 }
 
+struct PgClassFilter {
+    oid: Option<i64>,
+    relname: Option<String>,
+}
+
 struct PgClassCursor {
     conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
@@ -258,9 +321,10 @@ impl PgClassCursor {
         }
     }
 
-    fn load_from_sqlite_master(&mut self) -> Result<(), LimboError> {
+    fn load_from_sqlite_master(&mut self, filter: PgClassFilter) -> Result<(), LimboError> {
         let schema = self.conn.schema.read().clone();
         self.rows.clear();
+        let relowner = self.conn.pg_roles.read().current_role_oid();
 
         let tables = user_tables_sorted(&schema);
         let num_tables = tables.len() as i64;
@@ -271,6 +335,16 @@ impl PgClassCursor {
                 _ => continue,
             };
             let table_oid = USER_TABLE_OID_START + i as i64;
+            if let Some(oid) = filter.oid {
+                if oid != table_oid {
+                    continue;
+                }
+            }
+            if let Some(ref relname) = filter.relname {
+                if !table_name.eq_ignore_ascii_case(relname) {
+                    continue;
+                }
+            }
             let relnatts = btree.columns().len() as i64;
             let relhasindex = if schema.get_indices(table_name).next().is_some() {
                 1i64
@@ -285,7 +359,7 @@ impl PgClassCursor {
                 Value::from_i64(2200),                     // relnamespace (public schema)
                 Value::from_i64(0),                        // reltype
                 Value::from_i64(0),                        // reloftype
-                Value::from_i64(10),                       // relowner
+                Value::from_i64(relowner),                 // relowner
                 Value::from_i64(2),                        // relam (heap)
                 Value::from_i64(0),                        // relfilenode
                 Value::from_i64(0),                        // reltablespace
@@ -323,6 +397,18 @@ impl PgClassCursor {
                 if idx.ephemeral {
                     continue;
                 }
+                if let Some(oid) = filter.oid {
+                    if oid != index_oid {
+                        index_oid += 1;
+                        continue;
+                    }
+                }
+                if let Some(ref relname) = filter.relname {
+                    if !idx.name.eq_ignore_ascii_case(relname) {
+                        index_oid += 1;
+                        continue;
+                    }
+                }
                 let indnatts = idx.columns.len() as i64;
                 self.rows.push(vec![
                     Value::from_i64(index_oid),           // oid
@@ -330,7 +416,7 @@ impl PgClassCursor {
                     Value::from_i64(2200),                // relnamespace (public)
                     Value::from_i64(0),                   // reltype
                     Value::from_i64(0),                   // reloftype
-                    Value::from_i64(10),                  // relowner
+                    Value::from_i64(relowner),            // relowner
                     Value::from_i64(403),                 // relam (btree)
                     Value::from_i64(0),                   // relfilenode
                     Value::from_i64(0),                   // reltablespace
@@ -387,16 +473,30 @@ impl InternalVirtualTableCursor for PgClassCursor {
 
     fn filter(
         &mut self,
-        _args: &[Value],
+        args: &[Value],
         _idx_str: Option<String>,
-        _idx_num: i32,
+        idx_num: i32,
     ) -> Result<bool, LimboError> {
-        // Reset cursor and load data
         self.current_row = 0;
         self.rows.clear();
-        self.load_from_sqlite_master()?;
 
-        // Return true if we have any rows
+        let mut filter = PgClassFilter {
+            oid: None,
+            relname: None,
+        };
+        let mut arg_idx = 0;
+        if idx_num & PG_CLASS_IDX_OID != 0 {
+            filter.oid = args.get(arg_idx).and_then(|v| v.as_int());
+            arg_idx += 1;
+        }
+        if idx_num & PG_CLASS_IDX_RELNAME != 0 {
+            filter.relname = args
+                .get(arg_idx)
+                .and_then(|v| v.to_text())
+                .map(|t| t.to_string());
+        }
+
+        self.load_from_sqlite_master(filter)?;
         Ok(!self.rows.is_empty())
     }
 }
@@ -578,20 +678,43 @@ impl InternalVirtualTable for PgAttributeTable {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
+        use turso_ext::{ConstraintOp, ConstraintUsage};
+
+        let mut idx_num = 0;
+        let mut attrelid_idx = None;
+        for (i, c) in constraints.iter().enumerate() {
+            if !c.usable || c.op != ConstraintOp::Eq {
+                continue;
+            }
+            if c.column_index == 0 {
+                attrelid_idx = Some(i);
+                idx_num |= PG_ATTRIBUTE_IDX_ATTRELID;
+            }
+        }
+        let attrelid_argv = attrelid_idx.map(|_| 1u32);
         let constraint_usages = constraints
             .iter()
-            .map(|_constraint| turso_ext::ConstraintUsage {
-                argv_index: None, // We'll handle filtering ourselves
-                omit: false,
+            .enumerate()
+            .map(|(i, _)| ConstraintUsage {
+                argv_index: if Some(i) == attrelid_idx {
+                    attrelid_argv
+                } else {
+                    None
+                },
+                omit: Some(i) == attrelid_idx,
             })
             .collect();
 
         Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
+            idx_num,
+            idx_str: if idx_num == 0 {
+                None
+            } else {
+                Some(idx_num.to_string())
+            },
             order_by_consumed: false,
-            estimated_cost: 1000.0,
-            estimated_rows: 1000,
+            estimated_cost: if idx_num == 0 { 1000.0 } else { 50.0 },
+            estimated_rows: if idx_num == 0 { 1000 } else { 20 },
             constraint_usages,
         })
     }
@@ -643,7 +766,7 @@ impl PgAttributeCursor {
         }
     }
 
-    fn load_attributes(&mut self) -> Result<(), LimboError> {
+    fn load_attributes(&mut self, attrelid: Option<i64>) -> Result<(), LimboError> {
         let schema = self.conn.schema.read().clone();
         self.rows.clear();
 
@@ -652,6 +775,11 @@ impl PgAttributeCursor {
         for (_, table) in user_tables_sorted(&schema) {
             let table_oid = oid_counter;
             oid_counter += 1;
+            if let Some(relid) = attrelid {
+                if relid != table_oid {
+                    continue;
+                }
+            }
 
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
@@ -716,13 +844,18 @@ impl InternalVirtualTableCursor for PgAttributeCursor {
 
     fn filter(
         &mut self,
-        _args: &[Value],
+        args: &[Value],
         _idx_str: Option<String>,
-        _idx_num: i32,
+        idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
         self.rows.clear();
-        self.load_attributes()?;
+        let attrelid = if idx_num & PG_ATTRIBUTE_IDX_ATTRELID != 0 {
+            args.first().and_then(|v| v.as_int())
+        } else {
+            None
+        };
+        self.load_attributes(attrelid)?;
         Ok(!self.rows.is_empty())
     }
 }
@@ -799,38 +932,14 @@ fn parse_enum_label_token(part: &str) -> Option<String> {
     }
 }
 
-/// Stub: single default superuser role shared by pg_roles, pg_authid, and pg_user.
-fn default_pg_role_rows() -> Vec<Vec<Value>> {
-    vec![vec![
-        Value::from_i64(10),        // oid
-        Value::build_text("turso"), // rolname
-        Value::from_i64(1),         // rolsuper
-        Value::from_i64(1),         // rolinherit
-        Value::from_i64(1),         // rolcreaterole
-        Value::from_i64(1),         // rolcreatedb
-        Value::from_i64(1),         // rolcanlogin
-        Value::from_i64(1),         // rolreplication
-        Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-        Value::Null,                // rolpassword (never exposed)
-        Value::Null,                // rolvaliduntil
-        Value::from_i64(1),         // rolbypassrls
-        Value::Null,                // rolconfig
-    ]]
-}
-
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
-/// TODO: replace with real role data when authentication is implemented.
+/// Virtual table implementation for pg_catalog.pg_roles.
+/// Rows come from the connection's in-memory role registry (CREATE ROLE / DROP ROLE).
 #[derive(Debug)]
 pub struct PgRolesTable;
 
 impl PgRolesTable {
     pub fn new() -> Self {
         Self
-    }
-
-    fn roles() -> Vec<Vec<Value>> {
-        default_pg_role_rows()
     }
 }
 
@@ -841,9 +950,10 @@ impl InternalVirtualTable for PgRolesTable {
 
     fn open(
         &self,
-        _conn: Arc<Connection>,
+        conn: Arc<Connection>,
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         Ok(Arc::new(RwLock::new(PgRolesCursor {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         })))
@@ -893,6 +1003,7 @@ impl InternalVirtualTable for PgRolesTable {
 }
 
 struct PgRolesCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -922,7 +1033,7 @@ impl InternalVirtualTableCursor for PgRolesCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        self.rows = PgRolesTable::roles();
+        self.rows = pg_role_registry_rows(&self.conn, PgRoleCatalogKind::Roles);
         Ok(!self.rows.is_empty())
     }
 }
@@ -935,29 +1046,6 @@ impl PgAuthidTable {
     fn new() -> Self {
         Self
     }
-
-    fn authid_rows() -> Vec<Vec<Value>> {
-        default_pg_role_rows()
-            .into_iter()
-            .map(|row| {
-                vec![
-                    row[0].clone(),  // oid
-                    row[1].clone(),  // rolname
-                    row[2].clone(),  // rolsuper
-                    row[3].clone(),  // rolinherit
-                    row[4].clone(),  // rolcreaterole
-                    row[5].clone(),  // rolcreatedb
-                    row[6].clone(),  // rolcanlogin
-                    row[7].clone(),  // rolreplication
-                    row[8].clone(),  // rolconnlimit
-                    row[9].clone(),  // rolpassword
-                    row[10].clone(), // rolvaliduntil
-                    row[11].clone(), // rolbypassrls
-                    row[12].clone(), // rolconfig
-                ]
-            })
-            .collect()
-    }
 }
 
 impl InternalVirtualTable for PgAuthidTable {
@@ -967,9 +1055,10 @@ impl InternalVirtualTable for PgAuthidTable {
 
     fn open(
         &self,
-        _conn: Arc<Connection>,
+        conn: Arc<Connection>,
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         Ok(Arc::new(RwLock::new(PgAuthidCursor {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         })))
@@ -992,7 +1081,7 @@ impl InternalVirtualTable for PgAuthidTable {
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 10.0,
-            estimated_rows: 1,
+            estimated_rows: 2,
             constraint_usages,
         })
     }
@@ -1018,6 +1107,7 @@ impl InternalVirtualTable for PgAuthidTable {
 }
 
 struct PgAuthidCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -1047,7 +1137,7 @@ impl InternalVirtualTableCursor for PgAuthidCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        self.rows = PgAuthidTable::authid_rows();
+        self.rows = pg_role_registry_rows(&self.conn, PgRoleCatalogKind::Authid);
         Ok(!self.rows.is_empty())
     }
 }
@@ -1060,25 +1150,6 @@ impl PgUserTable {
     fn new() -> Self {
         Self
     }
-
-    fn user_rows() -> Vec<Vec<Value>> {
-        default_pg_role_rows()
-            .into_iter()
-            .map(|row| {
-                vec![
-                    row[1].clone(),  // usename
-                    row[0].clone(),  // usesysid
-                    row[5].clone(),  // usecreatedb
-                    row[2].clone(),  // usesuper
-                    row[7].clone(),  // userepl
-                    row[11].clone(), // usebypassrls
-                    row[9].clone(),  // passwd
-                    row[10].clone(), // valuntil
-                    row[12].clone(), // useconfig
-                ]
-            })
-            .collect()
-    }
 }
 
 impl InternalVirtualTable for PgUserTable {
@@ -1088,9 +1159,10 @@ impl InternalVirtualTable for PgUserTable {
 
     fn open(
         &self,
-        _conn: Arc<Connection>,
+        conn: Arc<Connection>,
     ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
         Ok(Arc::new(RwLock::new(PgUserCursor {
+            conn,
             rows: Vec::new(),
             current_row: 0,
         })))
@@ -1113,7 +1185,7 @@ impl InternalVirtualTable for PgUserTable {
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 10.0,
-            estimated_rows: 1,
+            estimated_rows: 2,
             constraint_usages,
         })
     }
@@ -1135,6 +1207,7 @@ impl InternalVirtualTable for PgUserTable {
 }
 
 struct PgUserCursor {
+    conn: Arc<Connection>,
     rows: Vec<Vec<Value>>,
     current_row: usize,
 }
@@ -1164,7 +1237,7 @@ impl InternalVirtualTableCursor for PgUserCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        self.rows = PgUserTable::user_rows();
+        self.rows = pg_role_registry_rows(&self.conn, PgRoleCatalogKind::User);
         Ok(!self.rows.is_empty())
     }
 }
@@ -1380,15 +1453,37 @@ struct PgProcCursor {
     current_row: usize,
 }
 
+fn stable_proc_oid_map(conn: &Connection) -> HashMap<String, i64> {
+    use crate::function::Func;
+
+    let mut names: Vec<String> = Func::builtin_function_list()
+        .into_iter()
+        .map(|e| e.name.to_string())
+        .collect();
+    for (name, _, _) in conn.get_syms_functions() {
+        names.push(name);
+    }
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| (name, PG_PROC_OID_BASE + i as i64))
+        .collect()
+}
+
 impl PgProcCursor {
     fn load_functions(&mut self) {
         use crate::function::Func;
 
         self.rows.clear();
-        let mut oid = 1i64;
+        let oid_map = stable_proc_oid_map(&self.conn);
 
         // Built-in functions from the same registry as PRAGMA function_list
         for entry in Func::builtin_function_list() {
+            let oid = *oid_map
+                .get(&entry.name)
+                .expect("builtin function missing from stable OID map");
             let prokind = match entry.func_type {
                 "a" => "a", // aggregate
                 "w" => "w", // window
@@ -1427,11 +1522,13 @@ impl PgProcCursor {
                 Value::Null,                        // proconfig
                 Value::Null,                        // proacl
             ]);
-            oid += 1;
         }
 
         // Extension functions
         for (name, is_agg, argc) in self.conn.get_syms_functions() {
+            let oid = *oid_map
+                .get(&name)
+                .expect("extension function missing from stable OID map");
             let prokind = if is_agg { "a" } else { "f" };
 
             self.rows.push(vec![
@@ -1465,7 +1562,6 @@ impl PgProcCursor {
                 Value::Null,                  // proconfig
                 Value::Null,                  // proacl
             ]);
-            oid += 1;
         }
     }
 }

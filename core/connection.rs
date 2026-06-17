@@ -232,6 +232,8 @@ pub struct Connection {
     pub(super) sql_dialect: AtomicSqlDialect,
     /// PostgreSQL session `search_path` for unqualified object resolution.
     pub(super) pg_search_path: RwLock<Vec<String>>,
+    /// PostgreSQL role registry (CREATE ROLE / DROP ROLE).
+    pub(super) pg_roles: RwLock<crate::pg_role::PgRoleRegistry>,
     /// Session `search_path` saved on the first `SET LOCAL search_path` in a
     /// transaction; restored when the transaction ends (COMMIT or ROLLBACK).
     pub(super) pg_search_path_local_saved: RwLock<Option<Vec<String>>>,

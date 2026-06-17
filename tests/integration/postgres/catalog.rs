@@ -1141,3 +1141,119 @@ fn test_pg_enum_labels(db: TempDatabase) {
     }
     assert_eq!(labels, vec!["happy", "sad"]);
 }
+
+#[turso_macros::test]
+fn test_pg_create_and_drop_role(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    conn.execute("CREATE ROLE appuser").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT rolname, rolcanlogin FROM pg_roles WHERE rolname = 'appuser'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected appuser in pg_roles");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(rolname) = row.get_value(0) else {
+        panic!("expected rolname text");
+    };
+    let Value::Numeric(Numeric::Integer(canlogin)) = row.get_value(1) else {
+        panic!("expected rolcanlogin integer");
+    };
+    assert_eq!(rolname.as_str(), "appuser");
+    assert_eq!(*canlogin, 1);
+
+    let mut stmt = conn.prepare("SELECT pg_get_userbyid(10)").unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected pg_get_userbyid row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(name) = row.get_value(0) else {
+        panic!("expected username text");
+    };
+    assert_eq!(name.as_str(), "turso");
+
+    conn.execute("DROP ROLE appuser").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM pg_roles WHERE rolname = 'appuser'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected count row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
+        panic!("expected count integer");
+    };
+    assert_eq!(*count, 0);
+}
+
+#[turso_macros::test]
+fn test_pg_proc_stable_oids(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT oid, proname FROM pg_proc WHERE proname = 'abs'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected abs in pg_proc");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(oid)) = row.get_value(0) else {
+        panic!("expected integer oid");
+    };
+    let Value::Text(proname) = row.get_value(1) else {
+        panic!("expected proname text");
+    };
+    assert_eq!(proname.as_str(), "abs");
+    assert!(
+        *oid >= 80_000,
+        "pg_proc OID should be stable base range, got {oid}"
+    );
+
+    let first_oid = *oid;
+    let mut stmt = conn
+        .prepare("SELECT oid FROM pg_proc WHERE proname = 'abs'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected abs oid on second scan");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(oid)) = row.get_value(0) else {
+        panic!("expected integer oid");
+    };
+    assert_eq!(*oid, first_oid, "pg_proc OID should be stable across scans");
+}
+
+#[turso_macros::test]
+fn test_pg_class_oid_index_filter(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE oid_filter_test (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT oid FROM pg_class WHERE relname = 'oid_filter_test'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected table oid row");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(table_oid)) = row.get_value(0) else {
+        panic!("expected integer table oid");
+    };
+
+    let sql = format!("SELECT relname FROM pg_class WHERE oid = {table_oid}");
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected row for oid filter");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Text(relname) = row.get_value(0) else {
+        panic!("expected relname text");
+    };
+    assert_eq!(relname.as_str(), "oid_filter_test");
+}

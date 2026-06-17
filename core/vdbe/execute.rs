@@ -7147,7 +7147,7 @@ pub fn op_function(
                     .get_value()
                     .as_int()
                     .unwrap_or(0);
-                state.registers[*dest].set_value(exec_pg_get_user_by_id(oid));
+                state.registers[*dest].set_value(exec_pg_get_user_by_id(&program.connection, oid));
             }
             ScalarFunc::PgTableIsVisible
             | ScalarFunc::PgFunctionIsVisible

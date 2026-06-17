@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use turso_core::{validate_schema_name, Connection, LimboError, Value};
+use turso_core::{validate_schema_name, Connection, LimboError, StepResult, Value};
 
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::portal::{Format, Portal};
@@ -222,7 +222,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                 responses.push(execute_non_query(&mut stmt, sql)?);
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
+                responses.push(execute_query(stmt, header)?);
             }
 
             // Only delete the backing schema file once the statement has
@@ -271,7 +271,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        execute_query(stmt, header)
     }
 
     async fn do_describe_statement<C>(
@@ -395,30 +395,78 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
     }
 }
 
-/// Execute a query that returns rows and build a Query response.
+struct QueryStreamState {
+    stmt: turso_core::Statement,
+    header: Arc<Vec<FieldInfo>>,
+}
+
+fn encode_row(row: &turso_core::Row, header: &Arc<Vec<FieldInfo>>) -> turso_core::Result<DataRow> {
+    let mut encoder = DataRowEncoder::new(header.clone());
+    for (i, val) in row.get_values().enumerate() {
+        let pg_type = header
+            .get(i)
+            .map(|fi| fi.datatype().clone())
+            .unwrap_or(Type::TEXT);
+        encode_value(&mut encoder, val, &pg_type)?;
+    }
+    encoder
+        .finish()
+        .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+}
+
+/// Execute a query that returns rows and build a lazily-streamed Query response.
 fn execute_query(
-    stmt: &mut turso_core::Statement,
+    stmt: turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
-    let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
-    let header_clone = header.clone();
+    let row_stream =
+        stream::try_unfold(
+            Some(QueryStreamState {
+                stmt,
+                header: header.clone(),
+            }),
+            |state| async move {
+                let mut state = match state {
+                    Some(s) => s,
+                    None => return Ok(None),
+                };
+                loop {
+                    match state.stmt.step() {
+                        Ok(StepResult::Row) => {
+                            let row = state
+                                .stmt
+                                .row()
+                                .expect("row must be present after StepResult::Row");
+                            let data_row = encode_row(row, &state.header).map_err(|e| {
+                                PgWireError::UserError(Box::new(limbo_error_to_pg(e)))
+                            })?;
+                            return Ok(Some((data_row, Some(state))));
+                        }
+                        Ok(StepResult::IO) => {
+                            state.stmt.get_pager().io.step().map_err(|e| {
+                                PgWireError::UserError(Box::new(limbo_error_to_pg(e)))
+                            })?;
+                        }
+                        Ok(StepResult::Done) => return Ok(None),
+                        Ok(StepResult::Interrupt) => {
+                            return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+                                turso_core::LimboError::Interrupt,
+                            ))));
+                        }
+                        Ok(StepResult::Busy) => {
+                            return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(
+                                turso_core::LimboError::Busy,
+                            ))));
+                        }
+                        Err(e) => {
+                            return Err(PgWireError::UserError(Box::new(limbo_error_to_pg(e))));
+                        }
+                    }
+                }
+            },
+        );
 
-    stmt.run_with_row_callback(|row| {
-        let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
-                .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
-        }
-        rows.push(encoder.finish());
-        Ok(())
-    })
-    .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
-
-    let data_stream = stream::iter(rows);
-    Ok(Response::Query(QueryResponse::new(header, data_stream)))
+    Ok(Response::Query(QueryResponse::new(header, row_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
@@ -514,13 +562,6 @@ fn read_be_f64(bytes: &[u8]) -> Result<f64, String> {
         .try_into()
         .map_err(|_| format!("expected 8 bytes, got {}", bytes.len()))?;
     Ok(f64::from_be_bytes(arr))
-}
-
-fn read_be_u16(bytes: &[u8]) -> Result<u16, String> {
-    let arr: [u8; 2] = bytes
-        .try_into()
-        .map_err(|_| format!("expected 2 bytes, got {}", bytes.len()))?;
-    Ok(u16::from_be_bytes(arr))
 }
 
 /// Proleptic Gregorian calendar helpers (Howard Hinnant).
@@ -649,36 +690,6 @@ fn format_money_cents(cents: i64) -> String {
     }
 }
 
-fn decode_numeric_binary(bytes: &[u8]) -> Result<f64, String> {
-    if bytes.len() < 8 {
-        return Err(format!("numeric too short: {} bytes", bytes.len()));
-    }
-    let ndigits = read_be_u16(&bytes[0..2])? as usize;
-    let weight = read_be_i16(&bytes[2..4])?;
-    let sign = read_be_u16(&bytes[4..6])?;
-    let _dscale = read_be_i16(&bytes[6..8])?;
-    if sign == 0xC000 {
-        return Err("numeric NaN".to_string());
-    }
-    let negative = sign == 0x4000;
-    let digits_bytes = ndigits
-        .checked_mul(2)
-        .ok_or_else(|| "numeric digit count overflow".to_string())?;
-    if bytes.len() < 8 + digits_bytes {
-        return Err("truncated numeric payload".to_string());
-    }
-    let mut value = 0.0f64;
-    for i in 0..ndigits {
-        let digit = read_be_u16(&bytes[8 + i * 2..10 + i * 2])? as f64;
-        let exp = i64::from(weight) - i as i64;
-        value += digit * 10000f64.powi(exp as i32);
-    }
-    if negative {
-        value = -value;
-    }
-    Ok(value)
-}
-
 /// Decode a parameter sent in PostgreSQL binary format.
 fn pg_bytes_to_value_binary(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     match *pg_type {
@@ -713,8 +724,9 @@ fn pg_bytes_to_value_binary(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value>
         }
         Type::BYTEA => Ok(Value::from_blob(bytes.to_vec())),
         Type::NUMERIC => {
-            let f = decode_numeric_binary(bytes).map_err(binary_parameter_error)?;
-            Ok(Value::from_f64(f))
+            let text = turso_core::pg_wire_numeric_binary_to_text(bytes)
+                .map_err(|e| binary_parameter_error(e.to_string()))?;
+            Ok(Value::from_text(text))
         }
         Type::DATE => {
             let days = read_be_i32(bytes).map_err(binary_parameter_error)?;
@@ -793,7 +805,8 @@ fn pg_bytes_to_value_text(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             })?;
             Ok(Value::from_i64(i))
         }
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
+        Type::NUMERIC => Ok(Value::from_text(text.to_owned())),
+        Type::FLOAT4 | Type::FLOAT8 => {
             let f: f64 = text.parse().map_err(|e| {
                 PgWireError::UserError(Box::new(invalid_parameter_error(format!(
                     "invalid float parameter: {e}"
@@ -881,15 +894,39 @@ fn encode_value(
                 encoder
                     .encode_field(&v)
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else if *pg_type == Type::NUMERIC {
+                let text = turso_core::value_to_pg_numeric_text(val)?;
+                encoder
+                    .encode_field_with_type_and_format(
+                        &text.as_str(),
+                        pg_type,
+                        FieldFormat::Text,
+                        &FormatOptions::default(),
+                    )
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             } else {
                 encoder
                     .encode_field(i)
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
-        Value::Numeric(turso_core::Numeric::Float(f)) => encoder
-            .encode_field(&f64::from(*f))
-            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
+        Value::Numeric(turso_core::Numeric::Float(f)) => {
+            if *pg_type == Type::NUMERIC {
+                let text = turso_core::value_to_pg_numeric_text(val)?;
+                encoder
+                    .encode_field_with_type_and_format(
+                        &text.as_str(),
+                        pg_type,
+                        FieldFormat::Text,
+                        &FormatOptions::default(),
+                    )
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            } else {
+                encoder
+                    .encode_field(&f64::from(*f))
+                    .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+            }
+        }
         Value::Text(t) => {
             let text = t.value.as_ref();
             // For TIMESTAMPTZ columns, ensure timezone info is present so clients
@@ -934,8 +971,8 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" => Type::FLOAT8,
+        "NUMERIC" | "DECIMAL" => Type::NUMERIC,
         "TEXT" | "VARCHAR" | "CHAR" | "CHARACTER VARYING" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
         "BOOLEAN" | "BOOL" => Type::BOOL,
@@ -1236,7 +1273,7 @@ mod tests {
         assert_eq!(val, Value::from_f64(-0.5));
 
         let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC, FieldFormat::Text).unwrap();
-        assert_eq!(val, Value::from_f64(1.23));
+        assert_eq!(val, Value::from_text("1.23"));
     }
 
     #[test]
@@ -1368,7 +1405,13 @@ mod tests {
     fn test_pg_bytes_to_value_binary_numeric() {
         let bytes = [0, 1, 0, 0, 0, 0, 0, 0, 0, 42];
         let val = pg_bytes_to_value(&bytes, &Type::NUMERIC, FieldFormat::Binary).unwrap();
-        assert_eq!(val, Value::from_f64(42.0));
+        assert_eq!(val, Value::from_text("42"));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_text_numeric_preserves_precision() {
+        let val = pg_bytes_to_value(b"12.340", &Type::NUMERIC, FieldFormat::Text).unwrap();
+        assert_eq!(val, Value::from_text("12.340"));
     }
 
     #[test]

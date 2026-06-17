@@ -4992,6 +4992,75 @@ pub struct PgDropSchemaStmt {
     pub cascade: bool,
 }
 
+/// Extracted CREATE ROLE / CREATE USER statement.
+#[derive(Debug, Clone)]
+pub struct PgCreateRoleStmt {
+    pub role: String,
+}
+
+/// Extracted DROP ROLE statement.
+#[derive(Debug, Clone)]
+pub struct PgDropRoleStmt {
+    pub roles: Vec<String>,
+    pub missing_ok: bool,
+}
+
+/// Try to extract CREATE ROLE / CREATE USER from pg_query parse output.
+pub fn try_extract_create_role(parse_result: &ParseResult) -> Option<PgCreateRoleStmt> {
+    use pg_query::protobuf::RoleStmtType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CreateRoleStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    let stmt_type = RoleStmtType::try_from(stmt.stmt_type).ok()?;
+    match stmt_type {
+        RoleStmtType::RolestmtRole | RoleStmtType::RolestmtUser => {}
+        _ => return None,
+    }
+    if stmt.role.is_empty() {
+        return None;
+    }
+    Some(PgCreateRoleStmt {
+        role: stmt.role.clone(),
+    })
+}
+
+/// Try to extract DROP ROLE from pg_query parse output.
+pub fn try_extract_drop_role(parse_result: &ParseResult) -> Option<PgDropRoleStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::DropRoleStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    let mut roles = Vec::new();
+    for role_node in &stmt.roles {
+        let Some(node) = role_node.node.as_ref() else {
+            continue;
+        };
+        match node.to_ref() {
+            NodeRef::RoleSpec(spec) => roles.push(spec.rolename.clone()),
+            NodeRef::String(s) => roles.push(s.sval.clone()),
+            _ => {}
+        }
+    }
+    if roles.is_empty() {
+        return None;
+    }
+    Some(PgDropRoleStmt {
+        roles,
+        missing_ok: stmt.missing_ok,
+    })
+}
+
 /// Try to extract a CREATE SCHEMA statement from pg_query parse output.
 pub fn try_extract_create_schema(parse_result: &ParseResult) -> Option<PgCreateSchemaStmt> {
     use pg_query::NodeRef;

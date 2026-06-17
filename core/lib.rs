@@ -50,6 +50,7 @@ mod numeric;
 mod parameters;
 mod pg_catalog;
 mod pg_dispatch;
+mod pg_role;
 mod pg_schema;
 mod pragma;
 mod progress;
@@ -140,6 +141,8 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
+#[cfg(feature = "cli_only")]
+pub use numeric::decimal::{pg_wire_numeric_binary_to_text, value_to_pg_numeric_text};
 pub use numeric::{nonnan::NonNan, Numeric};
 pub use pg_schema::validate_schema_name;
 pub use statement::{Statement, StatementStatusCounter};
@@ -1820,6 +1823,7 @@ impl Database {
             temp_store: AtomicTempStore::new(TempStore::Default),
             sql_dialect: AtomicSqlDialect::new(SqlDialect::default()),
             pg_search_path: RwLock::new(vec!["public".to_string()]),
+            pg_roles: RwLock::new(pg_role::PgRoleRegistry::bootstrap()),
             pg_search_path_local_saved: RwLock::new(None),
             data_sync_retry: AtomicBool::new(false),
             busy_handler: RwLock::new(BusyHandler::None),

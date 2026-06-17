@@ -30,8 +30,8 @@ fn pg_now(_args: &[ExtValue]) -> ExtValue {
     ExtValue::from_text(formatted)
 }
 
-pub fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+pub fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
+    crate::pg_role::exec_pg_get_user_by_id(conn, oid)
 }
 
 pub fn exec_pg_is_visible(_oid: i64) -> Value {
