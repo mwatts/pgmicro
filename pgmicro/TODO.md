@@ -1,5 +1,8 @@
 # pgmicro: Missing PG Features
 
+**Backlog:** See [EVALUATION.md](../EVALUATION.md) for the prioritized gap list and next-wave
+branches. This file tracks feature ideas by difficulty; strike through items when done.
+
 Sorted by implementation difficulty.
 
 ## Trivial (hours, mostly wiring)
@@ -8,7 +11,7 @@ Sorted by implementation difficulty.
 2. **PREPARE / EXECUTE / DEALLOCATE** — wire protocol already handles this; just need the SQL syntax to not error
 3. **GRANT/REVOKE** — parse + ignore (single-user system, just don't error)
 4. **More PG system functions** — register existing Turso functions under PG aliases (e.g. `string_agg` → `group_concat`, `regexp_replace`, etc.)
-5. **SET search_path** — intercept in try_prepare_pg, store on connection, use in table resolution
+5. ~~**SET search_path**~~ — DONE (`try_prepare_pg`, `Connection.pg_search_path`, resolver)
 
 ## Easy (a day or two)
 
@@ -27,7 +30,7 @@ Sorted by implementation difficulty.
 ## Hard (a week+)
 
 16. **User-defined functions (CREATE FUNCTION)** — needs a function registry, PL/pgSQL is out of scope but SQL-body functions are feasible
-17. **INTERVAL type with arithmetic** — needs a custom type in Turso core with operator overloading
+17. ~~**INTERVAL type with arithmetic**~~ — DONE (`core/interval`, `core/money`, translator + catalog; see `docs/design/interval-money-types.md`)
 18. **Full COPY protocol** — wire-level CopyData/CopyDone/CopyFail message handling in pg_server.rs
 19. **Triggers** — Turso has experimental trigger support but wiring PG syntax is non-trivial
 20. **Deferred constraints** — fundamental architectural change; SQLite checks constraints immediately

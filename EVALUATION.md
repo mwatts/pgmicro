@@ -17,7 +17,7 @@ never re-serialize SQL) is the right call.
 
 | Layer | Real capability |
 |---|---|
-| Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT, GREATEST/LEAST, DISTINCT ON |
+| Translator | Full DML, most DDL, ~all common expressions/operators, JSON `->`/`->>`, ILIKE, SIMILAR TO, BETWEEN, IS DISTINCT, CASE, COALESCE, casts, ARRAY, window frames, RETURNING, ON CONFLICT, GREATEST/LEAST, DISTINCT ON, INTERVAL/MONEY |
 | Catalog | `pg_class/attribute/namespace/type/index/constraint/attrdef/proc/tables` populated from live schema; ~12 stubs for psql compat |
 | Wire | Simple + Extended query protocol, multi-statement, trust auth (localhost-only; no TLS) |
 | REPL | 19 `\` meta-commands, all tested |
@@ -69,22 +69,17 @@ never re-serialize SQL) is the right call.
   truth semantics (any non-zero number is true).
 - **`gcd` / `lcm` overflow** — return `LimboError::IntegerOverflow` (SQLSTATE 22003) instead
   of a TEXT `"ERROR: ..."` row value.
-
-**Fixed (continued):**
-
 - **Aggregate ORDER BY** — `FuncCall.agg_order` is translated into `FunctionCall.order_by`;
   planner stores `order_by` on `Aggregate` and emits a sorter path (ungrouped: dedicated
   `AggOrderMetadata` sorter; grouped: extra sort keys on the GROUP BY sorter) so `AggStep`
   runs in sorted order. `array_agg(x ORDER BY y)` works end-to-end.
-
-**Fixed (continued):**
-
-- **MONEY→REAL, INTERVAL→TEXT** — Turso builtin `interval` (16-byte blob, calendar
-  semantics) and `money` (int64 cents) types in core; pgmicro maps `INTERVAL`/`MONEY` DDL
-  and casts to custom types, rewrites `timestamp ± interval` and `EXTRACT(... FROM
-  interval)`, and wires catalog OIDs (1186/790) plus wire `Type::INTERVAL`/`Type::MONEY`.
-
-**Remaining:**
+- **INTERVAL / MONEY types** — Turso builtin `interval` (16-byte blob, calendar semantics) and
+  `money` (int64 cents) in core; pgmicro maps DDL/casts, rewrites `timestamp ± interval` and
+  `EXTRACT(... FROM interval)`, and wires catalog OIDs (1186/790) plus wire
+  `Type::INTERVAL`/`Type::MONEY`. See `docs/design/interval-money-types.md`.
+- **Ungrouped `COUNT(*)` with custom-type WHERE** — inline AggFinal result path when WHERE
+  constant-folds before the main loop; wrapped aggregates like `COALESCE(sum(v), 0)` use the
+  normal epilogue (not bare-aggregate inline copy).
 
 ### Wire protocol fidelity
 
@@ -95,6 +90,7 @@ never re-serialize SQL) is the right call.
   `40001` serialization_failure, `22P02` invalid_parameter). Unclassified errors still use `XX000`.
 
 **Remaining:**
+
 - **Binary param format unsupported**, `cli/pg_server.rs:441`. Binary bytes decoded as UTF-8
   → garbage/error. JDBC/psycopg3 binary mode breaks.
 - **NUMERIC = f64** everywhere. Precision silently lost.
@@ -104,6 +100,8 @@ never re-serialize SQL) is the right call.
   advertised as FLOAT8 but `NUMERIC(10,2)` as NUMERIC — inconsistent.
 
 ### Catalog faithfulness
+
+**Remaining:**
 
 - **Single hardcoded `turso` role** everywhere (`pg_roles`, `tableowner`,
   `pg_get_userbyid`). Multi-user joins all wrong.
@@ -127,6 +125,12 @@ never re-serialize SQL) is the right call.
   (`public` → main DB, schema names → attached DBs).
 - **`SET LOCAL search_path`** — transaction-scoped; restored on `COMMIT`/`ROLLBACK` via
   `pg_search_path_local_saved` stack.
+- **Connect-time dialect** — new connections default to SQLite (`SqlDialect::default()`).
+  Postgres entry points set dialect explicitly (pgmicro REPL, PG wire server, NAPI
+  `default-postgres`). Avoids Cargo feature-unification from pgmicro breaking `core_tester`
+  SQLite tests when built in the same invocation.
+- **`prepare_execute_batch`** — SQLite path loops `Parser::next_cmd()` (matches `execute()`);
+  PG path runs all statements from `translate_stmts()`.
 
 **Remaining:**
 
@@ -135,10 +139,13 @@ never re-serialize SQL) is the right call.
 - **Cross-schema txns not atomic** — separate ATTACH WAL files, partial commit possible,
   undocumented.
 - **`:memory:` + CREATE SCHEMA** writes a physical file to cwd; sessions collide.
-- **Multi-statement `prepare()`** — `translate_stmts()` handles multi-command ALTER; most
-  other statement types still use `nodes()[0]` only.
+- **Multi-statement `prepare()` return value** — when `prepare()` sees multiple commands it
+  executes all via `compile_and_run_cmds()` but returns a dummy `Statement` (`SELECT 0 WHERE 0`).
+  Use `prepare_execute_batch()`, `execute()`, or wire simple protocol for intentional batching.
 
 ### Validation bugs
+
+**Remaining:**
 
 - Date validation accepts Feb 31 / Apr 31, `core/pg_catalog.rs:2958`.
 - `convert_to_postgres_ddl` naive string replace can rename columns containing `INTEGER`,
@@ -148,7 +155,7 @@ never re-serialize SQL) is the right call.
 ### Dead code
 
 - `parser_pg/src/{ast,lexer,parser,token}.rs` (~5k LOC hand-written PG parser) **unused** —
-  execution uses libpg_query. CLAUDE.md confirms.
+  execution uses libpg_query. AGENTS.md confirms.
 - `information_schema.tables → sqlite_master` map (`translator.rs:81`) is **dead** — schema
   prefix is stripped before it's reached.
 
@@ -158,22 +165,26 @@ Work in priority order; each item = branch off `pgmicro-fixes` → PR → squash
 
 | # | Branch | Scope | Notes |
 |---|--------|-------|-------|
-| 1 | `fix/interval-money-types` | `parser_pg` + types | INTERVAL/MONEY type fidelity (larger; may need Turso-core types first) |
+| 1 | `fix/wire-binary-params` | `cli/pg_server.rs` | Binary portal param format (JDBC/psycopg3) |
+| 2 | `fix/pg-database-schemas` | `core/pg_catalog.rs` | `pg_database` rows for ATTACH'd schemas; `\l` |
+| 3 | `fix/catalog-atttypmod` | `core/pg_catalog.rs` | `atttypmod` for varchar/numeric precision |
+| 4 | `fix/pg-catalog-validation` | `core/pg_catalog.rs` | Date, DDL string-replace, JSON validation |
+
+**Completed on `pgmicro-fixes`:** `fix/interval-money-types` (core types + translator + catalog/wire).
 
 ## Bottom line
 
 Core engine works and the design is clean. The major silent-correctness cluster from the
 original eval (NOT IN, NULLS, DISTINCT ON, set-op ALL, GREATEST/LEAST, ANY(array), TRUNCATE,
-ALTER, IS TRUE, search_path) is now fixed or partially fixed.
+ALTER, IS TRUE, search_path, INTERVAL/MONEY, aggregate ORDER BY) is fixed.
 
-Remaining gaps cluster in three buckets:
+Remaining gaps cluster in two buckets:
 
-1. **Execution gaps** (INTERVAL/MONEY types) — translation is often done; runtime/compiler
-   support lags.
-2. **PG fidelity for tooling** (SQLSTATE codes, binary format, role/catalog stubs,
-   `pg_database` attached schemas) — ORMs/typed drivers misbehave; psql mostly survives.
-3. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; prepared-statement
-   schema file cleanup.
+1. **PG fidelity for tooling** — binary wire params, catalog stubs (`pg_database`, roles,
+   `atttypmod`, enum OIDs), NUMERIC precision. ORMs and typed drivers misbehave; psql mostly
+   survives.
+2. **Wire server hardening** — auth/TLS if ever exposed beyond localhost; row streaming;
+   COPY/LISTEN/NOTIFY.
 
 Strongest part: translator breadth + test depth + rapid correctness fixes on `pgmicro-fixes`.
 Weakest: wire-protocol tooling fidelity and catalog completeness for ORM/framework startup.

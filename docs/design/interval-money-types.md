@@ -1,16 +1,14 @@
 # Design: INTERVAL and MONEY Type Fidelity
 
-**Status:** Approved for implementation  
-**Integration branch:** `pgmicro-fixes`  
-**Core branch:** `feat/interval-core` → PR stack A  
-**pgmicro branch:** `fix/interval-money-types` → PR stack B (after A merges)
+**Status:** Implemented on `pgmicro-fixes`  
+**Land commits:** `c97de3dd5` (core types), `2b084eed8` (translator, catalog, wire)  
+**Prior state:** pgmicro mapped `INTERVAL → TEXT` and `MONEY → REAL`, breaking interval
+arithmetic, timestamp math, and money precision.
 
 ## Summary
 
-pgmicro maps `INTERVAL → TEXT` and `MONEY → REAL`, which breaks interval arithmetic,
-timestamp math, and money precision. This design adds Turso-core custom types with
-PostgreSQL-compatible semantics, then wires pgmicro translation, catalog, and wire
-encoding on top.
+Turso-core custom types with PostgreSQL-compatible semantics, wired through pgmicro
+translation, catalog, and wire encoding.
 
 **Scope includes full calendar interval semantics** (`'1 month' + '1 month' ≠ '60 days'`),
 **`justify_hours` / `justify_days`**, and the **`extract(... FROM interval)` suite**.
@@ -28,7 +26,7 @@ encoding on top.
 | Extract | `epoch`, `year`, `month`, `day`, `hour`, `minute`, `second`, `milliseconds`, `microseconds` from interval |
 | Money | Fixed-scale cents; `+`, `-`, `*`, `/`; `$` formatting |
 | Errors | Invalid input → constraint/overflow errors with SQLSTATE 22007/22003 |
-| Tests | Fail on current `pgmicro-fixes`; pass after stack merges |
+| Tests | Integration tests in `tests/integration/postgres/interval.rs`; core unit tests in `core/interval/` |
 
 ## Non-Goals (deferred)
 
@@ -215,7 +213,7 @@ Reference vectors from PostgreSQL 16 where possible.
 | B2 | `fix(pg): translate INTERVAL literals, timestamp±interval, EXTRACT, justify_*` | B1, A3 |
 | B3 | `fix(pg): catalog and wire encoding for interval/money` | B1 |
 | B4 | `test(pg): integration tests for interval/money` | B2, B3 |
-| B5 | `docs: EVALUATION.md — interval/money fixed` | B4 |
+| B5 | `docs: EVALUATION.md — interval/money fixed` | B4 | ✅ done |
 
 ## Open Questions
 
