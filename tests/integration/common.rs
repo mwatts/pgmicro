@@ -1227,12 +1227,12 @@ mod tests {
             let rows = if clause.strip_prefix("SELECT ").is_some() {
                 let db = TempDatabase::builder()
                     .with_db_name("count-expr.db")
-                    .with_opts(opts.clone())
+                    .with_opts(opts)
                     .build();
                 let conn = db.connect_limbo();
                 super::limbo_exec_rows(&conn, clause)
             } else {
-                count_where(opts.clone(), clause)
+                count_where(opts, clause)
             };
             eprintln!("{name}: {rows:?}");
         }
@@ -1243,22 +1243,18 @@ mod tests {
     fn bisect_count_div_zero_opts() {
         let base = turso_core::DatabaseOpts::new().with_encryption(true);
         let cases: &[(&str, turso_core::DatabaseOpts)] = &[
-            ("index_method", base.clone().with_index_method(true)),
-            ("attach", base.clone().with_attach(true)),
-            (
-                "generated_columns",
-                base.clone().with_generated_columns(true),
-            ),
-            ("custom_types", base.clone().with_custom_types(true)),
-            ("postgres", base.clone().with_postgres(true)),
+            ("index_method", base.with_index_method(true)),
+            ("attach", base.with_attach(true)),
+            ("generated_columns", base.with_generated_columns(true)),
+            ("custom_types", base.with_custom_types(true)),
+            ("postgres", base.with_postgres(true)),
             (
                 "index+custom",
-                base.clone().with_index_method(true).with_custom_types(true),
+                base.with_index_method(true).with_custom_types(true),
             ),
             (
                 "all_fuzz",
-                base.clone()
-                    .with_index_method(true)
+                base.with_index_method(true)
                     .with_attach(true)
                     .with_generated_columns(true)
                     .with_custom_types(true)
@@ -1266,7 +1262,7 @@ mod tests {
             ),
         ];
         for (name, opts) in cases {
-            let rows = run_count_div_zero_query(opts.clone());
+            let rows = run_count_div_zero_query(*opts);
             eprintln!("{name}: {rows:?}");
             assert_eq!(
                 rows,

@@ -346,8 +346,9 @@ pub enum TempStore {
 /// Control SQL parsing dialect.
 /// - 0 = SQLite (default for new connections)
 /// - 1 = PostgreSQL (set explicitly by PG entry points or `PRAGMA sql_dialect`)
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SqlDialect {
+    #[default]
     Sqlite = 0,
     Postgres = 1,
 }
@@ -384,16 +385,6 @@ impl SqlDialect {
             }
         };
         Ok((dialect, raw_sql))
-    }
-}
-
-impl Default for SqlDialect {
-    fn default() -> Self {
-        // Always SQLite. Postgres entry points (pgmicro REPL, NAPI with default-postgres,
-        // PG wire server) set dialect explicitly at connect time. Using a compile-time
-        // default here breaks SQLite tests when Cargo unifies default-postgres from
-        // pgmicro into shared turso_core builds.
-        SqlDialect::Sqlite
     }
 }
 

@@ -1350,8 +1350,6 @@ impl PostgreSQLTranslator {
         let distinct_on = self.distinct_on_exprs(&select.distinct_clause)?;
         let distinctness = if Self::is_plain_distinct(&select.distinct_clause) {
             Some(ast::Distinctness::Distinct)
-        } else if select.distinct_clause.is_empty() {
-            None
         } else {
             None
         };
@@ -3269,22 +3267,23 @@ impl PostgreSQLTranslator {
         }
 
         // EXTRACT(field FROM interval) → interval_extract(field, source)
-        if func_name.eq_ignore_ascii_case("extract") && func_call.args.len() == 2 {
-            if is_pg_interval_node(&func_call.args[1]) {
-                return Ok(ast::Expr::FunctionCall {
-                    name: ast::Name::from_string("interval_extract"),
-                    distinctness: None,
-                    args: vec![
-                        Box::new(self.translate_expr(&func_call.args[0])?),
-                        Box::new(self.translate_expr(&func_call.args[1])?),
-                    ],
-                    order_by: vec![],
-                    filter_over: ast::FunctionTail {
-                        filter_clause: None,
-                        over_clause: None,
-                    },
-                });
-            }
+        if func_name.eq_ignore_ascii_case("extract")
+            && func_call.args.len() == 2
+            && is_pg_interval_node(&func_call.args[1])
+        {
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("interval_extract"),
+                distinctness: None,
+                args: vec![
+                    Box::new(self.translate_expr(&func_call.args[0])?),
+                    Box::new(self.translate_expr(&func_call.args[1])?),
+                ],
+                order_by: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
         }
 
         // Translate function arguments
@@ -3924,13 +3923,13 @@ impl PostgreSQLTranslator {
     fn distinct_on_exprs(
         &self,
         distinct_clause: &[pg_query::protobuf::Node],
-    ) -> Result<Vec<Box<ast::Expr>>, ParseError> {
+    ) -> Result<Vec<ast::Expr>, ParseError> {
         if distinct_clause.is_empty() || Self::is_plain_distinct(distinct_clause) {
             return Ok(vec![]);
         }
         distinct_clause
             .iter()
-            .map(|node| Ok(Box::new(self.translate_expr(node)?)))
+            .map(|node| self.translate_expr(node))
             .collect()
     }
 
@@ -4005,7 +4004,7 @@ impl PostgreSQLTranslator {
     fn wrap_distinct_on(
         &self,
         mut inner: ast::Select,
-        distinct_on: Vec<Box<ast::Expr>>,
+        distinct_on: Vec<ast::Expr>,
         outer_columns: Vec<ast::ResultColumn>,
     ) -> Result<ast::Select, ParseError> {
         const SUB_ALIAS: &str = "__pgmicro_distinct_on";
@@ -4036,7 +4035,7 @@ impl PostgreSQLTranslator {
 
         let window = ast::Window {
             base: None,
-            partition_by: distinct_on,
+            partition_by: distinct_on.into_iter().map(Box::new).collect(),
             order_by: inner.order_by.clone(),
             frame_clause: None,
         };

@@ -103,9 +103,9 @@ pub fn aggregates_need_input_sort(aggregates: &[Aggregate]) -> bool {
     aggregates.iter().any(|agg| !agg.order_by.is_empty())
 }
 
-pub(crate) fn aggregate_order_by_sort_key<'a>(
-    aggregates: &'a [Aggregate],
-) -> Result<&'a [(ast::Expr, SortOrder, Option<ast::NullsOrder>)]> {
+pub(crate) fn aggregate_order_by_sort_key(
+    aggregates: &[Aggregate],
+) -> Result<&[(ast::Expr, SortOrder, Option<ast::NullsOrder>)]> {
     let Some(key) = aggregates
         .iter()
         .find(|agg| !agg.order_by.is_empty())

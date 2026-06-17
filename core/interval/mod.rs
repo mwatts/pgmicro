@@ -75,17 +75,7 @@ impl Interval {
     }
 
     pub fn sub(self, other: Self) -> Result<Self, LimboError> {
-        let months = self.months.checked_sub(other.months).ok_or_overflow()?;
-        let days = self.days.checked_sub(other.days).ok_or_overflow()?;
-        let microseconds = self
-            .microseconds
-            .checked_sub(other.microseconds)
-            .ok_or_overflow()?;
-        Ok(Self {
-            months,
-            days,
-            microseconds,
-        })
+        self.add(other.negate())
     }
 
     pub fn mul(self, factor: f64) -> Result<Self, LimboError> {
@@ -279,7 +269,7 @@ fn parse_hms_to_microseconds(s: &str) -> Result<i64, LimboError> {
     let mut microseconds = (hours * 3600 + minutes * 60 + seconds) * USECS_PER_SEC;
     if let Some(frac) = frac {
         let frac_digits = frac.len().min(6);
-        let padded = format!("{:0<6}", frac);
+        let padded = format!("{frac:0<6}");
         let frac_us: i64 = padded[..frac_digits]
             .parse()
             .map_err(|_| invalid_interval(s))?;
@@ -623,6 +613,14 @@ mod tests {
         let sum = a.add(b).unwrap();
         assert_eq!(sum.days, 60);
         assert_eq!(sum.months, 0);
+    }
+
+    #[test]
+    fn negate_and_sub_are_inverse() {
+        let iv = Interval::from_text("2 months 3 days").unwrap();
+        let zero = iv.add(iv.negate()).unwrap();
+        assert_eq!(zero, Interval::default());
+        assert_eq!(iv.sub(iv).unwrap(), Interval::default());
     }
 
     #[test]

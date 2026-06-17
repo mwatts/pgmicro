@@ -15727,7 +15727,7 @@ mod tests {
         );
         assert_eq!(state.pc, 0, "pc should not advance on invariant violation");
         assert!(
-            matches!(state.active_op_state.hash_probe(), None),
+            state.active_op_state.hash_probe().is_none(),
             "HashProbe should not stash resumable state for the removed fallback path"
         );
     }
