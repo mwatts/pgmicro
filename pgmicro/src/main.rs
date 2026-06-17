@@ -92,6 +92,18 @@ struct Opts {
                 WARNING: the server performs no authentication; do not bind to a public address."
     )]
     server: Option<String>,
+
+    #[clap(
+        long,
+        help = "TLS certificate PEM file for the wire server (requires --tls-key)"
+    )]
+    tls_cert: Option<PathBuf>,
+
+    #[clap(
+        long,
+        help = "TLS private key PEM file for the wire server (requires --tls-cert)"
+    )]
+    tls_key: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,12 +1024,26 @@ fn main() -> anyhow::Result<()> {
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
         auto_attach_pg_schemas(&conn, &db_file);
-        eprintln!(
-            "WARNING: the PostgreSQL wire server performs NO authentication and uses no TLS. \
-             Any client that can reach {address} has full read/write access to the database. \
-             Bind only to a trusted address such as 127.0.0.1."
-        );
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        if opts.tls_cert.is_some() {
+            eprintln!(
+                "WARNING: the PostgreSQL wire server performs NO authentication. \
+                 TLS encrypts transport only. Bind only to a trusted address such as 127.0.0.1."
+            );
+        } else {
+            eprintln!(
+                "WARNING: the PostgreSQL wire server performs NO authentication and uses no TLS. \
+                 Any client that can reach {address} has full read/write access to the database. \
+                 Bind only to a trusted address such as 127.0.0.1."
+            );
+        }
+        let server = TursoPgServer::new(
+            address.clone(),
+            db_file,
+            conn,
+            interrupt_count,
+            opts.tls_cert.as_deref(),
+            opts.tls_key.as_deref(),
+        )?;
         return server.run();
     }
 

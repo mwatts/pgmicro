@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Error as IoError, ErrorKind};
 use std::num::NonZero;
+use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -11,12 +15,16 @@ use futures::stream;
 use futures::SinkExt;
 use tokio::net::TcpListener;
 use tracing::{error, info};
+use turso_core::copy::encode_copy_binary_file;
 use turso_core::{validate_schema_name, Connection, LimboError, StepResult, Value};
 use turso_parser_pg::translator::{
-    try_extract_copy_stdin, try_extract_copy_stdout, PgCopyStdinStmt, PgCopyStdoutStmt,
+    try_extract_copy_stdin, try_extract_copy_stdout, PgCopyFormat, PgCopyStdinStmt,
+    PgCopyStdoutStmt,
 };
 
+use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::StartupHandler;
+use pgwire::api::cancel::CancelHandler;
 use pgwire::api::copy::{send_copy_out_response, CopyHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
@@ -25,11 +33,13 @@ use pgwire::api::results::{
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, NoopHandler, PgWireServerHandlers, Type};
+use pgwire::api::{ClientInfo, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::cancel::CancelRequest;
 use pgwire::messages::copy::{CopyData, CopyDone};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::response::CommandComplete;
+use pgwire::messages::startup::SecretKey;
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
@@ -39,6 +49,8 @@ pub struct TursoPgServer {
     db_file: String,
     conn: Arc<Mutex<Arc<Connection>>>,
     interrupt_count: Arc<AtomicUsize>,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    cancel_registry: Arc<TursoCancelRegistry>,
 }
 
 impl TursoPgServer {
@@ -47,16 +59,28 @@ impl TursoPgServer {
         db_file: String,
         conn: Arc<Connection>,
         interrupt_count: Arc<AtomicUsize>,
-    ) -> Self {
+        tls_cert: Option<&Path>,
+        tls_key: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         // Set postgres dialect on the connection
         conn.set_sql_dialect(turso_core::SqlDialect::Postgres);
 
-        Self {
+        let tls_acceptor = match (tls_cert, tls_key) {
+            (Some(cert), Some(key)) => Some(load_tls_acceptor(cert, key)?),
+            (None, None) => None,
+            _ => {
+                anyhow::bail!("--tls-cert and --tls-key must be specified together");
+            }
+        };
+
+        Ok(Self {
             address,
             db_file,
             conn: Arc::new(Mutex::new(conn)),
             interrupt_count,
-        }
+            tls_acceptor,
+            cancel_registry: Arc::new(TursoCancelRegistry::default()),
+        })
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
@@ -71,6 +95,7 @@ impl TursoPgServer {
             self.address, self.db_file
         );
 
+        let tls_acceptor = self.tls_acceptor.clone();
         let factory = Arc::new(TursoPgFactory {
             handler: Arc::new(TursoPgHandler {
                 conn: self.conn.clone(),
@@ -78,6 +103,7 @@ impl TursoPgServer {
                 query_parser: Arc::new(NoopQueryParser::new()),
                 copy_in: Arc::new(Mutex::new(CopyInSession::default())),
             }),
+            cancel_registry: self.cancel_registry.clone(),
         });
 
         loop {
@@ -87,8 +113,9 @@ impl TursoPgServer {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
                             let factory_ref = factory.clone();
+                            let tls = tls_acceptor.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, tls, factory_ref).await {
                                     error!("Error processing connection from {}: {}", addr, e);
                                 }
                             });
@@ -115,9 +142,57 @@ impl TursoPgServer {
 }
 
 #[derive(Default)]
+struct TursoCancelRegistry {
+    sessions: Mutex<HashMap<(i32, SecretKey), Arc<Connection>>>,
+}
+
+impl TursoCancelRegistry {
+    fn register(&self, pid: i32, secret: SecretKey, conn: Arc<Connection>) {
+        self.sessions.lock().unwrap().insert((pid, secret), conn);
+    }
+}
+
+struct TursoCancelHandler {
+    registry: Arc<TursoCancelRegistry>,
+}
+
+#[async_trait]
+impl CancelHandler for TursoCancelHandler {
+    async fn on_cancel_request(&self, cancel_request: CancelRequest) {
+        let key = (cancel_request.pid, cancel_request.secret_key);
+        if let Some(conn) = self.registry.sessions.lock().unwrap().get(&key) {
+            conn.interrupt();
+        }
+    }
+}
+
+struct TursoStartupHandler {
+    conn: Arc<Connection>,
+    registry: Arc<TursoCancelRegistry>,
+}
+
+#[async_trait]
+impl NoopStartupHandler for TursoStartupHandler {
+    async fn post_startup<C>(
+        &self,
+        client: &mut C,
+        _message: pgwire::messages::PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: pgwire::api::ClientInfo + futures::Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (pid, secret) = client.pid_and_secret_key();
+        self.registry.register(pid, secret, self.conn.clone());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct CopyInSession {
     stmt: Option<PgCopyStdinStmt>,
-    buffer: String,
+    buffer: Vec<u8>,
 }
 
 struct TursoPgHandler {
@@ -201,6 +276,7 @@ fn delete_schema_file(db_file: &str, name: &str) {
 
 struct TursoPgFactory {
     handler: Arc<TursoPgHandler>,
+    cancel_registry: Arc<TursoCancelRegistry>,
 }
 
 impl PgWireServerHandlers for TursoPgFactory {
@@ -213,12 +289,49 @@ impl PgWireServerHandlers for TursoPgFactory {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        Arc::new(NoopHandler)
+        Arc::new(TursoStartupHandler {
+            conn: self.handler.conn.lock().unwrap().clone(),
+            registry: self.cancel_registry.clone(),
+        })
     }
 
     fn copy_handler(&self) -> Arc<impl CopyHandler> {
         self.handler.clone()
     }
+
+    fn cancel_handler(&self) -> Arc<impl CancelHandler> {
+        Arc::new(TursoCancelHandler {
+            registry: self.cancel_registry.clone(),
+        })
+    }
+}
+
+fn load_tls_acceptor(
+    cert_path: &Path,
+    key_path: &Path,
+) -> anyhow::Result<pgwire::tokio::TlsAcceptor> {
+    use rustls_pemfile::{certs, pkcs8_private_keys};
+    use rustls_pki_types::{CertificateDer, PrivateKeyDer};
+    use std::sync::Arc;
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::TlsAcceptor;
+
+    let certs = certs(&mut BufReader::new(File::open(cert_path)?))
+        .collect::<Result<Vec<CertificateDer>, IoError>>()?;
+    let key = pkcs8_private_keys(&mut BufReader::new(File::open(key_path)?))
+        .map(|key| key.map(PrivateKeyDer::from))
+        .collect::<Result<Vec<PrivateKeyDer>, IoError>>()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "no private key found"))?;
+
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| IoError::new(ErrorKind::InvalidInput, err))?;
+    config.alpn_protocols = vec![b"postgresql".to_vec()];
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 #[async_trait]
@@ -243,7 +356,7 @@ impl SimpleQueryHandler for TursoPgHandler {
                 let cols = copy_column_count(&conn, &copy)?;
                 *self.copy_in.lock().unwrap() = CopyInSession {
                     stmt: Some(copy),
-                    buffer: String::new(),
+                    buffer: Vec::new(),
                 };
                 responses.push(Response::CopyIn(CopyResponse::new(0, cols, vec![0; cols])));
                 continue;
@@ -302,7 +415,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
             let cols = copy_column_count(&conn, &copy)?;
             *self.copy_in.lock().unwrap() = CopyInSession {
                 stmt: Some(copy),
-                buffer: String::new(),
+                buffer: Vec::new(),
             };
             return Ok(Response::CopyIn(CopyResponse::new(0, cols, vec![0; cols])));
         }
@@ -561,20 +674,46 @@ where
     )
     .await?;
 
-    for row in &rows {
-        let mut line = String::new();
-        for (i, val) in row.iter().enumerate() {
-            if i > 0 {
-                line.push(copy.delimiter);
+    match copy.format {
+        PgCopyFormat::Text => {
+            for row in &rows {
+                let mut line = String::new();
+                for (i, val) in row.iter().enumerate() {
+                    if i > 0 {
+                        line.push(copy.delimiter);
+                    }
+                    line.push_str(val);
+                }
+                line.push('\n');
+                client
+                    .send(PgWireBackendMessage::CopyData(CopyData::new(
+                        line.into_bytes().into(),
+                    )))
+                    .await?;
             }
-            line.push_str(val);
         }
-        line.push('\n');
-        client
-            .send(PgWireBackendMessage::CopyData(CopyData::new(
-                line.into_bytes().into(),
-            )))
-            .await?;
+        PgCopyFormat::Binary => {
+            let encoded_rows: Vec<Vec<Option<String>>> = rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| {
+                            if v == &copy.null_string {
+                                None
+                            } else {
+                                Some(v.clone())
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let payload = encode_copy_binary_file(&encoded_rows);
+            client
+                .send(PgWireBackendMessage::CopyData(CopyData::new(
+                    payload.into(),
+                )))
+                .await?;
+        }
     }
     client
         .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
@@ -599,12 +738,11 @@ impl CopyHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let chunk = String::from_utf8(copy_data.data.to_vec()).map_err(|e| {
-            PgWireError::UserError(Box::new(invalid_parameter_error(format!(
-                "invalid COPY data encoding: {e}"
-            ))))
-        })?;
-        self.copy_in.lock().unwrap().buffer.push_str(&chunk);
+        self.copy_in
+            .lock()
+            .unwrap()
+            .buffer
+            .extend_from_slice(&copy_data.data);
         Ok(())
     }
 
@@ -633,6 +771,7 @@ impl CopyHandler for TursoPgHandler {
                 &copy.table_name,
                 copy.schema_name.as_deref(),
                 copy.columns.as_deref(),
+                copy.format,
                 copy.delimiter.as_deref(),
                 copy.header,
                 copy.null_string.as_deref(),
