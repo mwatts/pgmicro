@@ -5273,6 +5273,369 @@ pub fn try_extract_truncate(parse_result: &ParseResult) -> Option<PgTruncateStmt
     Some(PgTruncateStmt { tables })
 }
 
+/// COPY FROM STDIN metadata for the wire protocol / connection layer.
+#[derive(Debug, Clone)]
+pub struct PgCopyStdinStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub delimiter: Option<String>,
+    pub header: bool,
+    pub null_string: Option<String>,
+}
+
+/// Try to extract COPY FROM STDIN from pg_query parse output.
+pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyStdinStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
+        return None;
+    };
+    if !copy.is_from || !copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+
+    let relation = copy.relation.as_ref()?;
+    let table_name = relation.relname.clone();
+    let schema_name = if relation.schemaname.is_empty()
+        || matches!(
+            relation.schemaname.to_lowercase().as_str(),
+            "public" | "pg_catalog"
+        ) {
+        None
+    } else {
+        Some(relation.schemaname.clone())
+    };
+
+    let columns = if copy.attlist.is_empty() {
+        None
+    } else {
+        let cols: Vec<String> = copy
+            .attlist
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        Some(cols)
+    };
+
+    let mut delimiter = None;
+    let mut header = false;
+    let mut null_string = None;
+    for opt in &copy.options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            continue;
+        };
+        match def.defname.as_str() {
+            "format" => {
+                if let Some(val) = def_elem_string_val(def) {
+                    if val.to_lowercase() != "text" {
+                        return None;
+                    }
+                }
+            }
+            "delimiter" => delimiter = def_elem_string_val(def),
+            "header" => header = def_elem_bool_val(def).unwrap_or(true),
+            "null" => null_string = def_elem_string_val(def),
+            _ => {}
+        }
+    }
+
+    Some(PgCopyStdinStmt {
+        table_name,
+        schema_name,
+        columns,
+        delimiter,
+        header,
+        null_string,
+    })
+}
+
+/// COPY TO STDOUT metadata for the wire protocol.
+#[derive(Debug, Clone)]
+pub struct PgCopyStdoutStmt {
+    pub table_name: String,
+    pub schema_name: Option<String>,
+    pub columns: Option<Vec<String>>,
+    pub delimiter: char,
+    pub null_string: String,
+}
+
+/// Try to extract COPY TO STDOUT from pg_query parse output.
+pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdoutStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CopyStmt(copy) = &nodes[0].0 else {
+        return None;
+    };
+    if copy.is_from || !copy.filename.is_empty() || copy.is_program {
+        return None;
+    }
+
+    let relation = copy.relation.as_ref()?;
+    let table_name = relation.relname.clone();
+    let schema_name = if relation.schemaname.is_empty()
+        || matches!(
+            relation.schemaname.to_lowercase().as_str(),
+            "public" | "pg_catalog"
+        ) {
+        None
+    } else {
+        Some(relation.schemaname.clone())
+    };
+
+    let columns = if copy.attlist.is_empty() {
+        None
+    } else {
+        let cols: Vec<String> = copy
+            .attlist
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect();
+        Some(cols)
+    };
+
+    let mut delimiter = '\t';
+    let mut null_string = "\\N".to_string();
+    for opt in &copy.options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            continue;
+        };
+        match def.defname.as_str() {
+            "format" => {
+                if let Some(val) = def_elem_string_val(def) {
+                    if val.to_lowercase() != "text" {
+                        return None;
+                    }
+                }
+            }
+            "delimiter" => {
+                if let Some(val) = def_elem_string_val(def) {
+                    delimiter = val.chars().next().unwrap_or('\t');
+                }
+            }
+            "null" => {
+                if let Some(val) = def_elem_string_val(def) {
+                    null_string = val;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(PgCopyStdoutStmt {
+        table_name,
+        schema_name,
+        columns,
+        delimiter,
+        null_string,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub enum PgCommentTarget {
+    Table { name: String },
+    Column { table: String, column: String },
+    Type { name: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct PgCommentStmt {
+    pub target: PgCommentTarget,
+    pub comment: String,
+}
+
+/// Try to extract COMMENT ON from pg_query parse output.
+pub fn try_extract_comment(parse_result: &ParseResult) -> Option<PgCommentStmt> {
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::CommentStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    let object = stmt.object.as_deref()?;
+    let objtype = ObjectType::try_from(stmt.objtype).ok()?;
+    let target = match objtype {
+        ObjectType::ObjectTable | ObjectType::ObjectMatview => {
+            let name = parse_comment_table_object(object)?;
+            PgCommentTarget::Table { name }
+        }
+        ObjectType::ObjectColumn => {
+            let (table, column) = parse_comment_column_object(object)?;
+            PgCommentTarget::Column { table, column }
+        }
+        ObjectType::ObjectType | ObjectType::ObjectDomain => PgCommentTarget::Type {
+            name: parse_comment_type_object(object)?,
+        },
+        _ => return None,
+    };
+    Some(PgCommentStmt {
+        target,
+        comment: stmt.comment.clone(),
+    })
+}
+
+fn parse_comment_table_object(object: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+
+    match object.node.as_ref()? {
+        Node::RangeVar(rv) => Some(rv.relname.clone()),
+        Node::List(list) => list
+            .items
+            .first()
+            .and_then(|n| n.node.as_ref())
+            .and_then(|n| {
+                if let Node::String(s) = n {
+                    Some(s.sval.clone())
+                } else if let Node::RangeVar(rv) = n {
+                    Some(rv.relname.clone())
+                } else {
+                    None
+                }
+            }),
+        _ => None,
+    }
+}
+
+fn parse_comment_column_object(object: &pg_query::protobuf::Node) -> Option<(String, String)> {
+    use pg_query::protobuf::node::Node;
+
+    let Node::List(list) = object.node.as_ref()? else {
+        return None;
+    };
+    if list.items.len() < 2 {
+        return None;
+    }
+    let table = list.items.first().and_then(|n| n.node.as_ref())?;
+    let column = list.items.get(1).and_then(|n| n.node.as_ref())?;
+    let Node::RangeVar(rv) = table else {
+        return None;
+    };
+    let Node::String(col) = column else {
+        return None;
+    };
+    Some((rv.relname.clone(), col.sval.clone()))
+}
+
+fn parse_comment_type_object(object: &pg_query::protobuf::Node) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+
+    let Node::TypeName(ty) = object.node.as_ref()? else {
+        return None;
+    };
+    ty.names.last().and_then(|n| n.node.as_ref()).and_then(|n| {
+        if let Node::String(s) = n {
+            Some(s.sval.clone())
+        } else {
+            None
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PgPrepareStmt {
+    pub name: String,
+    pub query_sql: String,
+}
+
+/// Try to extract PREPARE from pg_query parse output.
+pub fn try_extract_prepare(parse_result: &ParseResult) -> Option<PgPrepareStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::PrepareStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    if stmt.name.is_empty() {
+        return None;
+    }
+    let query = stmt.query.as_ref()?;
+    let query_node = query.node.as_ref()?;
+    let query_sql = query_node.to_ref().deparse().ok()?;
+    Some(PgPrepareStmt {
+        name: stmt.name.clone(),
+        query_sql,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PgExecuteStmt {
+    pub name: String,
+    pub params: Vec<String>,
+}
+
+/// Try to extract EXECUTE from pg_query parse output.
+pub fn try_extract_execute(parse_result: &ParseResult) -> Option<PgExecuteStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::ExecuteStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    if stmt.name.is_empty() {
+        return None;
+    }
+    let params = stmt
+        .params
+        .iter()
+        .filter_map(deparse_default_expr)
+        .collect();
+    Some(PgExecuteStmt {
+        name: stmt.name.clone(),
+        params,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PgDeallocateStmt {
+    pub name: Option<String>,
+    pub all: bool,
+}
+
+/// Try to extract DEALLOCATE from pg_query parse output.
+pub fn try_extract_deallocate(parse_result: &ParseResult) -> Option<PgDeallocateStmt> {
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    if nodes.is_empty() {
+        return None;
+    }
+    let NodeRef::DeallocateStmt(stmt) = &nodes[0].0 else {
+        return None;
+    };
+    Some(PgDeallocateStmt {
+        name: if stmt.name.is_empty() {
+            None
+        } else {
+            Some(stmt.name.clone())
+        },
+        all: stmt.isall,
+    })
+}
+
 /// Parse a SQL referential action string to an AST RefAct.
 fn parse_ref_act(action: &str) -> Option<ast::RefAct> {
     match action.to_uppercase().as_str() {
@@ -7748,6 +8111,27 @@ mod tests {
                 assert_eq!(window_clause[1].window.order_by.len(), 1);
             }
         }
+    }
+
+    #[test]
+    fn test_try_extract_prepare_execute() {
+        let parsed = crate::parse("PREPARE sel AS SELECT 7 + $1").unwrap();
+        let prep = try_extract_prepare(&parsed).expect("prepare");
+        assert_eq!(prep.name, "sel");
+        assert!(prep.query_sql.contains("7"));
+
+        let parsed = crate::parse("EXECUTE sel(5)").unwrap();
+        let exec = try_extract_execute(&parsed).expect("execute");
+        assert_eq!(exec.name, "sel");
+        assert_eq!(exec.params, vec!["5"]);
+    }
+
+    #[test]
+    fn test_try_extract_comment_on_table() {
+        let parsed = crate::parse("COMMENT ON TABLE users IS 'hello'").unwrap();
+        let comment = try_extract_comment(&parsed).expect("comment extract");
+        assert_eq!(comment.comment, "hello");
+        assert!(matches!(comment.target, PgCommentTarget::Table { .. }));
     }
 
     #[test]
