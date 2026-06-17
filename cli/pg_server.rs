@@ -863,16 +863,16 @@ impl CopyHandler for TursoPgHandler {
 
         let conn = self.conn.lock().unwrap().clone();
         let rows = conn
-            .handle_pg_copy_data(
-                &copy.table_name,
-                copy.schema_name.as_deref(),
-                copy.columns.as_deref(),
-                copy.format,
-                copy.delimiter.as_deref(),
-                copy.header,
-                copy.null_string.as_deref(),
-                &data,
-            )
+            .handle_pg_copy_data(turso_core::PgCopyInsertOptions {
+                table_name: &copy.table_name,
+                schema_name: copy.schema_name.as_deref(),
+                columns: copy.columns.as_deref(),
+                format: copy.format,
+                delimiter: copy.delimiter.as_deref(),
+                header: copy.header,
+                null_string: copy.null_string.as_deref(),
+                data: &data,
+            })
             .map_err(|e| PgWireError::UserError(Box::new(limbo_error_to_pg(e))))?;
 
         client

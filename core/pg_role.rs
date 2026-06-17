@@ -124,21 +124,6 @@ impl PgRoleRegistry {
         self.current_role_oid
     }
 
-    pub fn set_current_role_oid(&mut self, oid: i64) -> Result<()> {
-        if self.roles.iter().any(|r| r.oid == oid) {
-            self.current_role_oid = oid;
-            Ok(())
-        } else {
-            Err(LimboError::ParseError(format!(
-                "role with OID {oid} does not exist"
-            )))
-        }
-    }
-
-    pub fn roles(&self) -> &[PgRole] {
-        &self.roles
-    }
-
     pub fn role_by_oid(&self, oid: i64) -> Option<&PgRole> {
         self.roles.iter().find(|r| r.oid == oid)
     }

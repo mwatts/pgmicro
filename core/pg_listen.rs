@@ -208,10 +208,6 @@ impl PgListenRegistry {
     pub fn unlisten_all(&mut self) {
         self.channels.clear();
     }
-
-    pub fn channels(&self) -> impl Iterator<Item = &String> {
-        self.channels.iter()
-    }
 }
 
 fn ensure_subscriber(conn: &Connection) -> u64 {

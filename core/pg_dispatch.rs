@@ -26,6 +26,18 @@ use turso_parser_pg::translator::{
 
 use crate::sync::Arc;
 
+/// Options for `Connection::handle_pg_copy_data`.
+pub struct PgCopyInsertOptions<'a> {
+    pub table_name: &'a str,
+    pub schema_name: Option<&'a str>,
+    pub columns: Option<&'a [String]>,
+    pub format: PgCopyFormat,
+    pub delimiter: Option<&'a str>,
+    pub header: bool,
+    pub null_string: Option<&'a str>,
+    pub data: &'a [u8],
+}
+
 impl Connection {
     /// Parse PostgreSQL SQL using pg_query and translate to Turso AST.
     pub(crate) fn parse_postgresql_sql(&self, sql: &str) -> Result<Vec<Cmd>> {
@@ -304,30 +316,30 @@ impl Connection {
         let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
             LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
         })?;
-        self.handle_pg_copy_data(
-            &stmt.table_name,
-            stmt.schema_name.as_deref(),
-            stmt.columns.as_deref(),
-            PgCopyFormat::Text,
-            stmt.delimiter.as_deref(),
-            stmt.header,
-            stmt.null_string.as_deref(),
-            data.as_bytes(),
-        )
+        self.handle_pg_copy_data(PgCopyInsertOptions {
+            table_name: &stmt.table_name,
+            schema_name: stmt.schema_name.as_deref(),
+            columns: stmt.columns.as_deref(),
+            format: PgCopyFormat::Text,
+            delimiter: stmt.delimiter.as_deref(),
+            header: stmt.header,
+            null_string: stmt.null_string.as_deref(),
+            data: data.as_bytes(),
+        })
     }
 
     /// Insert COPY rows into a table. Used by COPY FROM file and STDIN.
-    pub fn handle_pg_copy_data(
-        self: &Arc<Self>,
-        table_name: &str,
-        schema_name: Option<&str>,
-        columns: Option<&[String]>,
-        format: PgCopyFormat,
-        delimiter: Option<&str>,
-        header: bool,
-        null_string: Option<&str>,
-        data: &[u8],
-    ) -> Result<usize> {
+    pub fn handle_pg_copy_data(self: &Arc<Self>, opts: PgCopyInsertOptions<'_>) -> Result<usize> {
+        let PgCopyInsertOptions {
+            table_name,
+            schema_name,
+            columns,
+            format,
+            delimiter,
+            header,
+            null_string,
+            data,
+        } = opts;
         let qualified_table = match schema_name {
             Some(schema) => format!("\"{schema}\".\"{table_name}\""),
             None => format!("\"{table_name}\""),

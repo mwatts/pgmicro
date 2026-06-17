@@ -863,6 +863,19 @@ fn copy_from_file_not_found_repl() {
 // Wire protocol: COPY FROM returns "COPY N"
 // ---------------------------------------------------------------------------
 
+// Unique base ports spaced by 1000 so (base + pid % 1000) cannot collide across tests.
+const WIRE_PORT_COPY_FROM: u16 = 15432;
+const WIRE_PORT_COPY_STDIN: u16 = 16432;
+const WIRE_PORT_DROP_SCHEMA: u16 = 17432;
+const WIRE_PORT_COPY_STDOUT: u16 = 18432;
+const WIRE_PORT_NOTIFY: u16 = 19432;
+const WIRE_PORT_BINARY_INT4: u16 = 20432;
+const WIRE_PORT_PREPARED_DROP_SCHEMA: u16 = 21432;
+
+fn wire_port(base: u16) -> u16 {
+    base + (std::process::id() % 1000) as u16
+}
+
 /// Start pgmicro with --server and wait for it to be ready.
 fn start_pgmicro_server(port: u16) -> Child {
     start_pgmicro_server_with_db(port, ":memory:")
@@ -1187,7 +1200,7 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 #[test]
 fn wire_copy_from_returns_copy_n() {
     // Use a unique port to avoid conflicts with parallel tests
-    let port = 15432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_COPY_FROM);
     let mut server = start_pgmicro_server(port);
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
@@ -1224,7 +1237,7 @@ fn wire_copy_from_returns_copy_n() {
 
 #[test]
 fn wire_copy_from_stdin_returns_copy_n() {
-    let port = 17432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_COPY_STDIN);
     let mut server = start_pgmicro_server(port);
     let mut client = PgTestClient::connect(port);
 
@@ -1252,7 +1265,7 @@ fn wire_copy_from_stdin_returns_copy_n() {
 
 #[test]
 fn wire_notify_delivers_to_listener() {
-    let port = 19432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_NOTIFY);
     let mut server = start_pgmicro_server(port);
 
     let mut listener = PgTestClient::connect(port);
@@ -1273,9 +1286,8 @@ fn wire_notify_delivers_to_listener() {
     // Drain the async notification (may arrive before or during the next query).
     let response = listener.query_raw("SELECT 1");
     assert!(
-        response.iter().any(|&b| b == b'A'),
-        "expected NotificationResponse in: {:?}",
-        response
+        response.contains(&b'A'),
+        "expected NotificationResponse in: {response:?}"
     );
     let mut pos = 0;
     while pos < response.len() {
@@ -1310,7 +1322,7 @@ fn wire_notify_delivers_to_listener() {
 
 #[test]
 fn wire_copy_to_stdout_streams_rows() {
-    let port = 18432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_COPY_STDOUT);
     let mut server = start_pgmicro_server(port);
     let mut client = PgTestClient::connect(port);
 
@@ -1334,7 +1346,7 @@ fn wire_copy_to_stdout_streams_rows() {
 
 #[test]
 fn wire_drop_schema_keeps_file_on_failure() {
-    let port = 16432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_DROP_SCHEMA);
     let dir = std::env::temp_dir().join(format!("pgmicro-wire-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     let db_path = dir.join("main.db");
@@ -1384,7 +1396,7 @@ fn wire_drop_schema_keeps_file_on_failure() {
 
 #[test]
 fn wire_binary_int4_parameter_binds() {
-    let port = 18432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_BINARY_INT4);
     let mut server = start_pgmicro_server(port);
     let mut client = PgTestClient::connect(port);
 
@@ -1426,7 +1438,7 @@ fn wire_binary_int4_parameter_binds() {
 
 #[test]
 fn wire_prepared_drop_schema_deletes_file() {
-    let port = 17432 + (std::process::id() % 1000) as u16;
+    let port = wire_port(WIRE_PORT_PREPARED_DROP_SCHEMA);
     let dir = std::env::temp_dir().join(format!("pgmicro-wire-prep-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     let db_path = dir.join("main.db");

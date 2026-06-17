@@ -896,7 +896,7 @@ fn parse_enum_labels_from_type_def(td: &TypeDef) -> Vec<String> {
             let inner = &rest[start_paren + 1..end_paren];
             return inner
                 .split(',')
-                .filter_map(|part| parse_enum_label_token(part))
+                .filter_map(parse_enum_label_token)
                 .collect();
         }
     }
@@ -911,7 +911,7 @@ fn parse_enum_labels_from_type_def(td: &TypeDef) -> Vec<String> {
     };
     rest[..in_end]
         .split(',')
-        .filter_map(|part| parse_enum_label_token(part))
+        .filter_map(parse_enum_label_token)
         .collect()
 }
 
@@ -1458,8 +1458,8 @@ fn stable_proc_oid_map(conn: &Connection) -> HashMap<String, i64> {
 
     let mut names: Vec<String> = Func::builtin_function_list()
         .into_iter()
-        .chain(Func::pg_proc_alias_entries().into_iter())
-        .map(|e| e.name.to_string())
+        .chain(Func::pg_proc_alias_entries())
+        .map(|e| e.name)
         .collect();
     for (name, _, _) in conn.get_syms_functions() {
         names.push(name);
@@ -4807,7 +4807,7 @@ mod tests {
     #[test]
     fn test_pg_atttypmod_numeric() {
         assert_eq!(pg_atttypmod("numeric(10,2)", &[]), 655366);
-        assert_eq!(pg_atttypmod("decimal(5,0)", &[]), ((5 << 16) | 0) + 4);
+        assert_eq!(pg_atttypmod("decimal(5,0)", &[]), (5 << 16) + 4);
         assert_eq!(pg_atttypmod("numeric", &[]), -1);
     }
 

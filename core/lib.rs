@@ -147,6 +147,7 @@ pub use io::{
 #[cfg(feature = "cli_only")]
 pub use numeric::decimal::{pg_wire_numeric_binary_to_text, value_to_pg_numeric_text};
 pub use numeric::{nonnan::NonNan, Numeric};
+pub use pg_dispatch::PgCopyInsertOptions;
 pub use pg_listen::{PgNotification, PgNotifyDelivery, PgNotifyHub};
 pub use pg_schema::validate_schema_name;
 pub use statement::{Statement, StatementStatusCounter};
