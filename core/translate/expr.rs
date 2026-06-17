@@ -7956,7 +7956,7 @@ fn operator_returns_custom_type_value(op: &ast::Operator) -> bool {
 }
 
 /// True when `expr` is `CAST(... AS type_name)` for the given custom type.
-fn is_cast_to_custom_type(expr: &ast::Expr, type_name: &str) -> bool {
+pub(crate) fn is_cast_to_custom_type(expr: &ast::Expr, type_name: &str) -> bool {
     matches!(
         expr,
         ast::Expr::Cast {

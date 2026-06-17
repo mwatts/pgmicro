@@ -26,8 +26,8 @@ use crate::{
             ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -458,7 +458,8 @@ pub fn translate_insert(
     if !result_columns.is_empty() {
         program.result_columns.clone_from(&result_columns);
     }
-    let insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
+    let mut insertion = build_insertion(program, &table, &columns, ctx.num_values)?;
+    mark_pre_encoded_columns(&mut insertion.col_mappings, &values);
 
     translate_rows_and_open_tables(
         program,
@@ -648,10 +649,17 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
+        let needs_input_type_check = columns_needing_custom_type_encode(
+            &insertion.col_mappings,
+            insertion.num_non_virtual_cols,
+        );
+
         // Pre-encode TypeCheck: validate input types match the custom type's
         // declared value type BEFORE encoding. This catches type mismatches
         // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
         // be silently converted by the encode expression.
+        // Skip columns populated via CAST(... AS <column type>) — those are
+        // already in encoded storage form from expression translation.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
@@ -659,12 +667,18 @@ pub fn translate_insert(
             table_reference: BTreeTable::input_type_check_table_ref(
                 ctx.table,
                 resolver.schema(),
-                None,
+                Some(&needs_input_type_check),
             ),
         });
 
         // Encode values for columns with custom types.
-        emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
+        emit_custom_type_encode(
+            program,
+            resolver,
+            &insertion,
+            &ctx.table.name,
+            Some(&needs_input_type_check),
+        )?;
 
         // Post-encode TypeCheck: validate that encode produced the correct
         // storage type (BASE).
@@ -2451,6 +2465,9 @@ pub struct ColMapping<'a> {
     pub value_index: Option<usize>,
     /// Register where the value will be stored for insertion into the table.
     pub register: usize,
+    /// True when the column value is `CAST(... AS <column type>)`, which already
+    /// produced the encoded storage representation during expression translation.
+    pub pre_encoded: bool,
 }
 
 /// Resolves how each column in a table should be populated during an INSERT.
@@ -2482,6 +2499,7 @@ fn build_insertion<'a>(
             column: c,
             value_index: None,
             register: layout.to_register(base_reg, i),
+            pre_encoded: false,
         })
         .collect::<Vec<_>>();
 
@@ -2510,6 +2528,7 @@ fn build_insertion<'a>(
                     column: col,
                     value_index: Some(value_idx),
                     register: rowid_register,
+                    pre_encoded: false,
                 });
             } else {
                 column_mappings[i].value_index = Some(value_idx);
@@ -2530,6 +2549,7 @@ fn build_insertion<'a>(
                         column: col_in_table,
                         value_index: Some(value_index),
                         register: rowid_register,
+                        pre_encoded: false,
                     });
                 } else if column_mappings[idx_in_table].value_index.is_none() {
                     column_mappings[idx_in_table].value_index = Some(value_index);
@@ -2544,6 +2564,7 @@ fn build_insertion<'a>(
                         column: col_in_table,
                         value_index: Some(value_index),
                         register: rowid_register,
+                        pre_encoded: false,
                     });
                 } else {
                     insertion_key = InsertionKey::LiteralRowid {
@@ -4256,6 +4277,7 @@ fn emit_custom_type_encode(
     resolver: &Resolver,
     insertion: &Insertion,
     table_name: &str,
+    only_columns: Option<&ColumnMask>,
 ) -> Result<()> {
     let columns: Vec<_> = insertion
         .col_mappings
@@ -4268,8 +4290,38 @@ fn emit_custom_type_encode(
         resolver,
         &columns,
         insertion.first_col_register(),
-        None, // INSERT: encode all columns
+        only_columns,
         table_name,
         &layout,
     )
+}
+
+fn value_expr_for_column<'a>(
+    col_mapping: &'a ColMapping<'a>,
+    values: &'a [Box<Expr>],
+) -> Option<&'a Expr> {
+    if let Some(value_index) = col_mapping.value_index {
+        return values.get(value_index).map(|expr| expr.as_ref());
+    }
+    col_mapping.column.default.as_deref()
+}
+
+fn mark_pre_encoded_columns(col_mappings: &mut [ColMapping<'_>], values: &[Box<Expr>]) {
+    for col_mapping in col_mappings.iter_mut() {
+        let Some(expr) = value_expr_for_column(col_mapping, values) else {
+            continue;
+        };
+        col_mapping.pre_encoded =
+            crate::translate::expr::is_cast_to_custom_type(expr, &col_mapping.column.ty_str);
+    }
+}
+
+fn columns_needing_custom_type_encode(col_mappings: &[ColMapping<'_>], count: usize) -> ColumnMask {
+    let mut mask = ColumnMask::default();
+    for (i, col_mapping) in col_mappings.iter().take(count).enumerate() {
+        if !col_mapping.pre_encoded {
+            mask.set(i);
+        }
+    }
+    mask
 }
