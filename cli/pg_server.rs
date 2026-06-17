@@ -451,7 +451,8 @@ fn bind_portal_parameters(
                     .get(i)
                     .and_then(|t| t.as_ref())
                     .unwrap_or(&Type::UNKNOWN);
-                pg_bytes_to_value(bytes, pg_type)?
+                let format = portal.parameter_format.format_for(i);
+                pg_bytes_to_value(bytes, pg_type, format)?
             }
         };
         // Portal parameter i corresponds to PostgreSQL $N where N = i + 1.
@@ -465,9 +466,130 @@ fn bind_portal_parameters(
     Ok(())
 }
 
+/// Convert raw parameter bytes to a turso Value based on the PostgreSQL type and
+/// wire format (text or binary).
+fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type, format: FieldFormat) -> PgWireResult<Value> {
+    match format {
+        FieldFormat::Text => pg_bytes_to_value_text(bytes, pg_type),
+        FieldFormat::Binary => pg_bytes_to_value_binary(bytes, pg_type),
+    }
+}
+
+fn binary_parameter_error(message: impl std::fmt::Display) -> PgWireError {
+    PgWireError::UserError(Box::new(invalid_parameter_error(format!(
+        "invalid binary parameter: {message}"
+    ))))
+}
+
+fn read_be_i16(bytes: &[u8]) -> Result<i16, String> {
+    let arr: [u8; 2] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 2 bytes, got {}", bytes.len()))?;
+    Ok(i16::from_be_bytes(arr))
+}
+
+fn read_be_i32(bytes: &[u8]) -> Result<i32, String> {
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 4 bytes, got {}", bytes.len()))?;
+    Ok(i32::from_be_bytes(arr))
+}
+
+fn read_be_i64(bytes: &[u8]) -> Result<i64, String> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 8 bytes, got {}", bytes.len()))?;
+    Ok(i64::from_be_bytes(arr))
+}
+
+fn read_be_f32(bytes: &[u8]) -> Result<f32, String> {
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 4 bytes, got {}", bytes.len()))?;
+    Ok(f32::from_be_bytes(arr))
+}
+
+fn read_be_f64(bytes: &[u8]) -> Result<f64, String> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("expected 8 bytes, got {}", bytes.len()))?;
+    Ok(f64::from_be_bytes(arr))
+}
+
+/// Decode a parameter sent in PostgreSQL binary format.
+fn pg_bytes_to_value_binary(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    match *pg_type {
+        Type::INT2 => {
+            let v = read_be_i16(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(i64::from(v)))
+        }
+        Type::INT4 => {
+            let v = read_be_i32(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(i64::from(v)))
+        }
+        Type::INT8 => {
+            let v = read_be_i64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(v))
+        }
+        Type::FLOAT4 => {
+            let v = read_be_f32(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_f64(f64::from(v)))
+        }
+        Type::FLOAT8 => {
+            let v = read_be_f64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_f64(v))
+        }
+        Type::BOOL => {
+            if bytes.len() != 1 {
+                return Err(binary_parameter_error(format!(
+                    "expected 1 byte, got {}",
+                    bytes.len()
+                )));
+            }
+            Ok(Value::from_i64(if bytes[0] == 0 { 0 } else { 1 }))
+        }
+        Type::BYTEA => Ok(Value::from_blob(bytes.to_vec())),
+        Type::NUMERIC => Err(binary_parameter_error(
+            "binary NUMERIC format is not supported",
+        )),
+        Type::UNKNOWN => pg_bytes_to_value_binary_unknown(bytes),
+        // TEXT, VARCHAR, and other types: binary is still UTF-8 payload
+        _ => {
+            let text = std::str::from_utf8(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_text(text.to_owned()))
+        }
+    }
+}
+
+/// Infer type for UNKNOWN binary parameters when the client omits explicit OIDs.
+fn pg_bytes_to_value_binary_unknown(bytes: &[u8]) -> PgWireResult<Value> {
+    if std::str::from_utf8(bytes).is_ok() {
+        return pg_bytes_to_value_text(bytes, &Type::UNKNOWN);
+    }
+
+    match bytes.len() {
+        1 => Ok(Value::from_i64(if bytes[0] == 0 { 0 } else { 1 })),
+        2 => {
+            let v = read_be_i16(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(i64::from(v)))
+        }
+        4 => {
+            let v = read_be_i32(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(i64::from(v)))
+        }
+        8 => {
+            let v = read_be_i64(bytes).map_err(binary_parameter_error)?;
+            Ok(Value::from_i64(v))
+        }
+        len => Err(binary_parameter_error(format!(
+            "cannot infer UNKNOWN binary parameter from {len} bytes"
+        ))),
+    }
+}
+
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
 /// Assumes text format encoding (UTF-8 string representations).
-fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+fn pg_bytes_to_value_text(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(Box::new(invalid_parameter_error(format!(
             "invalid UTF-8 in parameter: {e}"
@@ -897,81 +1019,135 @@ mod tests {
 
     #[test]
     fn test_pg_bytes_to_value_integer() {
-        let val = pg_bytes_to_value(b"42", &Type::INT4).unwrap();
+        let val = pg_bytes_to_value(b"42", &Type::INT4, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(42));
 
-        let val = pg_bytes_to_value(b"-100", &Type::INT8).unwrap();
+        let val = pg_bytes_to_value(b"-100", &Type::INT8, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(-100));
 
-        let val = pg_bytes_to_value(b"0", &Type::INT2).unwrap();
+        let val = pg_bytes_to_value(b"0", &Type::INT2, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
     }
 
     #[test]
     fn test_pg_bytes_to_value_float() {
-        let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8).unwrap();
+        let val = pg_bytes_to_value(b"3.25", &Type::FLOAT8, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(3.25));
 
-        let val = pg_bytes_to_value(b"-0.5", &Type::FLOAT4).unwrap();
+        let val = pg_bytes_to_value(b"-0.5", &Type::FLOAT4, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(-0.5));
 
-        let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC).unwrap();
+        let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_f64(1.23));
     }
 
     #[test]
     fn test_pg_bytes_to_value_bool() {
-        let val = pg_bytes_to_value(b"t", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"t", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(1));
 
-        let val = pg_bytes_to_value(b"f", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"f", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
 
-        let val = pg_bytes_to_value(b"true", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"true", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(1));
 
-        let val = pg_bytes_to_value(b"false", &Type::BOOL).unwrap();
+        let val = pg_bytes_to_value(b"false", &Type::BOOL, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_i64(0));
     }
 
     #[test]
     fn test_pg_bytes_to_value_text() {
-        let val = pg_bytes_to_value(b"hello world", &Type::TEXT).unwrap();
+        let val = pg_bytes_to_value(b"hello world", &Type::TEXT, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("hello world".to_owned()));
 
-        let val = pg_bytes_to_value(b"Alice", &Type::VARCHAR).unwrap();
+        let val = pg_bytes_to_value(b"Alice", &Type::VARCHAR, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("Alice".to_owned()));
     }
 
     #[test]
     fn test_pg_bytes_to_value_bytea() {
-        let val = pg_bytes_to_value(b"\\xDEADBEEF", &Type::BYTEA).unwrap();
+        let val = pg_bytes_to_value(b"\\xDEADBEEF", &Type::BYTEA, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_blob(vec![0xDE, 0xAD, 0xBE, 0xEF]));
     }
 
     #[test]
     fn test_pg_bytes_to_value_unknown_type_as_text() {
         // Unknown types should be treated as text
-        let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID).unwrap();
+        let val = pg_bytes_to_value(b"some-uuid-value", &Type::UUID, FieldFormat::Text).unwrap();
         assert_eq!(val, Value::from_text("some-uuid-value".to_owned()));
     }
 
     #[test]
     fn test_pg_bytes_to_value_integer_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4);
+        let result = pg_bytes_to_value(b"not_a_number", &Type::INT4, FieldFormat::Text);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_pg_bytes_to_value_float_parse_error() {
-        let result = pg_bytes_to_value(b"not_a_float", &Type::FLOAT8);
+        let result = pg_bytes_to_value(b"not_a_float", &Type::FLOAT8, FieldFormat::Text);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_pg_bytes_to_value_bool_invalid() {
-        let result = pg_bytes_to_value(b"maybe", &Type::BOOL);
+        let result = pg_bytes_to_value(b"maybe", &Type::BOOL, FieldFormat::Text);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_int4() {
+        let bytes = 42i32.to_be_bytes();
+        let val = pg_bytes_to_value(&bytes, &Type::INT4, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_i64(42));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_int8() {
+        let bytes = (-100i64).to_be_bytes();
+        let val = pg_bytes_to_value(&bytes, &Type::INT8, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_i64(-100));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_bool() {
+        let val = pg_bytes_to_value(&[1], &Type::BOOL, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_i64(1));
+
+        let val = pg_bytes_to_value(&[0], &Type::BOOL, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_i64(0));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_float8() {
+        let bytes = 3.25f64.to_be_bytes();
+        let val = pg_bytes_to_value(&bytes, &Type::FLOAT8, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_f64(3.25));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_bytea() {
+        let bytes = [0xDE, 0xAD, 0xBE, 0xEF];
+        let val = pg_bytes_to_value(&bytes, &Type::BYTEA, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_blob(bytes.to_vec()));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_text_fallback() {
+        let val = pg_bytes_to_value(b"hello", &Type::TEXT, FieldFormat::Binary).unwrap();
+        assert_eq!(val, Value::from_text("hello".to_owned()));
+    }
+
+    #[test]
+    fn test_pg_bytes_to_value_binary_int4_invalid_length() {
+        let result = pg_bytes_to_value(&[0, 1], &Type::INT4, FieldFormat::Binary);
+        assert!(result.is_err());
+        if let Err(PgWireError::UserError(info)) = result {
+            assert_eq!(info.code, "22P02");
+        } else {
+            panic!("expected UserError with SQLSTATE 22P02");
+        }
     }
 
     #[test]
@@ -1013,14 +1189,14 @@ mod tests {
     #[test]
     fn test_unknown_type_inference() {
         // UNKNOWN type should infer integers from numeric-looking strings
-        let val = pg_bytes_to_value(b"42", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"42", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         assert!(matches!(
             val,
             Value::Numeric(turso_core::Numeric::Integer(42))
         ));
 
         // UNKNOWN type should infer floats
-        let val = pg_bytes_to_value(b"3.14", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"3.14", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         if let Value::Numeric(turso_core::Numeric::Float(f)) = val {
             #[allow(clippy::approx_constant)]
             let expected = 3.14;
@@ -1030,7 +1206,7 @@ mod tests {
         }
 
         // UNKNOWN type should keep text for non-numeric strings
-        let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN).unwrap();
+        let val = pg_bytes_to_value(b"hello", &Type::UNKNOWN, FieldFormat::Text).unwrap();
         assert!(matches!(val, Value::Text(_)));
     }
 }

@@ -990,6 +990,44 @@ impl PgTestClient {
         buf.push(0);
     }
 
+    /// Extended query with binary parameter format: Parse + Bind + Execute + Sync.
+    fn execute_prepared_binary_int4(
+        &mut self,
+        statement: &str,
+        portal: &str,
+        sql: &str,
+        param: i32,
+    ) {
+        let mut parse_body = Vec::new();
+        Self::write_cstring(&mut parse_body, statement);
+        Self::write_cstring(&mut parse_body, sql);
+        parse_body.extend_from_slice(&1i16.to_be_bytes());
+        // INT4 OID
+        parse_body.extend_from_slice(&23i32.to_be_bytes());
+        self.write_message(b'P', &parse_body);
+
+        let mut bind_body = Vec::new();
+        Self::write_cstring(&mut bind_body, portal);
+        Self::write_cstring(&mut bind_body, statement);
+        // One format code for all parameters: binary (1)
+        bind_body.extend_from_slice(&1i16.to_be_bytes());
+        bind_body.extend_from_slice(&1i16.to_be_bytes());
+        bind_body.extend_from_slice(&1i16.to_be_bytes());
+        let bytes = param.to_be_bytes();
+        bind_body.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+        bind_body.extend_from_slice(&bytes);
+        bind_body.extend_from_slice(&0i16.to_be_bytes());
+        self.write_message(b'B', &bind_body);
+
+        let mut execute_body = Vec::new();
+        Self::write_cstring(&mut execute_body, portal);
+        execute_body.extend_from_slice(&0i32.to_be_bytes());
+        self.write_message(b'E', &execute_body);
+
+        self.write_message(b'S', &[]);
+        self.stream.flush().unwrap();
+    }
+
     /// Extended query: Parse + Bind + Execute + Sync.
     fn execute_prepared(&mut self, statement: &str, portal: &str, sql: &str, params: &[&str]) {
         let mut parse_body = Vec::new();
@@ -1163,6 +1201,48 @@ fn wire_drop_schema_keeps_file_on_failure() {
     server.kill().ok();
     server.wait().ok();
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn wire_binary_int4_parameter_binds() {
+    let port = 18432 + (std::process::id() % 1000) as u16;
+    let mut server = start_pgmicro_server(port);
+    let mut client = PgTestClient::connect(port);
+
+    let tags = client.query_command_tags("CREATE TABLE items(id INT, name TEXT)");
+    assert!(
+        tags.iter().any(|t| t.contains("CREATE")),
+        "expected CREATE tag, got: {tags:?}"
+    );
+
+    let tags = client.query_command_tags("INSERT INTO items VALUES (42, 'match')");
+    assert!(
+        tags.iter().any(|t| t.contains("INSERT")),
+        "expected INSERT tag, got: {tags:?}"
+    );
+
+    let response = {
+        client.execute_prepared_binary_int4(
+            "find_item",
+            "p1",
+            "SELECT name FROM items WHERE id = $1",
+            42,
+        );
+        client.read_until_ready()
+    };
+    assert!(
+        !response_has_error(&response),
+        "binary int4 bind should succeed, response: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+    let tags = extract_command_tags(&response);
+    assert!(
+        tags.iter().any(|t| t.starts_with("SELECT 1")),
+        "expected SELECT 1 from binary int4 parameter match, got: {tags:?}"
+    );
+
+    server.kill().ok();
+    server.wait().ok();
 }
 
 #[test]
