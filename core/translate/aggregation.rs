@@ -20,9 +20,68 @@ use super::{
         ConditionMetadata, NoConstantOptReason,
     },
     order_by::{custom_type_comparator, sorter_insert},
-    plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
+    plan::{Aggregate, Distinctness, QueryDestination, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
+
+/// True when the ungrouped-aggregation epilogue can emit Copy/ResultRow/Halt inline
+/// after AggFinal. This avoids falling through to the init section (start_offset),
+/// which re-nulls aggregate registers before copying them.
+fn ungrouped_agg_can_emit_inline_result(plan: &SelectPlan, t_ctx: &TranslateCtx<'_>) -> bool {
+    if !matches!(plan.query_destination, QueryDestination::ResultRows) {
+        return false;
+    }
+    if plan.limit.is_some() || t_ctx.reg_offset.is_some() {
+        return false;
+    }
+    if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
+        return false;
+    }
+    if plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty() || gb.having.as_ref().is_some_and(|h| !h.is_empty()))
+    {
+        return false;
+    }
+    plan.result_columns.iter().all(|rc| rc.contains_aggregates)
+}
+
+fn emit_ungrouped_agg_inline_result(
+    program: &mut ProgramBuilder,
+    agg_start_reg: usize,
+    plan: &SelectPlan,
+    col_start: usize,
+) {
+    for (i, rc) in plan.result_columns.iter().enumerate() {
+        let Some(agg_idx) = plan
+            .aggregates
+            .iter()
+            .position(|agg| exprs_are_equivalent(&agg.original_expr, &rc.expr))
+        else {
+            continue;
+        };
+        let agg_reg = agg_start_reg + agg_idx;
+        let dest = col_start + i;
+        if agg_reg != dest {
+            program.emit_no_constant_insn(Insn::Copy {
+                src_reg: agg_reg,
+                dst_reg: dest,
+                extra_amount: 0,
+            });
+        }
+    }
+    program.emit_no_constant_insn(Insn::ResultRow {
+        start_reg: col_start,
+        count: plan.result_columns.len(),
+    });
+    program.emit_insn(Insn::Halt {
+        err_code: 0,
+        description: String::new(),
+        on_error: None,
+        description_reg: None,
+    });
+}
 
 /// Metadata for sorting aggregate inputs before accumulation (ungrouped queries).
 #[derive(Debug)]
@@ -449,18 +508,23 @@ pub fn emit_ungrouped_aggregation<'a>(
         program.preassign_label_to_next_insn(skip_nonagg_eval);
     }
 
-    // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
-    emit_select_result(
-        program,
-        &t_ctx.resolver,
-        plan,
-        None,
-        None,
-        t_ctx.reg_nonagg_emit_once_flag,
-        None, // we've already handled offset
-        t_ctx.reg_result_cols_start.unwrap(),
-        t_ctx.limit_ctx,
-    )?;
+    let col_start = t_ctx.reg_result_cols_start.unwrap();
+    if ungrouped_agg_can_emit_inline_result(plan, t_ctx) {
+        emit_ungrouped_agg_inline_result(program, agg_start_reg, plan, col_start);
+    } else {
+        // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
+        emit_select_result(
+            program,
+            &t_ctx.resolver,
+            plan,
+            None,
+            None,
+            t_ctx.reg_nonagg_emit_once_flag,
+            None, // we've already handled offset
+            col_start,
+            t_ctx.limit_ctx,
+        )?;
+    }
 
     // Resolve the SELECT DISTINCT label if present
     // When a duplicate is found by the Found instruction, jump here to skip emitting the row

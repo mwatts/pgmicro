@@ -755,19 +755,14 @@ pub fn translate_condition_expr(
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
-            // Check if either operand has a custom type with a matching operator
-            if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)
-            {
-                let result_reg = emit_custom_type_operator(
-                    program,
-                    Some(referenced_tables),
-                    e1,
-                    e2,
-                    op,
-                    &resolved,
-                    resolver,
-                )?;
+            // Custom-type operator calls must not be emitted directly in condition
+            // context: they evaluate outside the start_offset epilogue and cause
+            // COUNT(*) to return NULL when a constant-folded false WHERE jumps past
+            // the integrated AggFinal/Copy/ResultRow sequence. Evaluate via
+            // translate_expr (same semantics) and branch on the boolean result.
+            if find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver).is_some() {
+                let result_reg = program.alloc_register();
+                translate_expr(program, Some(referenced_tables), expr, result_reg, resolver)?;
                 emit_cond_jump(program, condition_metadata, result_reg);
             } else {
                 let result_reg = program.alloc_register();
