@@ -1,10 +1,12 @@
 use crate::schema::{Schema, Table};
-use crate::sync::{Arc, RwLock};
+use crate::sync::{Arc, LazyLock, RwLock};
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 #[allow(unused_imports)]
 use crate::Numeric;
 use crate::{Connection, LimboError, SqlDialect, Value};
+use chrono::NaiveDate;
+use regex::Regex;
 use rustc_hash::FxHashMap as HashMap;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
@@ -2986,11 +2988,16 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
         "date" => {
             // Accept YYYY-MM-DD
             let parts: Vec<&str> = trimmed.split('-').collect();
-            if parts.len() == 3
-                && parts[0].parse::<i32>().is_ok()
-                && parts[1].parse::<u32>().is_ok_and(|m| (1..=12).contains(&m))
-                && parts[2].parse::<u32>().is_ok_and(|d| (1..=31).contains(&d))
-            {
+            let valid = parts.len() == 3
+                && matches!(
+                    (
+                        parts[0].parse::<i32>(),
+                        parts[1].parse::<u32>(),
+                        parts[2].parse::<u32>()
+                    ),
+                    (Ok(year), Ok(month), Ok(day)) if is_valid_calendar_date(year, month, day)
+                );
+            if valid {
                 None
             } else {
                 Some((
@@ -3150,6 +3157,11 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
     }
 }
 
+/// Returns true when `year-month-day` is a real calendar date.
+fn is_valid_calendar_date(year: i32, month: u32, day: u32) -> bool {
+    NaiveDate::from_ymd_opt(year, month, day).is_some()
+}
+
 /// Parse a YYYY-MM-DD HH:MM:SS[.fff] prefix, returning Some(()) if valid.
 fn parse_timestamp_prefix(s: &str) -> Option<()> {
     let parts: Vec<&str> = s.splitn(2, [' ', 'T']).collect();
@@ -3158,15 +3170,17 @@ fn parse_timestamp_prefix(s: &str) -> Option<()> {
     }
     // Validate date part
     let date_parts: Vec<&str> = parts[0].split('-').collect();
-    if date_parts.len() != 3
-        || date_parts[0].parse::<i32>().is_err()
-        || !date_parts[1]
-            .parse::<u32>()
-            .is_ok_and(|m| (1..=12).contains(&m))
-        || !date_parts[2]
-            .parse::<u32>()
-            .is_ok_and(|d| (1..=31).contains(&d))
-    {
+    if date_parts.len() != 3 {
+        return None;
+    }
+    let (Ok(year), Ok(month), Ok(day)) = (
+        date_parts[0].parse::<i32>(),
+        date_parts[1].parse::<u32>(),
+        date_parts[2].parse::<u32>(),
+    ) else {
+        return None;
+    };
+    if !is_valid_calendar_date(year, month, day) {
         return None;
     }
     // Validate time part (strip fractional seconds)
@@ -3193,60 +3207,225 @@ fn parse_timestamp_prefix(s: &str) -> Option<()> {
     Some(())
 }
 
-/// Minimal JSON validation without requiring serde_json.
+/// Validate JSON text by parsing the full value (no trailing garbage).
 fn is_valid_json(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return false;
     }
-    // Quick structural check: must start with {, [, ", digit, true, false, or null
-    let first = trimmed.as_bytes()[0];
-    match first {
-        b'{' => trimmed.ends_with('}') && validate_json_braces(trimmed),
-        b'[' => trimmed.ends_with(']') && validate_json_braces(trimmed),
-        b'"' => trimmed.len() >= 2 && trimmed.ends_with('"'),
-        b't' => trimmed == "true",
-        b'f' => trimmed == "false",
-        b'n' => trimmed == "null",
-        b'0'..=b'9' | b'-' => trimmed.parse::<f64>().is_ok(),
-        _ => false,
+    parse_json_value(trimmed, 0).is_some_and(|end| end == trimmed.len())
+}
+
+fn skip_json_whitespace(s: &str, mut pos: usize) -> usize {
+    while pos < s.len() && matches!(s.as_bytes()[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    pos
+}
+
+fn parse_json_value(s: &str, start: usize) -> Option<usize> {
+    let pos = skip_json_whitespace(s, start);
+    if pos >= s.len() {
+        return None;
+    }
+    match s.as_bytes()[pos] {
+        b'{' => parse_json_object(s, pos),
+        b'[' => parse_json_array(s, pos),
+        b'"' => parse_json_string(s, pos),
+        b't' => parse_json_literal(s, pos, "true"),
+        b'f' => parse_json_literal(s, pos, "false"),
+        b'n' => parse_json_literal(s, pos, "null"),
+        b'0'..=b'9' | b'-' => parse_json_number(s, pos),
+        _ => None,
     }
 }
 
-/// Check that braces/brackets are balanced in a JSON string.
-fn validate_json_braces(s: &str) -> bool {
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escape = false;
+fn parse_json_literal(s: &str, start: usize, literal: &str) -> Option<usize> {
+    s.get(start..start + literal.len())
+        .filter(|slice| *slice == literal)
+        .map(|_| start + literal.len())
+}
 
-    for ch in s.chars() {
+fn parse_json_string(s: &str, start: usize) -> Option<usize> {
+    if s.as_bytes().get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut pos = start + 1;
+    let mut escape = false;
+    while pos < s.len() {
+        let byte = s.as_bytes()[pos];
         if escape {
+            match byte {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => pos += 1,
+                b'u' => {
+                    if pos + 4 >= s.len() {
+                        return None;
+                    }
+                    for offset in 1..=4 {
+                        if !s.as_bytes()[pos + offset].is_ascii_hexdigit() {
+                            return None;
+                        }
+                    }
+                    pos += 5;
+                }
+                _ => return None,
+            }
             escape = false;
             continue;
         }
-        if ch == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        match ch {
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.pop() != Some(ch) {
-                    return false;
-                }
+        match byte {
+            b'\\' => {
+                escape = true;
+                pos += 1;
             }
-            _ => {}
+            b'"' => return Some(pos + 1),
+            0x00..=0x1F => return None,
+            _ => pos += 1,
         }
     }
-    stack.is_empty() && !in_string
+    None
+}
+
+fn parse_json_number(s: &str, start: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut pos = start;
+    if bytes.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    let &first = bytes.get(pos)?;
+    if first == b'0' {
+        pos += 1;
+    } else if first.is_ascii_digit() {
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+    } else {
+        return None;
+    }
+    if bytes.get(pos) == Some(&b'.') {
+        pos += 1;
+        if !bytes.get(pos)?.is_ascii_digit() {
+            return None;
+        }
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+    }
+    if matches!(bytes.get(pos), Some(b'e') | Some(b'E')) {
+        pos += 1;
+        if matches!(bytes.get(pos), Some(b'+') | Some(b'-')) {
+            pos += 1;
+        }
+        if !bytes.get(pos)?.is_ascii_digit() {
+            return None;
+        }
+        pos += 1;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+    }
+    Some(pos)
+}
+
+fn parse_json_object(s: &str, start: usize) -> Option<usize> {
+    let mut pos = start + 1;
+    pos = skip_json_whitespace(s, pos);
+    if s.as_bytes().get(pos) == Some(&b'}') {
+        return Some(pos + 1);
+    }
+    loop {
+        if s.as_bytes().get(pos) != Some(&b'"') {
+            return None;
+        }
+        pos = parse_json_string(s, pos)?;
+        pos = skip_json_whitespace(s, pos);
+        if s.as_bytes().get(pos) != Some(&b':') {
+            return None;
+        }
+        pos += 1;
+        pos = parse_json_value(s, pos)?;
+        pos = skip_json_whitespace(s, pos);
+        match s.as_bytes().get(pos) {
+            Some(b',') => {
+                pos += 1;
+                pos = skip_json_whitespace(s, pos);
+            }
+            Some(b'}') => return Some(pos + 1),
+            _ => return None,
+        }
+    }
+}
+
+fn parse_json_array(s: &str, start: usize) -> Option<usize> {
+    let mut pos = start + 1;
+    pos = skip_json_whitespace(s, pos);
+    if s.as_bytes().get(pos) == Some(&b']') {
+        return Some(pos + 1);
+    }
+    loop {
+        pos = parse_json_value(s, pos)?;
+        pos = skip_json_whitespace(s, pos);
+        match s.as_bytes().get(pos) {
+            Some(b',') => {
+                pos += 1;
+                pos = skip_json_whitespace(s, pos);
+            }
+            Some(b']') => return Some(pos + 1),
+            _ => return None,
+        }
+    }
+}
+
+static SQLITE_DDL_INTEGER_PK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bINTEGER\s+PRIMARY\s+KEY\b").expect("valid INTEGER PRIMARY KEY regex")
+});
+static SQLITE_DDL_AUTOINCREMENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bAUTOINCREMENT\b").expect("valid AUTOINCREMENT regex"));
+static SQLITE_DDL_WITHOUT_ROWID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bWITHOUT\s+ROWID\b").expect("valid WITHOUT ROWID regex"));
+static SQLITE_DDL_INTEGER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bINTEGER\b").expect("valid INTEGER regex"));
+static SQLITE_DDL_REAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bREAL\b").expect("valid REAL regex"));
+static SQLITE_DDL_TEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bTEXT\b").expect("valid TEXT regex"));
+static SQLITE_DDL_BLOB: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bBLOB\b").expect("valid BLOB regex"));
+static SQLITE_DDL_DATETIME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bDATETIME\b").expect("valid DATETIME regex"));
+
+/// Convert a SQLite CREATE TABLE DDL string to PostgreSQL-compatible syntax.
+fn convert_sqlite_ddl_to_postgres(sqlite_ddl: &str) -> String {
+    let mut postgres_ddl = sqlite_ddl.to_string();
+
+    postgres_ddl = SQLITE_DDL_INTEGER_PK
+        .replace_all(&postgres_ddl, "SERIAL PRIMARY KEY")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_AUTOINCREMENT
+        .replace_all(&postgres_ddl, "")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_INTEGER
+        .replace_all(&postgres_ddl, "integer")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_REAL
+        .replace_all(&postgres_ddl, "double precision")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_TEXT
+        .replace_all(&postgres_ddl, "text")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_BLOB
+        .replace_all(&postgres_ddl, "bytea")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_DATETIME
+        .replace_all(&postgres_ddl, "timestamp")
+        .into_owned();
+    postgres_ddl = SQLITE_DDL_WITHOUT_ROWID
+        .replace_all(&postgres_ddl, "")
+        .into_owned();
+
+    postgres_ddl
 }
 
 impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
@@ -3473,36 +3652,7 @@ impl PgGetTableDefCursor {
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
-        let mut postgres_ddl = sqlite_ddl.to_string();
-
-        // Basic SQLite to PostgreSQL type conversions
-        // Handle INTEGER PRIMARY KEY specially for SERIAL
-        postgres_ddl = postgres_ddl.replace(" INTEGER PRIMARY KEY", " SERIAL PRIMARY KEY");
-        postgres_ddl = postgres_ddl.replace(" AUTOINCREMENT", "");
-
-        // Type conversions - use lowercase for PostgreSQL standard
-        // Use regex-like replacements to handle case-insensitive matches
-        let type_replacements = [
-            (" INTEGER", " integer"),
-            (" intEgEr", " integer"),
-            (" REAL", " double precision"),
-            (" real", " double precision"),
-            (" TEXT", " text"),
-            (" text", " text"),
-            (" BLOB", " bytea"),
-            (" blob", " bytea"),
-            (" DATETIME", " timestamp"),
-            (" datetime", " timestamp"),
-        ];
-
-        for (from, to) in &type_replacements {
-            postgres_ddl = postgres_ddl.replace(from, to);
-        }
-
-        // Remove SQLite-specific features
-        postgres_ddl = postgres_ddl.replace(" WITHOUT ROWID", "");
-
-        postgres_ddl
+        convert_sqlite_ddl_to_postgres(sqlite_ddl)
     }
 }
 
@@ -3727,6 +3877,49 @@ mod tests {
     use super::*;
     use crate::{Database, PlatformIO, StepResult};
     use tempfile::tempdir;
+
+    #[test]
+    fn test_parse_timestamp_rejects_invalid_calendar_dates() {
+        assert!(parse_timestamp_prefix("2024-02-31 10:00:00").is_none());
+        assert!(parse_timestamp_prefix("2024-04-31 10:00:00").is_none());
+        assert!(parse_timestamp_prefix("2024-02-29 10:00:00").is_some());
+        assert!(parse_timestamp_prefix("2023-02-29 10:00:00").is_none());
+    }
+
+    #[test]
+    fn test_validate_pg_input_rejects_invalid_dates() {
+        assert!(validate_pg_input("2024-02-31", "date").is_some());
+        assert!(validate_pg_input("2024-01-15", "date").is_none());
+        assert!(validate_pg_input("2024-02-31 10:00:00", "timestamp").is_some());
+    }
+
+    #[test]
+    fn test_convert_sqlite_ddl_preserves_integer_in_column_names() {
+        let sqlite_ddl =
+            "CREATE TABLE t (my_integer_col INTEGER, INTEGER_col TEXT, col INTEGER_col INTEGER)";
+        let postgres_ddl = convert_sqlite_ddl_to_postgres(sqlite_ddl);
+
+        assert!(postgres_ddl.contains("my_integer_col integer"));
+        assert!(postgres_ddl.contains("INTEGER_col text"));
+        assert!(postgres_ddl.contains("col INTEGER_col integer"));
+        assert!(!postgres_ddl.contains("col integer_col integer"));
+    }
+
+    #[test]
+    fn test_is_valid_json_rejects_malformed_objects() {
+        assert!(!is_valid_json(r#"{"a":}"#));
+        assert!(!is_valid_json(r#"{"a":1,}"#));
+        assert!(!is_valid_json(r#"{"a":1} trailing"#));
+        assert!(is_valid_json(r#"{"a":1}"#));
+        assert!(is_valid_json(r#"{"key": "value"}"#));
+    }
+
+    #[test]
+    fn test_validate_pg_input_rejects_malformed_json() {
+        assert!(validate_pg_input(r#"{"a":}"#, "json").is_some());
+        assert!(validate_pg_input(r#"{"a":}"#, "jsonb").is_some());
+        assert!(validate_pg_input(r#"{"a":1}"#, "json").is_none());
+    }
 
     #[test]
 
