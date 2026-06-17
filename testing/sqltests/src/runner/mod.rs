@@ -269,7 +269,8 @@ fn format_snapshot_content(eqp_rows: &[Vec<String>], explain_rows: &[Vec<String>
 
     // EXPLAIN section
     output.push_str("BYTECODE\n");
-    output.push_str(&format_explain_output(explain_rows));
+    let explain_rows = crate::snapshot::normalize_explain_rows_for_snapshot(explain_rows);
+    output.push_str(&format_explain_output(&explain_rows));
 
     output
 }

@@ -40,6 +40,11 @@ const CI_ENV_NAMES: [&str; 9] = [
     "CODEBUILD_BUILD_ID", // AWS CodeBuild
 ];
 
+/// Hash join memory budget varies by build profile (32KB in debug, 64MB in release).
+/// Normalize before snapshot formatting/comparison so bytecode layout is stable.
+static HASH_JOIN_BUDGET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"budget=\d+").expect("valid budget regex"));
+
 static IS_CI: LazyLock<bool> = LazyLock::new(|| {
     // Check common CI environment variables
     CI_ENV_NAMES.iter().any(|env| {
@@ -111,6 +116,24 @@ impl std::str::FromStr for SnapshotUpdateMode {
 /// Check if we're running in a CI environment.
 pub fn is_ci() -> bool {
     *IS_CI
+}
+
+/// Normalize hash-join budget literals for stable snapshot output across build profiles.
+pub fn normalize_hash_join_budget(text: &str) -> String {
+    HASH_JOIN_BUDGET_RE
+        .replace_all(text, "budget=<BUDGET>")
+        .to_string()
+}
+
+/// Normalize EXPLAIN rows before snapshot formatting.
+pub fn normalize_explain_rows_for_snapshot(rows: &[Vec<String>]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|cell| normalize_hash_join_budget(cell))
+                .collect()
+        })
+        .collect()
 }
 
 /// Snapshot file metadata (YAML frontmatter)
@@ -397,9 +420,10 @@ impl SnapshotManager {
         // Try to read existing snapshot
         match self.read_snapshot(name).await {
             Ok(Some(snapshot)) => {
-                let expected = &snapshot.content;
+                let expected = normalize_hash_join_budget(&snapshot.content);
+                let normalized_actual = normalize_hash_join_budget(actual);
 
-                if expected.trim() == actual.trim() {
+                if expected.trim() == normalized_actual.trim() {
                     // In Always mode, clean up any stale .snap.new file
                     if self.update_mode == SnapshotUpdateMode::Always {
                         let _ = self.remove_pending(name).await;
@@ -425,7 +449,7 @@ impl SnapshotManager {
                         SnapshotUpdateMode::New => {
                             // Write to .snap.new for review, then report mismatch
                             let _ = self.write_pending(name, sql, actual, info).await;
-                            let diff = generate_diff(expected, actual);
+                            let diff = generate_diff(&expected, &normalized_actual);
                             SnapshotResult::Mismatch {
                                 expected: expected.clone(),
                                 actual: actual.to_string(),
@@ -434,7 +458,7 @@ impl SnapshotManager {
                         }
                         SnapshotUpdateMode::No | SnapshotUpdateMode::Auto => {
                             // Auto should already be resolved, but handle it as No
-                            let diff = generate_diff(expected, actual);
+                            let diff = generate_diff(&expected, &normalized_actual);
                             SnapshotResult::Mismatch {
                                 expected: expected.clone(),
                                 actual: actual.to_string(),
@@ -1163,6 +1187,18 @@ mod tests {
         assert_eq!(
             detect_statement_type("WITH cte AS (SELECT 1) SELECT * FROM cte"),
             "WITH (CTE)"
+        );
+    }
+
+    #[test]
+    fn test_normalize_hash_join_budget() {
+        assert_eq!(
+            normalize_hash_join_budget("budget=32768 payload"),
+            "budget=<BUDGET> payload"
+        );
+        assert_eq!(
+            normalize_hash_join_budget("budget=67108864 payload"),
+            "budget=<BUDGET> payload"
         );
     }
 
