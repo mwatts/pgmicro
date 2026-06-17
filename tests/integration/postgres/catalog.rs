@@ -1036,17 +1036,38 @@ fn test_pg_create_table_in_pg_database(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
 
-    // pg_database should return at least one row
-    let mut stmt = conn.prepare("SELECT datname FROM pg_database").unwrap();
-    let mut found = false;
+    conn.execute("CREATE SCHEMA foo").unwrap();
+
+    let main_db_name = db
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .expect("temp database path should have a file stem");
+
+    let mut stmt = conn
+        .prepare("SELECT datname FROM pg_database ORDER BY datname")
+        .unwrap();
+    let mut datnames = Vec::new();
     loop {
         match stmt.step().unwrap() {
             StepResult::Row => {
-                found = true;
+                let row = stmt.row().unwrap();
+                let Value::Text(datname) = row.get_value(0) else {
+                    panic!("expected text datname");
+                };
+                datnames.push(datname.as_str().to_string());
             }
             StepResult::Done => break,
             _ => {}
         }
     }
-    assert!(found, "pg_database should return at least one row");
+
+    assert!(
+        datnames.contains(&main_db_name.to_string()),
+        "pg_database should include main database '{main_db_name}', got {datnames:?}"
+    );
+    assert!(
+        datnames.contains(&"foo".to_string()),
+        "pg_database should include attached schema 'foo', got {datnames:?}"
+    );
 }

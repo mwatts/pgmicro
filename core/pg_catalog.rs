@@ -1080,6 +1080,27 @@ impl PgDatabaseTable {
             .unwrap_or(path)
             .to_string()
     }
+
+    fn database_row(oid: i64, datname: String) -> Vec<Value> {
+        vec![
+            Value::from_i64(oid),             // oid
+            Value::build_text(datname),       // datname
+            Value::from_i64(10),              // datdba (bootstrap superuser OID)
+            Value::from_i64(6),               // encoding (UTF8)
+            Value::build_text("c"),           // datlocprovider (libc)
+            Value::from_i64(0),               // datistemplate
+            Value::from_i64(1),               // datallowconn
+            Value::from_i64(-1),              // datconnlimit (unlimited)
+            Value::from_i64(0),               // datfrozenxid
+            Value::from_i64(0),               // datminmxid
+            Value::from_i64(1663),            // dattablespace (pg_default)
+            Value::build_text("en_US.UTF-8"), // datcollate
+            Value::build_text("en_US.UTF-8"), // datctype
+            Value::Null,                      // daticulocale
+            Value::Null,                      // daticurules
+            Value::Null,                      // datacl
+        ]
+    }
 }
 
 impl InternalVirtualTable for PgDatabaseTable {
@@ -1115,7 +1136,7 @@ impl InternalVirtualTable for PgDatabaseTable {
             idx_str: None,
             order_by_consumed: false,
             estimated_cost: 10.0,
-            estimated_rows: 1,
+            estimated_rows: 5,
             constraint_usages,
         })
     }
@@ -1149,6 +1170,32 @@ struct PgDatabaseCursor {
     current_row: usize,
 }
 
+impl PgDatabaseCursor {
+    fn load_databases(&mut self) -> Result<(), LimboError> {
+        self.rows.clear();
+
+        let db_name = PgDatabaseTable::db_name_from_path(&self.conn.db.path);
+        self.rows
+            .push(PgDatabaseTable::database_row(16384, db_name));
+
+        let schema_names: Vec<String> = self
+            .conn
+            .attached_databases
+            .read()
+            .name_to_index
+            .keys()
+            .cloned()
+            .collect();
+        let mut oid = 16385i64;
+        for name in schema_names {
+            self.rows.push(PgDatabaseTable::database_row(oid, name));
+            oid += 1;
+        }
+
+        Ok(())
+    }
+}
+
 impl InternalVirtualTableCursor for PgDatabaseCursor {
     fn next(&mut self) -> Result<bool, LimboError> {
         self.current_row += 1;
@@ -1174,25 +1221,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        let db_name = PgDatabaseTable::db_name_from_path(&self.conn.db.path);
-        self.rows = vec![vec![
-            Value::from_i64(16384),           // oid
-            Value::build_text(db_name),       // datname
-            Value::from_i64(10),              // datdba (bootstrap superuser OID)
-            Value::from_i64(6),               // encoding (UTF8)
-            Value::build_text("c"),           // datlocprovider (libc)
-            Value::from_i64(0),               // datistemplate
-            Value::from_i64(1),               // datallowconn
-            Value::from_i64(-1),              // datconnlimit (unlimited)
-            Value::from_i64(0),               // datfrozenxid
-            Value::from_i64(0),               // datminmxid
-            Value::from_i64(1663),            // dattablespace (pg_default)
-            Value::build_text("en_US.UTF-8"), // datcollate
-            Value::build_text("en_US.UTF-8"), // datctype
-            Value::Null,                      // daticulocale
-            Value::Null,                      // daticurules
-            Value::Null,                      // datacl
-        ]];
+        self.load_databases()?;
         Ok(!self.rows.is_empty())
     }
 }
