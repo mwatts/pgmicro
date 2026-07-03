@@ -37,6 +37,22 @@ pub struct PostgreSQLTranslator {
     // TODO: Add schema information, type mappings, etc.
 }
 
+/// Constraint fragments parsed from a PG `ColumnDef.constraints` list, shared by
+/// the CREATE TABLE and ALTER TABLE ADD COLUMN paths. Table-level concerns (whether
+/// PK implies AUTOINCREMENT, whether a table-level PK suppresses the column-level
+/// one) stay in the CREATE-TABLE-only caller; this only does per-constraint
+/// translation, so both paths see the exact same set of supported constraint kinds.
+#[derive(Default)]
+struct PgColumnConstraintParts {
+    is_primary_key: bool,
+    is_not_null: bool,
+    is_unique: bool,
+    default_expr: Option<ast::Expr>,
+    foreign_key: Option<PgForeignKey>,
+    check_exprs: Vec<ast::Expr>,
+    generated_expr: Option<ast::Expr>,
+}
+
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
@@ -301,60 +317,43 @@ impl PostgreSQLTranslator {
         })
     }
 
-    /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
-    /// Handles SERIAL/BIGSERIAL autoincrement, column-level PK/FK, and type mapping.
-    fn translate_create_table_column(
+    /// Translate a PG `ColumnDef.constraints` list into its constituent parts, shared
+    /// by the CREATE TABLE and ALTER TABLE ADD COLUMN column-definition translators.
+    /// Table-level concerns (SERIAL/autoincrement, table-level PK suppression) are
+    /// NOT handled here — those stay in the CREATE-TABLE-only caller.
+    fn translate_column_constraints(
         &self,
-        col_def: &pg_query::protobuf::ColumnDef,
-        has_autoincrement: bool,
-        has_table_pk: bool,
-    ) -> Result<ast::ColumnDefinition, ParseError> {
+        constraints: &[pg_query::protobuf::Node],
+    ) -> Result<PgColumnConstraintParts, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
-        let name = col_def.colname.clone();
-        let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
-
-        let is_serial = is_serial_type(&pg_type);
-
-        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
-            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
-        })?;
-
-        let mut is_primary_key = is_serial;
-        let mut is_not_null = col_def.is_not_null || is_serial;
-        let mut is_unique = false;
-        let mut default_expr: Option<ast::Expr> = None;
-        let mut foreign_key: Option<PgForeignKey> = None;
-
-        let mut check_exprs: Vec<ast::Expr> = Vec::new();
-        let mut generated_expr: Option<ast::Expr> = None;
-        for constraint_node in &col_def.constraints {
+        let mut parts = PgColumnConstraintParts::default();
+        for constraint_node in constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
             };
             let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
             match contype {
-                ConstrType::ConstrPrimary => is_primary_key = true,
-                ConstrType::ConstrNotnull => is_not_null = true,
-                ConstrType::ConstrUnique => is_unique = true,
+                ConstrType::ConstrPrimary => parts.is_primary_key = true,
+                ConstrType::ConstrNotnull => parts.is_not_null = true,
+                ConstrType::ConstrUnique => parts.is_unique = true,
                 ConstrType::ConstrDefault => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
-                        default_expr = Some(self.translate_expr(raw_expr)?);
+                        parts.default_expr = Some(self.translate_expr(raw_expr)?);
                     }
                 }
                 ConstrType::ConstrForeign => {
-                    foreign_key = extract_foreign_key(constraint);
+                    parts.foreign_key = extract_foreign_key(constraint);
                 }
                 ConstrType::ConstrCheck => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
-                        check_exprs.push(self.translate_expr(raw_expr)?);
+                        parts.check_exprs.push(self.translate_expr(raw_expr)?);
                     }
                 }
                 ConstrType::ConstrGenerated => {
                     if let Some(ref raw_expr) = constraint.raw_expr {
-                        generated_expr = Some(self.translate_expr(raw_expr)?);
+                        parts.generated_expr = Some(self.translate_expr(raw_expr)?);
                     }
                 }
                 ConstrType::ConstrIdentity => {
@@ -366,6 +365,33 @@ impl PostgreSQLTranslator {
                 _ => {}
             }
         }
+        Ok(parts)
+    }
+
+    /// Translate a single PG column definition for CREATE TABLE to a Turso AST ColumnDefinition.
+    /// Handles SERIAL/BIGSERIAL autoincrement, column-level PK/FK, and type mapping.
+    fn translate_create_table_column(
+        &self,
+        col_def: &pg_query::protobuf::ColumnDef,
+        has_autoincrement: bool,
+        has_table_pk: bool,
+    ) -> Result<ast::ColumnDefinition, ParseError> {
+        let name = col_def.colname.clone();
+        let pg_type = extract_type_name(col_def)?;
+        let typmods = extract_integer_typmods(col_def);
+
+        let is_serial = is_serial_type(&pg_type);
+
+        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
+            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
+        })?;
+
+        let parts = self.translate_column_constraints(&col_def.constraints)?;
+
+        // SERIAL implies PRIMARY KEY and NOT NULL, in addition to whatever the
+        // constraint list itself specifies.
+        let is_primary_key = parts.is_primary_key || is_serial;
+        let is_not_null = parts.is_not_null || col_def.is_not_null || is_serial;
 
         // Build the type with size parameters (e.g. varchar(4), numeric(10,2))
         let col_type = if mapping.type_name.is_empty() {
@@ -415,7 +441,7 @@ impl PostgreSQLTranslator {
         }
 
         // UNIQUE
-        if is_unique {
+        if parts.is_unique {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Unique(None),
@@ -423,7 +449,7 @@ impl PostgreSQLTranslator {
         }
 
         // DEFAULT
-        if let Some(expr) = default_expr {
+        if let Some(expr) = parts.default_expr {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Default(Box::new(expr)),
@@ -431,7 +457,7 @@ impl PostgreSQLTranslator {
         }
 
         // REFERENCES (column-level FK)
-        if let Some(ref fk) = foreign_key {
+        if let Some(ref fk) = parts.foreign_key {
             let clause = self.pg_fk_to_fk_clause(fk);
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
@@ -443,7 +469,7 @@ impl PostgreSQLTranslator {
         }
 
         // CHECK
-        for expr in check_exprs {
+        for expr in parts.check_exprs {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Check(Box::new(expr)),
@@ -451,7 +477,7 @@ impl PostgreSQLTranslator {
         }
 
         // GENERATED ... STORED (PG has no virtual generated columns, only STORED)
-        if let Some(expr) = generated_expr {
+        if let Some(expr) = parts.generated_expr {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Generated {
@@ -713,11 +739,7 @@ impl PostgreSQLTranslator {
         &self,
         col_def: &pg_query::protobuf::ColumnDef,
     ) -> Result<ast::ColumnDefinition, ParseError> {
-        use pg_query::protobuf::node::Node;
-        use pg_query::protobuf::ConstrType;
-
         let col_name = ast::Name::from_string(&col_def.colname);
-
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
@@ -739,37 +761,62 @@ impl PostgreSQLTranslator {
             array_dimensions: mapping.array_dimensions,
         });
 
+        let parts = self.translate_column_constraints(&col_def.constraints)?;
         let mut constraints = Vec::new();
-        for constraint_node in &col_def.constraints {
-            let Some(Node::Constraint(constraint)) = &constraint_node.node else {
-                continue;
-            };
-            let contype = ConstrType::try_from(constraint.contype).unwrap_or(ConstrType::Undefined);
-            let constraint_ast = match contype {
-                ConstrType::ConstrPrimary => Some(ast::ColumnConstraint::PrimaryKey {
+        if parts.is_primary_key {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::PrimaryKey {
                     order: None,
                     conflict_clause: None,
                     auto_increment: false,
-                }),
-                ConstrType::ConstrNotnull => Some(ast::ColumnConstraint::NotNull {
+                },
+            });
+        }
+        if parts.is_not_null && !parts.is_primary_key {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::NotNull {
                     nullable: false,
                     conflict_clause: None,
-                }),
-                ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
-                ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
-                    Some(raw_expr) => Some(ast::ColumnConstraint::Default(Box::new(
-                        self.translate_expr(raw_expr)?,
-                    ))),
-                    None => None,
                 },
-                _ => None,
-            };
-            if let Some(c) = constraint_ast {
-                constraints.push(ast::NamedColumnConstraint {
-                    name: None,
-                    constraint: c,
-                });
-            }
+            });
+        }
+        if parts.is_unique {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Unique(None),
+            });
+        }
+        if let Some(expr) = parts.default_expr {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Default(Box::new(expr)),
+            });
+        }
+        if let Some(fk) = &parts.foreign_key {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::ForeignKey {
+                    clause: self.pg_fk_to_fk_clause(fk),
+                    defer_clause: None,
+                },
+            });
+        }
+        for expr in parts.check_exprs {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Check(Box::new(expr)),
+            });
+        }
+        if let Some(expr) = parts.generated_expr {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Generated {
+                    expr: Box::new(expr),
+                    typ: Some(ast::GeneratedColumnType::Stored),
+                },
+            });
         }
 
         Ok(ast::ColumnDefinition {
@@ -6116,6 +6163,39 @@ mod tests {
         let parsed = crate::parse(sql).unwrap();
         let err = translator.translate(&parsed).unwrap_err();
         assert!(matches!(err, ParseError::ParseError(_)));
+    }
+
+    #[test]
+    fn test_alter_table_add_column_preserves_fk_and_check() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "ALTER TABLE orders ADD COLUMN cust_id INTEGER \
+                   REFERENCES customers(id) CHECK (cust_id > 0)";
+        let parsed = crate::parse(sql).unwrap();
+        let stmts = translator.translate_stmts(&parsed).unwrap();
+        assert_eq!(stmts.len(), 1);
+
+        if let ast::Stmt::AlterTable(ast::AlterTable {
+            body: ast::AlterTableBody::AddColumn(col),
+            ..
+        }) = &stmts[0]
+        {
+            let has_fk = col
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::ForeignKey { .. }));
+            let has_check = col
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Check(_)));
+            assert!(has_fk, "FK dropped by ADD COLUMN: {:?}", col.constraints);
+            assert!(
+                has_check,
+                "CHECK dropped by ADD COLUMN: {:?}",
+                col.constraints
+            );
+        } else {
+            panic!("Expected AlterTable::AddColumn");
+        }
     }
 
     #[test]
