@@ -1817,8 +1817,9 @@ git commit -S -m "fix(translator): preserve GENERATED ... STORED columns, reject
 `docs/superpowers/plans/2026-07-03-turso-core-sequences.md` (merged with the
 `CREATE SEQUENCE`/`nextval`/`currval`/`setval` item further below, since
 both need the same underlying sequence-object-type primitive). The pgmicro
-follow-up plan wiring `ConstrIdentity` to it is not yet written — do it once
-the core plan lands.
+follow-up plan wiring `ConstrIdentity` to it is also written —
+`docs/superpowers/plans/2026-07-03-pgmicro-sequences-followup.md` — do not
+start it before the core plan lands.
 
 ---
 
@@ -3079,7 +3080,8 @@ where real PostgreSQL refuses by default with
 RESTRICT-by-default gap is flagged in that plan as arguably higher priority
 than CASCADE itself, since it's a silently-wrong-today correctness bug, not
 just a missing feature. The pgmicro-side plan (parsing `CASCADE`/`RESTRICT`
-keywords, wiring to the new core primitive) is not yet written.
+keywords, wiring to the new core primitive) is now written:
+`docs/superpowers/plans/2026-07-03-pgmicro-cascading-drop-followup.md`.
 
 ---
 
@@ -3563,8 +3565,14 @@ populated in `emitter/update.rs:90-166` is unkeyed/ungrouped, so a target row
 with N join matches produces N scratch rows — silently harmless for UPDATE
 today, but would multiply `RETURNING` rows for the new DELETE...USING
 feature and diverges from PostgreSQL's one-row-per-target-row DELETE
-semantics. The pgmicro-side plan (parsing `USING`, wiring to the new core
-fields) is not yet written.
+semantics. The pgmicro-side plan is now written —
+`docs/superpowers/plans/2026-07-03-pgmicro-join-delete-followup.md` — which
+found the parser_pg-side translation is nearly a direct copy of
+`translate_update`'s existing `from_clause` handling (`translator.rs:1349-1351`),
+since `delete.using_clause` is the same libpg_query protobuf shape as
+`update.from_clause`; it also replaces the interim rejection test
+(`test_delete_using_rejected_not_silently_ignored`, `translator.rs:7474`)
+rather than leaving it asserting now-obsolete behavior.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3995,8 +4003,11 @@ add as new Turso-native keywords/AST rather than PG-only syntax; population
 state is tracked via a new `Schema::unpopulated_views` set mirroring the
 existing `incompatible_views` pattern. `CONCURRENTLY` is explicitly excluded
 (no reusable diff/temp-table primitive exists today — flagged as genuinely
-new engineering, not a small addition). The pgmicro-side plan (parsing
-`WITH NO DATA`, wiring the REFRESH statement) is not yet written.
+new engineering, not a small addition). The pgmicro-side plan is now written
+too — `docs/superpowers/plans/2026-07-03-pgmicro-unpopulated-matview-followup.md` —
+and found Task B24 just above (the `WITH NO DATA` rejection) has not
+actually landed in code yet despite being specced; that follow-up plan's
+wiring subsumes and replaces B24's rejection once the core plan lands.
 
 ---
 
@@ -7265,26 +7276,35 @@ git commit -S -m "fix(translate): decode array_agg to PG text array in ungrouped
      (also covers `GENERATED ... AS IDENTITY` from Task B2/line 1814 above — same
      primitive). Flags the durable non-transactional advancement mechanism
      `nextval` requires as genuinely new engineering ground with no precedent in
-     `core/storage/` today.
+     `core/storage/` today. pgmicro-side follow-up:
+     `docs/superpowers/plans/2026-07-03-pgmicro-sequences-followup.md` — also
+     covers making `SERIAL` create a real, catalog-visible backing sequence
+     instead of today's pure-`AUTOINCREMENT` faking (confirmed no
+     `<table>_<column>_seq` object is created or queryable today).
    - `TIMESTAMPTZ` timezone semantics: `docs/superpowers/plans/2026-07-03-turso-core-timezone.md`,
      plus an (unrequested but kept) pgmicro-side follow-up at
      `docs/superpowers/plans/2026-07-03-pgmicro-timezone-followup.md`. Root
      finding: today's `timestamptz` custom type (`core/schema.rs:685`) is
      byte-for-byte identical to plain `timestamp` (`core/schema.rs:684`) — it has
      never had timezone-specific behavior.
-   - Advisory locks: `docs/superpowers/plans/2026-07-03-turso-core-advisory-locks.md`.
-     The core registry has no dependency on Workstream A, but its pgmicro
-     follow-up (not yet written) will: `cli/pg_server.rs` currently serves all
+   - Advisory locks: `docs/superpowers/plans/2026-07-03-turso-core-advisory-locks.md`,
+     pgmicro follow-up now written at
+     `docs/superpowers/plans/2026-07-03-pgmicro-advisory-locks-followup.md`.
+     The core registry has no dependency on Workstream A, but the follow-up
+     plan is explicitly blocked on it: `cli/pg_server.rs` currently serves all
      wire clients through one shared `Connection` (Task A3 unlanded), so wiring
      `pg_advisory_lock`-family functions before that lands would make unrelated
      `psql` sessions spuriously share locks.
-   - `INT4` 32-bit range enforcement: `docs/superpowers/plans/2026-07-03-turso-core-int32-overflow.md`.
+   - `INT4` 32-bit range enforcement: `docs/superpowers/plans/2026-07-03-turso-core-int32-overflow.md`,
+     pgmicro follow-up `docs/superpowers/plans/2026-07-03-pgmicro-int32-overflow-followup.md`.
      Turned out cheaper than the CHECK-based framing above assumed: `int4` has
      no custom type at all today (maps to raw `INTEGER`,
      `translator.rs:4853`), and Turso already has a generic translate-time
      custom-type `OPERATOR` dispatch mechanism (`expr.rs:8228`, used today by
      `numeric`/`money`) that this can reuse — no new `Value` variant, no VDBE
-     change.
+     change. The follow-up plan also fixes the pre-existing `int4(x)`/`int2(x)`
+     cast-shortcut bypass and flags a SERIAL/rowid-alias interaction to verify
+     before repointing `INTEGER`'s type mapping.
 
    Each core plan's pgmicro-side follow-up (except timezone's, already written)
    remains to be written once its core plan lands.
@@ -7540,8 +7560,15 @@ conflict (SQLite must stay case-insensitive regardless of quoting; PG
 delimited-identifier semantics need fold-unless-quoted) as an explicit open
 decision between two approaches (dialect-threaded normalization vs. a
 parallel resolution path) rather than picking silently. The pgmicro-side
-plan (wiring dialect-aware normalization through the translator) is not yet
-written.
+plan is written —
+`docs/superpowers/plans/2026-07-03-pgmicro-identifier-case-followup.md` —
+and assumes the dialect-threaded approach (a) as a recommendation (backed by
+`Connection::get_sql_dialect()` already existing), flagged as contingent on
+that still being a human decision, not a settled one. It also found two
+`normalize_ident`-independent lowercase-folding spots the core plan's
+`core/`-only search couldn't see: `parser_pg/src/translator.rs`'s own schema-name
+folding (5 call sites) and `core/pg_catalog.rs`'s lowercase-keyed lookup
+tables (doc comment at line 149) — both need fixing alongside the core change.
 
 **Interfaces:** None — self-contained to `core/translate/schema.rs`. Independent of every other Workstream F task. **This is a `core/` change** — flag for extra review/CI attention per CLAUDE.md's "minimize core/ changes."
 
