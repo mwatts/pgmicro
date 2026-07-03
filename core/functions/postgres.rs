@@ -142,22 +142,18 @@ pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Value {
     }
 }
 
-fn gcd_inner(mut a: i64, mut b: i64) -> i64 {
+fn gcd_inner(mut a: i64, mut b: i64) -> Result<i64, LimboError> {
     while b != 0 {
         let t = b;
-        b = a % b;
+        b = a.checked_rem(b).ok_or(LimboError::IntegerOverflow)?;
         a = t;
     }
-    a.wrapping_abs()
+    a.checked_abs().ok_or(LimboError::IntegerOverflow)
 }
 
 /// Greatest common divisor.
 pub fn exec_gcd(a: i64, b: i64) -> Result<Value, LimboError> {
-    // PG raises ERROR on overflow (gcd(INT_MIN, 0)), we match that
-    if (a == i64::MIN && b == 0) || (b == i64::MIN && a == 0) || (a == i64::MIN && b == i64::MIN) {
-        return Err(LimboError::IntegerOverflow);
-    }
-    Ok(Value::from_i64(gcd_inner(a, b)))
+    Ok(Value::from_i64(gcd_inner(a, b)?))
 }
 
 /// Least common multiple.
@@ -165,11 +161,15 @@ pub fn exec_lcm(a: i64, b: i64) -> Result<Value, LimboError> {
     if a == 0 || b == 0 {
         return Ok(Value::from_i64(0));
     }
-    let g = gcd_inner(a, b);
-    match (a / g).checked_mul(b.wrapping_abs()) {
-        Some(v) => Ok(Value::from_i64(v.wrapping_abs())),
-        None => Err(LimboError::IntegerOverflow),
-    }
+    let g = gcd_inner(a, b)?; // g is always > 0, so a/g never hits MIN/-1
+    let b_abs = b.checked_abs().ok_or(LimboError::IntegerOverflow)?;
+    let product = (a / g)
+        .checked_mul(b_abs)
+        .ok_or(LimboError::IntegerOverflow)?;
+    product
+        .checked_abs()
+        .map(Value::from_i64)
+        .ok_or(LimboError::IntegerOverflow)
 }
 
 /// Repeat a string n times.
@@ -379,6 +379,17 @@ mod tests {
             exec_gcd(i64::MIN, i64::MIN),
             Err(LimboError::IntegerOverflow)
         ));
+        // Euclid's algorithm reaches i64::MIN % -1 mid-loop for this pair even
+        // though neither input matches the 3 previously special-cased tuples.
+        // Before the fix this panics the process instead of returning Err.
+        assert!(matches!(
+            exec_gcd(i64::MIN, -1),
+            Err(LimboError::IntegerOverflow)
+        ));
+        assert!(matches!(
+            exec_gcd(-1, i64::MIN),
+            Err(LimboError::IntegerOverflow)
+        ));
     }
 
     #[test]
@@ -392,6 +403,15 @@ mod tests {
     fn lcm_overflow_raises() {
         assert!(matches!(
             exec_lcm(i64::MAX, 2),
+            Err(LimboError::IntegerOverflow)
+        ));
+    }
+
+    #[test]
+    fn lcm_overflow_raises_on_min_abs() {
+        // b.wrapping_abs() previously silently wrapped i64::MIN back to i64::MIN.
+        assert!(matches!(
+            exec_lcm(i64::MIN, -1),
             Err(LimboError::IntegerOverflow)
         ));
     }
