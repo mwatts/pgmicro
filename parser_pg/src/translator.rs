@@ -155,7 +155,7 @@ impl PostgreSQLTranslator {
             NodeRef::UpdateStmt(update) => Ok(vec![self.translate_update(update)?]),
             NodeRef::DeleteStmt(delete) => Ok(vec![self.translate_delete(delete)?]),
             NodeRef::TransactionStmt(txn) => Ok(vec![self.translate_transaction(txn)?]),
-            NodeRef::DropStmt(drop) => Ok(vec![self.translate_drop(drop)?]),
+            NodeRef::DropStmt(drop) => self.translate_drop(drop),
             NodeRef::AlterTableStmt(alter) => self.translate_alter_table(alter),
             NodeRef::RenameStmt(rename) => Ok(vec![self.translate_rename_stmt(rename)?]),
             NodeRef::IndexStmt(idx) => Ok(vec![self.translate_create_index(idx)?]),
@@ -902,20 +902,14 @@ impl PostgreSQLTranslator {
         })
     }
 
-    fn translate_drop(&self, drop: &pg_query::protobuf::DropStmt) -> Result<ast::Stmt, ParseError> {
+    /// Resolves a single DROP target's protobuf `Node` into an `ast::QualifiedName`.
+    fn qualified_name_from_drop_object(
+        &self,
+        obj_node: &pg_query::protobuf::Node,
+    ) -> Result<ast::QualifiedName, ParseError> {
         use pg_query::protobuf::node::Node;
-        use pg_query::protobuf::ObjectType;
 
-        let remove_type = ObjectType::try_from(drop.remove_type)
-            .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
-
-        // Extract the first qualified name from drop.objects
-        let obj_node = drop
-            .objects
-            .first()
-            .ok_or_else(|| ParseError::ParseError("DROP missing object name".into()))?;
-
-        let qualified_name = match &obj_node.node {
+        match &obj_node.node {
             Some(Node::List(list)) => {
                 let names: Vec<String> = list
                     .items
@@ -926,17 +920,19 @@ impl PostgreSQLTranslator {
                     })
                     .collect();
                 match names.len() {
-                    0 => return Err(ParseError::ParseError("DROP: empty name list".into())),
-                    1 => ast::QualifiedName::single(ast::Name::from_string(names[0].clone())),
-                    _ => ast::QualifiedName::fullname(
+                    0 => Err(ParseError::ParseError("DROP: empty name list".into())),
+                    1 => Ok(ast::QualifiedName::single(ast::Name::from_string(
+                        names[0].clone(),
+                    ))),
+                    _ => Ok(ast::QualifiedName::fullname(
                         ast::Name::from_string(names[0].clone()),
                         ast::Name::from_string(names[1].clone()),
-                    ),
+                    )),
                 }
             }
-            Some(Node::String(s)) => {
-                ast::QualifiedName::single(ast::Name::from_string(s.sval.clone()))
-            }
+            Some(Node::String(s)) => Ok(ast::QualifiedName::single(ast::Name::from_string(
+                s.sval.clone(),
+            ))),
             Some(Node::TypeName(tn)) => {
                 // DROP TYPE uses TypeName nodes; extract the last name component
                 let type_name = tn
@@ -948,41 +944,68 @@ impl PostgreSQLTranslator {
                     })
                     .next_back()
                     .ok_or_else(|| ParseError::ParseError("DROP TYPE: empty type name".into()))?;
-                ast::QualifiedName::single(ast::Name::from_string(type_name))
+                Ok(ast::QualifiedName::single(ast::Name::from_string(
+                    type_name,
+                )))
             }
-            _ => {
-                return Err(ParseError::ParseError(
-                    "DROP: unexpected object format".into(),
-                ));
-            }
-        };
-
-        match remove_type {
-            ObjectType::ObjectTable => Ok(ast::Stmt::DropTable {
-                if_exists: drop.missing_ok,
-                tbl_name: qualified_name,
-            }),
-            ObjectType::ObjectIndex => Ok(ast::Stmt::DropIndex {
-                if_exists: drop.missing_ok,
-                idx_name: qualified_name,
-            }),
-            ObjectType::ObjectView | ObjectType::ObjectMatview => Ok(ast::Stmt::DropView {
-                if_exists: drop.missing_ok,
-                view_name: qualified_name,
-            }),
-            ObjectType::ObjectType => Ok(ast::Stmt::DropType {
-                if_exists: drop.missing_ok,
-                type_name: qualified_name.name.as_str().to_string(),
-            }),
-            ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
-                if_exists: drop.missing_ok,
-                domain_name: qualified_name.name.as_str().to_string(),
-            }),
-            _ => Err(ParseError::ParseError(format!(
-                "DROP {} is not supported",
-                drop_object_type_name(remove_type)
-            ))),
+            _ => Err(ParseError::ParseError(
+                "DROP: unexpected object format".into(),
+            )),
         }
+    }
+
+    fn translate_drop(
+        &self,
+        drop: &pg_query::protobuf::DropStmt,
+    ) -> Result<Vec<ast::Stmt>, ParseError> {
+        use pg_query::protobuf::{DropBehavior, ObjectType};
+
+        let remove_type = ObjectType::try_from(drop.remove_type)
+            .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
+
+        if DropBehavior::try_from(drop.behavior).ok() == Some(DropBehavior::DropCascade) {
+            return Err(ParseError::ParseError(
+                "DROP ... CASCADE is not supported; dependent objects must be dropped explicitly"
+                    .into(),
+            ));
+        }
+
+        if drop.objects.is_empty() {
+            return Err(ParseError::ParseError("DROP missing object name".into()));
+        }
+
+        drop.objects
+            .iter()
+            .map(|obj_node| {
+                let qualified_name = self.qualified_name_from_drop_object(obj_node)?;
+                match remove_type {
+                    ObjectType::ObjectTable => Ok(ast::Stmt::DropTable {
+                        if_exists: drop.missing_ok,
+                        tbl_name: qualified_name,
+                    }),
+                    ObjectType::ObjectIndex => Ok(ast::Stmt::DropIndex {
+                        if_exists: drop.missing_ok,
+                        idx_name: qualified_name,
+                    }),
+                    ObjectType::ObjectView | ObjectType::ObjectMatview => Ok(ast::Stmt::DropView {
+                        if_exists: drop.missing_ok,
+                        view_name: qualified_name,
+                    }),
+                    ObjectType::ObjectType => Ok(ast::Stmt::DropType {
+                        if_exists: drop.missing_ok,
+                        type_name: qualified_name.name.as_str().to_string(),
+                    }),
+                    ObjectType::ObjectDomain => Ok(ast::Stmt::DropDomain {
+                        if_exists: drop.missing_ok,
+                        domain_name: qualified_name.name.as_str().to_string(),
+                    }),
+                    _ => Err(ParseError::ParseError(format!(
+                        "DROP {} is not supported",
+                        drop_object_type_name(remove_type)
+                    ))),
+                }
+            })
+            .collect()
     }
 
     fn translate_truncate(
@@ -7281,6 +7304,51 @@ mod tests {
             assert!(if_exists);
         } else {
             panic!("Expected DropTable");
+        }
+    }
+
+    #[test]
+    fn test_drop_multiple_tables_all_translated() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "DROP TABLE a, b, c";
+        let parsed = crate::parse(sql).unwrap();
+        let stmts = translator.translate_stmts(&parsed).unwrap();
+        assert_eq!(
+            stmts.len(),
+            3,
+            "All 3 objects must be dropped, not just the first"
+        );
+        let names: Vec<String> = stmts
+            .iter()
+            .map(|s| match s {
+                ast::Stmt::DropTable { tbl_name, .. } => tbl_name.name.as_str().to_string(),
+                other => panic!("Expected DropTable, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_drop_cascade_rejected_not_silently_ignored() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "DROP TABLE a CASCADE";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate_stmts(&parsed).unwrap_err();
+        assert!(matches!(err, ParseError::ParseError(_)));
+    }
+
+    #[test]
+    fn test_drop_multiple_tables_if_exists_threaded_per_object() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "DROP TABLE IF EXISTS a, b";
+        let parsed = crate::parse(sql).unwrap();
+        let stmts = translator.translate_stmts(&parsed).unwrap();
+        assert_eq!(stmts.len(), 2);
+        for s in &stmts {
+            match s {
+                ast::Stmt::DropTable { if_exists, .. } => assert!(if_exists),
+                other => panic!("Expected DropTable, got {other:?}"),
+            }
         }
     }
 
