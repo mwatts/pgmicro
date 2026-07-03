@@ -3148,6 +3148,39 @@ impl PostgreSQLTranslator {
         }
     }
 
+    /// PG wraps `X LIKE Y ESCAPE Z` as `like_escape(Y, Z)`; unwrap it so `Y` becomes the
+    /// pattern and `Z` becomes the AST `escape` field, instead of falling through to a
+    /// generic FuncCall to a nonexistent `like_escape` SQL function.
+    fn translate_like_pattern_and_escape(
+        &self,
+        rexpr: &pg_query::protobuf::Node,
+    ) -> Result<(ast::Expr, Option<Box<ast::Expr>>), ParseError> {
+        if let Some(pg_query::protobuf::node::Node::FuncCall(fc)) = &rexpr.node {
+            let is_like_escape = fc
+                .funcname
+                .iter()
+                .filter_map(|n| match &n.node {
+                    Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .next_back()
+                == Some("like_escape");
+            if is_like_escape {
+                let pattern = fc
+                    .args
+                    .first()
+                    .ok_or_else(|| ParseError::ParseError("like_escape: missing pattern".into()))?;
+                let pattern_expr = self.translate_expr(pattern)?;
+                let escape_expr = match fc.args.get(1) {
+                    Some(esc) => Some(Box::new(self.translate_expr(esc)?)),
+                    None => None,
+                };
+                return Ok((pattern_expr, escape_expr));
+            }
+        }
+        Ok((self.translate_expr(rexpr)?, None))
+    }
+
     fn translate_like_expr(
         &self,
         a_expr: &pg_query::protobuf::AExpr,
@@ -3188,20 +3221,17 @@ impl PostgreSQLTranslator {
             ));
         };
 
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing right expression for LIKE operator".to_string(),
-            ));
-        };
+        let rexpr = a_expr.rexpr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("Missing right expression for LIKE operator".to_string())
+        })?;
+        let (rhs, escape) = self.translate_like_pattern_and_escape(rexpr)?;
 
         Ok(ast::Expr::Like {
             lhs,
             not,
             op: ast::LikeOperator::Like,
-            rhs,
-            escape: None,
+            rhs: Box::new(rhs),
+            escape,
         })
     }
 
@@ -3237,15 +3267,14 @@ impl PostgreSQLTranslator {
             ));
         };
 
-        let rhs = if let Some(rexpr) = &a_expr.rexpr {
-            self.translate_expr(rexpr)?
-        } else {
-            return Err(ParseError::ParseError(
-                "Missing right expression for ILIKE".to_string(),
-            ));
-        };
+        let rexpr = a_expr.rexpr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("Missing right expression for ILIKE".to_string())
+        })?;
+        let (rhs, escape) = self.translate_like_pattern_and_escape(rexpr)?;
 
-        // Wrap both sides in LOWER() to make case-insensitive
+        // Wrap both sides in LOWER() to make case-insensitive. The ESCAPE character
+        // itself is NOT lower()-wrapped: PostgreSQL treats it as a literal codepoint
+        // compared byte-for-byte, not subject to ILIKE's case-folding.
         let lower_lhs = ast::Expr::FunctionCall {
             name: ast::Name::from_string("lower"),
             distinctness: None,
@@ -3273,7 +3302,7 @@ impl PostgreSQLTranslator {
             not,
             op: ast::LikeOperator::Like,
             rhs: Box::new(lower_rhs),
-            escape: None,
+            escape,
         })
     }
 
@@ -6847,6 +6876,71 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_like_escape_clause_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = r"SELECT * FROM users WHERE name LIKE '50\%%' ESCAPE '\'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                if let ast::Expr::Like { rhs, escape, .. } = &**where_clause.as_ref().unwrap() {
+                    assert!(escape.is_some(), "ESCAPE clause was dropped");
+                    assert!(
+                        matches!(**rhs, ast::Expr::Literal(ast::Literal::String(_))),
+                        "rhs should be the unwrapped pattern literal, not a like_escape(...) call: {rhs:?}"
+                    );
+                } else {
+                    panic!("Expected Like expression");
+                }
+            }
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_ilike_escape_clause_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = r"SELECT * FROM users WHERE name ILIKE '50\%%' ESCAPE '\'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                if let ast::Expr::Like { rhs, escape, .. } = &**where_clause.as_ref().unwrap() {
+                    assert!(escape.is_some(), "ESCAPE clause was dropped");
+                    // The pattern side of ILIKE is wrapped in lower(...); the escape
+                    // character itself must NOT be lower()-wrapped (PostgreSQL treats
+                    // the ESCAPE char as a literal codepoint, not subject to case-folding).
+                    assert!(
+                        matches!(**rhs, ast::Expr::FunctionCall { .. }),
+                        "rhs should be lower(pattern) for ILIKE: {rhs:?}"
+                    );
+                    if let ast::Expr::FunctionCall { name, args, .. } = &**rhs {
+                        assert_eq!(name.as_str().to_lowercase(), "lower");
+                        assert_eq!(args.len(), 1);
+                        assert!(
+                            matches!(*args[0], ast::Expr::Literal(ast::Literal::String(_))),
+                            "lower()'s argument should be the unwrapped pattern literal, not a like_escape(...) call: {:?}",
+                            args[0]
+                        );
+                    }
+                    let escape_expr = escape.as_ref().unwrap();
+                    assert!(
+                        matches!(**escape_expr, ast::Expr::Literal(ast::Literal::String(_))),
+                        "escape char should be the plain literal, not wrapped in lower(): {escape_expr:?}"
+                    );
+                } else {
+                    panic!("Expected Like expression");
+                }
+            }
+        } else {
+            panic!("Expected Select");
         }
     }
 
