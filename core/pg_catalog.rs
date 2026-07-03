@@ -1,7 +1,6 @@
 use crate::pg_role::{pg_role_registry_rows, PgRoleCatalogKind};
 use crate::schema::{Schema, Table, TypeDef};
 use crate::sync::{Arc, LazyLock, RwLock};
-use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 #[allow(unused_imports)]
 use crate::Numeric;
@@ -3222,25 +3221,30 @@ impl PgConstraintCursor {
                     .collect::<Vec<_>>()
                     .join(" ");
 
-                // Find matching index OID
-                let conindid = if us.is_primary_key {
-                    // PK auto-index name: sqlite_autoindex_{table}_{N}
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| {
-                            k.starts_with(&format!(
-                                "{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{table_name}"
-                            ))
-                        })
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                } else {
-                    index_oid_map
-                        .iter()
-                        .find(|(k, _)| k.contains(&col_names.join("_")))
-                        .map(|(_, &v)| v)
-                        .unwrap_or(0)
-                };
+                // Find matching index OID. Resolve by matching this constraint's
+                // column-position set against the SAME table's indexes only
+                // (schema.get_indices(table_name)), instead of a substring search
+                // over the global index_oid_map — a substring match can spuriously
+                // match another table's similarly-named/columned index.
+                let col_positions: std::collections::BTreeSet<usize> = col_names
+                    .iter()
+                    .filter_map(|name| btree.get_column(name).map(|(pos, _)| pos))
+                    .collect();
+                let conindid = schema
+                    .get_indices(table_name)
+                    .find(|idx| {
+                        !idx.ephemeral
+                            && idx.unique
+                            && idx
+                                .columns
+                                .iter()
+                                .filter(|c| c.expr.is_none())
+                                .map(|c| c.pos_in_table)
+                                .collect::<std::collections::BTreeSet<_>>()
+                                == col_positions
+                    })
+                    .and_then(|idx| index_oid_map.get(&idx.name).copied())
+                    .unwrap_or(0);
 
                 self.rows.push(vec![
                     Value::from_i64(constraint_oid), // oid

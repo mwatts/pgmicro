@@ -493,6 +493,37 @@ fn test_pg_constraint_check(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_pg_constraint_conindid_scoped_to_own_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT con.conindid, idx.indrelid = con.conrelid AS same_table
+             FROM pg_constraint con
+             JOIN pg_index idx ON idx.indexrelid = con.conindid
+             JOIN pg_class c ON c.oid = con.conrelid
+             WHERE c.relname = 'users' AND con.contype = 'u'",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let same_table = stmt.row().unwrap().get_value(1).as_int();
+            assert_eq!(
+                same_table,
+                Some(1),
+                "conindid must reference an index on the constraint's own table"
+            );
+        }
+        _ => panic!("UNIQUE constraint on users.email not found"),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // pg_class index row tests
 // ──────────────────────────────────────────────────────────────────────
