@@ -142,6 +142,25 @@ fn test_postgres_aggregate_order_by(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_array_agg_plain_decodes_to_text_array(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let mut rows = conn.query("SELECT array_agg(x) FROM t").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(array) = row.get_value(0) else {
+        panic!("expected text array, got {:?}", row.get_value(0));
+    };
+    assert_eq!(array.as_str(), "{1,2,3}");
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_greatest_least(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = postgres").unwrap();

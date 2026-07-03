@@ -44,6 +44,18 @@ fn ungrouped_agg_can_emit_inline_result(plan: &SelectPlan, t_ctx: &TranslateCtx<
     {
         return false;
     }
+    // The inline fast path emits Copy+ResultRow directly and skips
+    // result_row::emit_array_decode_for_results(), which is what converts an
+    // array-typed aggregate's internal Blob payload into PG's `{...}` text
+    // form. Bail out to the slower-but-correct emit_select_result() path
+    // whenever a result column would need that decode step.
+    if plan
+        .result_columns
+        .iter()
+        .any(|rc| super::expr::expr_is_array(&rc.expr, Some(&plan.table_references)))
+    {
+        return false;
+    }
     plan.result_columns.iter().all(|rc| {
         plan.aggregates
             .iter()
