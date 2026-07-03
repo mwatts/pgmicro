@@ -3765,6 +3765,98 @@ impl PostgreSQLTranslator {
         })
     }
 
+    /// Rewrite `x <op> ANY (subquery)` / `x <op> ALL (subquery)` (op != `=`/`<>`) as a
+    /// correlated EXISTS. Only supports a simple, non-compound subquery with exactly one
+    /// result column — anything else is rejected with a clear error rather than silently
+    /// mistranslated.
+    ///
+    /// `x <op> ANY (subq)`  is  `EXISTS (SELECT 1 FROM (subq) s WHERE x <op> s.col)`
+    /// `x <op> ALL (subq)`  is  `NOT EXISTS (SELECT 1 FROM (subq) s WHERE NOT (x <op> s.col))`
+    fn translate_any_all_subquery(
+        &self,
+        sub_link: &pg_query::protobuf::SubLink,
+        mut select: ast::Select,
+        op: &str,
+        is_all: bool,
+    ) -> Result<ast::Expr, ParseError> {
+        const SUB_ALIAS: &str = "__pgmicro_any_all";
+        const COL_ALIAS: &str = "__pgmicro_any_all_col";
+
+        let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("ANY/ALL subquery missing testexpr".to_string())
+        })?;
+        let lhs = self.translate_expr(test_node)?;
+
+        if !select.body.compounds.is_empty() {
+            return Err(ParseError::ParseError(
+                "ANY/ALL subquery with UNION/INTERSECT/EXCEPT is not supported".to_string(),
+            ));
+        }
+        let ast::OneSelect::Select { columns, .. } = &mut select.body.select else {
+            return Err(ParseError::ParseError(
+                "ANY/ALL subquery must be a simple SELECT".to_string(),
+            ));
+        };
+        if columns.len() != 1 {
+            return Err(ParseError::ParseError(
+                "ANY/ALL subquery must return exactly one column".to_string(),
+            ));
+        }
+        match &mut columns[0] {
+            ast::ResultColumn::Expr(_, alias) => {
+                *alias = Some(ast::As::As(ast::Name::from_string(COL_ALIAS)));
+            }
+            _ => {
+                return Err(ParseError::ParseError(
+                    "ANY/ALL subquery must return a single expression column".to_string(),
+                ));
+            }
+        }
+
+        let operator = pg_comparison_operator(op)?;
+        let col_ref = ast::Expr::Qualified(
+            ast::Name::from_string(SUB_ALIAS),
+            ast::Name::from_string(COL_ALIAS),
+        );
+        let mut predicate = ast::Expr::Binary(Box::new(lhs), operator, Box::new(col_ref));
+        if is_all {
+            predicate = ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(predicate));
+        }
+
+        let exists_select = ast::Select {
+            with: None,
+            body: ast::SelectBody {
+                select: ast::OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ast::ResultColumn::Expr(
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+                        None,
+                    )],
+                    from: Some(ast::FromClause {
+                        select: Box::new(ast::SelectTable::Select(
+                            select,
+                            Some(ast::As::As(ast::Name::from_string(SUB_ALIAS))),
+                        )),
+                        joins: vec![],
+                    }),
+                    where_clause: Some(Box::new(predicate)),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        let exists = ast::Expr::Exists(exists_select);
+        Ok(if is_all {
+            ast::Expr::Unary(ast::UnaryOperator::Not, Box::new(exists))
+        } else {
+            exists
+        })
+    }
+
     fn translate_sublink(
         &self,
         sub_link: &pg_query::protobuf::SubLink,
@@ -3788,10 +3880,11 @@ impl PostgreSQLTranslator {
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
             SubLinkType::ExprSublink => Ok(ast::Expr::Subquery(select)),
-            SubLinkType::AnySublink => {
-                // `x = ANY (subquery)` / `x IN (subquery)`
-                self.translate_in_subselect(sub_link, select, false)
-            }
+            SubLinkType::AnySublink => match Self::sublink_operator_name(sub_link) {
+                // `x = ANY (subquery)`; plain `x IN (subquery)` has no operName (implicit `=`)
+                Some("=") | None => self.translate_in_subselect(sub_link, select, false),
+                Some(op) => self.translate_any_all_subquery(sub_link, select, op, false),
+            },
             SubLinkType::AllSublink => {
                 // `x <> ALL (subquery)` is equivalent to `x NOT IN (subquery)`
                 match Self::sublink_operator_name(sub_link) {
@@ -4527,6 +4620,22 @@ impl PostgreSQLTranslator {
             not_null,
             constraints,
         })
+    }
+}
+
+/// Map a PostgreSQL comparison operator name to the equivalent Turso AST operator, for use
+/// in the ANY/ALL subquery rewrite. Only comparison operators are supported.
+fn pg_comparison_operator(op: &str) -> Result<ast::Operator, ParseError> {
+    match op {
+        "=" => Ok(ast::Operator::Equals),
+        "<>" | "!=" => Ok(ast::Operator::NotEquals),
+        "<" => Ok(ast::Operator::Less),
+        "<=" => Ok(ast::Operator::LessEquals),
+        ">" => Ok(ast::Operator::Greater),
+        ">=" => Ok(ast::Operator::GreaterEquals),
+        other => Err(ParseError::ParseError(format!(
+            "Unsupported ANY/ALL comparison operator: {other}"
+        ))),
     }
 }
 
@@ -7512,6 +7621,57 @@ mod tests {
                 panic!("Expected Select for {sql}");
             }
         }
+    }
+
+    #[test]
+    fn test_any_subquery_greater_than() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM orders WHERE total > ANY (SELECT limit_amt FROM limits)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                let where_expr = where_clause.as_ref().expect("Should have WHERE");
+                assert!(
+                    !matches!(**where_expr, ast::Expr::InSelect { .. }),
+                    "`> ANY` must not degrade to IN: {where_expr:?}"
+                );
+                if let ast::Expr::Exists(inner) = &**where_expr {
+                    if let ast::OneSelect::Select {
+                        where_clause, from, ..
+                    } = &inner.body.select
+                    {
+                        assert!(from.is_some(), "EXISTS subquery must have a FROM");
+                        let inner_where = where_clause.as_ref().expect("Should have inner WHERE");
+                        assert!(
+                            matches!(
+                                **inner_where,
+                                ast::Expr::Binary(_, ast::Operator::Greater, _)
+                            ),
+                            "Inner predicate should use > : {inner_where:?}"
+                        );
+                    } else {
+                        panic!("Expected simple SELECT inside EXISTS");
+                    }
+                } else {
+                    panic!("Expected Exists expression, got: {where_expr:?}");
+                }
+            } else {
+                panic!("Expected OneSelect::Select");
+            }
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_any_subquery_multi_column_rejected() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM orders WHERE total > ANY (SELECT a, b FROM limits)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(matches!(err, ParseError::ParseError(_)));
     }
 
     #[test]
