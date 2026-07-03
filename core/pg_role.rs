@@ -205,9 +205,9 @@ impl PgRoleRegistry {
 
 fn normalize_role_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
-    let unquoted = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-        || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-    {
+    let is_quoted = (trimmed.starts_with('"') && trimmed.ends_with('"'))
+        || (trimmed.starts_with('\'') && trimmed.ends_with('\''));
+    let unquoted = if is_quoted {
         &trimmed[1..trimmed.len() - 1]
     } else {
         trimmed
@@ -225,7 +225,14 @@ fn normalize_role_name(name: &str) -> Result<String> {
             "invalid role name \"{unquoted}\""
         )));
     }
-    Ok(unquoted.to_lowercase())
+    // `name` always arrives already identifier-folded by libpg_query (which strips
+    // surrounding quotes itself before we ever see the string): unquoted role names
+    // are already lowercased, quoted role names already keep their original case.
+    // The quote-stripping above is defensive only; it is not reachable via the
+    // CREATE ROLE / DROP ROLE call paths today. Re-lowercasing here regardless of
+    // `is_quoted` used to clobber the case of quoted role names (e.g. `CREATE ROLE
+    // "Alice"` was silently stored as `alice`), so we must not fold again.
+    Ok(unquoted.to_string())
 }
 
 pub fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {

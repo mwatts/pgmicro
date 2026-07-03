@@ -1388,6 +1388,39 @@ fn test_pg_create_and_drop_role(db: TempDatabase) {
     assert_eq!(*count, 0);
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_quoted_role_name_preserves_case(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE ROLE \"Alice\"").unwrap();
+
+    let mut rows = conn
+        .query("SELECT rolname FROM pg_roles WHERE rolname = 'Alice'")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("CREATE ROLE \"Alice\" should preserve case, but no rolname='Alice' row was found");
+    };
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_unquoted_role_name_still_folds_lowercase(db: TempDatabase) {
+    // Regression guard: unquoted identifiers must keep PG's normal fold-to-lowercase behavior.
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE ROLE Bob").unwrap();
+
+    let mut rows = conn
+        .query("SELECT rolname FROM pg_roles WHERE rolname = 'bob'")
+        .unwrap()
+        .unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("unquoted CREATE ROLE Bob should fold to lowercase 'bob'");
+    };
+}
+
 #[turso_macros::test]
 fn test_pg_proc_stable_oids(db: TempDatabase) {
     let conn = db.connect_limbo();
