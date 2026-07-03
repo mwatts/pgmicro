@@ -12,7 +12,7 @@ use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::{Expr, RefAct};
 
 /// Starting OID for user tables (matches PostgreSQL convention)
-const USER_TABLE_OID_START: i64 = 16384;
+pub(crate) const USER_TABLE_OID_START: i64 = 16384;
 
 /// Stable OID base for pg_proc rows.
 const PG_PROC_OID_BASE: i64 = 80_000;

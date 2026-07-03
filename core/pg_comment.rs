@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::pg_catalog::USER_TABLE_OID_START;
 use crate::schema::{Schema, Table};
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Result, Value};
@@ -8,8 +9,6 @@ use turso_parser_pg::translator::{PgCommentStmt, PgCommentTarget};
 /// PostgreSQL catalog class OIDs for `pg_description.classoid`.
 pub const PG_CLASS_CLASSOID: i64 = 1259;
 pub const PG_TYPE_CLASSOID: i64 = 1247;
-
-const USER_TABLE_OID_START: i64 = 16384;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PgDescriptionKey {
