@@ -1667,3 +1667,27 @@ fn test_pg_attribute_and_relnatts_exclude_hidden_column(db: TempDatabase) {
         _ => panic!("relnatts query failed"),
     }
 }
+
+#[turso_macros::test]
+fn test_pg_proc_overloaded_builtin_has_distinct_oids(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT oid FROM pg_proc WHERE proname = 'round'")
+        .unwrap();
+    let mut oids = std::collections::HashSet::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                oids.insert(stmt.row().unwrap().get_value(0).as_int());
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert!(
+        oids.len() >= 2,
+        "round/1 and round/2 must get distinct OIDs, got {}",
+        oids.len()
+    );
+}

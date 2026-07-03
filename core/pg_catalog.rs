@@ -1461,23 +1461,26 @@ struct PgProcCursor {
     current_row: usize,
 }
 
-fn stable_proc_oid_map(conn: &Connection) -> HashMap<String, i64> {
+/// Keyed by (function name, arity) rather than name alone: PostgreSQL's pg_proc has one
+/// row per overload (e.g. `round(numeric)` and `round(numeric, int)` are distinct catalog
+/// entries with distinct OIDs), and `Func::builtin_function_list()` already emits one
+/// `FunctionListEntry` per arity for overloaded functions.
+fn stable_proc_oid_map(conn: &Connection) -> HashMap<(String, i32), i64> {
     use crate::function::Func;
 
-    let mut names: Vec<String> = Func::builtin_function_list()
+    let mut keys: Vec<(String, i32)> = Func::builtin_function_list()
         .into_iter()
         .chain(Func::pg_proc_alias_entries())
-        .map(|e| e.name)
+        .map(|e| (e.name, e.narg))
         .collect();
-    for (name, _, _) in conn.get_syms_functions() {
-        names.push(name);
+    for (name, _, argc) in conn.get_syms_functions() {
+        keys.push((name, argc));
     }
-    names.sort();
-    names.dedup();
-    names
-        .into_iter()
+    keys.sort();
+    keys.dedup();
+    keys.into_iter()
         .enumerate()
-        .map(|(i, name)| (name, PG_PROC_OID_BASE + i as i64))
+        .map(|(i, key)| (key, PG_PROC_OID_BASE + i as i64))
         .collect()
 }
 
@@ -1500,7 +1503,7 @@ impl PgProcCursor {
         // Built-in functions from the same registry as PRAGMA function_list
         for entry in Func::builtin_function_list() {
             let oid = *oid_map
-                .get(&entry.name)
+                .get(&(entry.name.clone(), entry.narg))
                 .expect("builtin function missing from stable OID map");
             let prokind = if agg_names.contains(entry.name.as_str()) {
                 "a" // aggregate
@@ -1547,7 +1550,7 @@ impl PgProcCursor {
 
         for entry in Func::pg_proc_alias_entries() {
             let oid = *oid_map
-                .get(&entry.name)
+                .get(&(entry.name.clone(), entry.narg))
                 .expect("pg_proc alias missing from stable OID map");
             let prokind = match entry.func_type {
                 "a" => "a",
@@ -1590,7 +1593,7 @@ impl PgProcCursor {
         // Extension functions
         for (name, is_agg, argc) in self.conn.get_syms_functions() {
             let oid = *oid_map
-                .get(&name)
+                .get(&(name.clone(), argc))
                 .expect("extension function missing from stable OID map");
             let prokind = if is_agg { "a" } else { "f" };
 
