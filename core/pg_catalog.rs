@@ -793,7 +793,14 @@ impl PgAttributeCursor {
                     continue;
                 }
                 attnum += 1;
-                let col_name = col.name.clone().unwrap_or_default();
+                let col_name = col.name.clone().unwrap_or_else(|| {
+                    tracing::warn!(
+                        table = table.get_name(),
+                        position = attnum,
+                        "column has no name; emitting empty attname"
+                    );
+                    String::new()
+                });
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
                 let atttypmod = pg_atttypmod(&col.ty_str, &col.ty_params);
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
