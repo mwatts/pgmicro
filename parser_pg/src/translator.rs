@@ -1373,6 +1373,14 @@ impl PostgreSQLTranslator {
         &self,
         delete: &pg_query::protobuf::DeleteStmt,
     ) -> Result<ast::Stmt, ParseError> {
+        if !delete.using_clause.is_empty() {
+            return Err(ParseError::ParseError(
+                "DELETE ... USING is not supported (Turso has no multi-table DELETE); \
+                 rewrite using a correlated WHERE ... IN/EXISTS subquery instead"
+                    .into(),
+            ));
+        }
+
         // Extract table name
         let relation = delete
             .relation
@@ -7454,6 +7462,18 @@ mod tests {
         } else {
             panic!("Expected Delete");
         }
+    }
+
+    #[test]
+    fn test_delete_using_rejected_not_silently_ignored() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "DELETE FROM orders USING customers WHERE orders.cust_id = customers.id AND customers.banned";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(
+            matches!(err, ParseError::ParseError(_)),
+            "DELETE ... USING must be rejected, not silently executed without the join filter"
+        );
     }
 
     #[test]
