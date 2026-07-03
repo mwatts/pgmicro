@@ -7049,11 +7049,152 @@ git commit -S -m "fix(semantics): plain integer/float division by zero errors un
 
 ---
 
+### Task D3 (newly discovered — not in original PGMICRO_QUALITY_REVIEW.md): `array_agg()` returns raw internal Blob instead of decoded PG text array for ungrouped aggregates
+
+**Discovered while reviewing Task E4** (H25 catalog fix): the pre-existing test `test_postgres_aggregate_order_by` (`tests/integration/postgres/dialect.rs`) fails on current `master`/this branch's base, unrelated to any Workstream E change. Root-caused via direct investigation (see Notes) — this is a real, high-value bug: **every ungrouped `array_agg(...)` query returns a raw internal record-format `Blob` instead of PostgreSQL's `{a,b,c}` text array representation.** This is not specific to `ORDER BY` inside the aggregate — a plain `SELECT array_agg(x) FROM t` (no `GROUP BY`, no `ORDER BY`) exhibits the identical bug, confirmed via a throwaway probe test during investigation (not committed).
+
+**Root cause:** `core/translate/aggregation.rs`'s `ungrouped_agg_can_emit_inline_result()` is a fast-path optimization: when every result column of a `SELECT` is directly an aggregate expression (no `GROUP BY`/`DISTINCT`/`LIMIT`), the compiler emits `Copy` + `ResultRow` + `Halt` directly via `emit_ungrouped_agg_inline_result()`, **bypassing** `result_row::emit_select_result()`. But `emit_select_result()` is the only place that calls `result_row::emit_array_decode_for_results()`, which emits the `Insn::ArrayDecode` instruction that converts an array-typed aggregate's internal Blob payload into PG's `{...}` text form. The inline fast path never runs `ArrayDecode`, so any array-typed aggregate result (currently: `array_agg`, via `Func::Agg(AggFunc::ArrayAgg)` matched in `expr::expr_is_array()`) leaks out as a raw `Blob`.
+
+Confirmed the `GROUP BY` variant (`SELECT g, array_agg(x ORDER BY y) FROM g GROUP BY g ...`, same test function, later assertions) is **not** affected — `ungrouped_agg_can_emit_inline_result()` already bails out (returns `false`) whenever `plan.group_by` is non-empty, so grouped queries always go through the correct `emit_select_result()` path. The bug is confined to the ungrouped fast path only.
+
+**Files:**
+- Modify: `core/translate/aggregation.rs:30-52` (`ungrouped_agg_can_emit_inline_result`)
+- Test: `tests/integration/postgres/dialect.rs` (existing `test_postgres_aggregate_order_by`/`_mvcc` — currently RED; plus one new test for the non-`ORDER BY` shape of the bug)
+
+**Interfaces:**
+- Consumes: `expr::expr_is_array(expr: &ast::Expr, referenced_tables: Option<&TableReferences>) -> bool` (existing, `core/translate/expr.rs:4822`) — already correctly recognizes `Func::Agg(AggFunc::ArrayAgg)` result-column expressions regardless of whether the call has an inner `ORDER BY`.
+- Produces: no new public interface — this only tightens an existing internal fast-path gate.
+
+- [ ] **Step 1: Confirm the existing test is currently RED (do not write a new failing test for this part — it already exists and already fails)**
+
+Run: `cargo test -p core_tester --test integration_tests -- aggregate_order_by`
+Expected: both `postgres::dialect::test_postgres_aggregate_order_by` and `_mvcc` FAIL with `expected text array, got Blob([4, 1, 1, 9, 2, 3])` (or similar Blob bytes) at `tests/integration/postgres/dialect.rs:99`.
+
+- [ ] **Step 2: Write one additional failing test for the plain (non-`ORDER BY`) shape of the bug**
+
+Add to `tests/integration/postgres/dialect.rs`, near `test_postgres_aggregate_order_by`:
+
+```rust
+#[turso_macros::test(mvcc)]
+fn test_postgres_array_agg_plain_decodes_to_text_array(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE TABLE t(x INT)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let mut rows = conn.query("SELECT array_agg(x) FROM t").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected row");
+    };
+    let row = rows.row().unwrap();
+    let Value::Text(array) = row.get_value(0) else {
+        panic!("expected text array, got {:?}", row.get_value(0));
+    };
+    assert_eq!(array.as_str(), "{1,2,3}");
+}
+```
+
+Run: `cargo test -p core_tester --test integration_tests -- array_agg_plain_decodes_to_text_array`
+Expected: FAIL with `expected text array, got Blob(...)` — same root cause, confirming this isn't `ORDER BY`-specific.
+
+- [ ] **Step 3: Fix `ungrouped_agg_can_emit_inline_result` to bail out when any result column is array-typed**
+
+```rust
+// core/translate/aggregation.rs — before (lines 30-52)
+fn ungrouped_agg_can_emit_inline_result(plan: &SelectPlan, t_ctx: &TranslateCtx<'_>) -> bool {
+    if !matches!(plan.query_destination, QueryDestination::ResultRows) {
+        return false;
+    }
+    if plan.limit.is_some() || t_ctx.reg_offset.is_some() {
+        return false;
+    }
+    if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
+        return false;
+    }
+    if plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty() || gb.having.as_ref().is_some_and(|h| !h.is_empty()))
+    {
+        return false;
+    }
+    plan.result_columns.iter().all(|rc| {
+        plan.aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, &rc.expr))
+    })
+}
+```
+
+```rust
+// core/translate/aggregation.rs — after
+fn ungrouped_agg_can_emit_inline_result(plan: &SelectPlan, t_ctx: &TranslateCtx<'_>) -> bool {
+    if !matches!(plan.query_destination, QueryDestination::ResultRows) {
+        return false;
+    }
+    if plan.limit.is_some() || t_ctx.reg_offset.is_some() {
+        return false;
+    }
+    if matches!(plan.distinctness, Distinctness::Distinct { .. }) {
+        return false;
+    }
+    if plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty() || gb.having.as_ref().is_some_and(|h| !h.is_empty()))
+    {
+        return false;
+    }
+    // The inline fast path emits Copy+ResultRow directly and skips
+    // result_row::emit_array_decode_for_results(), which is what converts an
+    // array-typed aggregate's internal Blob payload into PG's `{...}` text
+    // form. Bail out to the slower-but-correct emit_select_result() path
+    // whenever a result column would need that decode step.
+    if plan
+        .result_columns
+        .iter()
+        .any(|rc| super::expr::expr_is_array(&rc.expr, Some(&plan.table_references)))
+    {
+        return false;
+    }
+    plan.result_columns.iter().all(|rc| {
+        plan.aggregates
+            .iter()
+            .any(|agg| exprs_are_equivalent(&agg.original_expr, &rc.expr))
+    })
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `cargo test -p core_tester --test integration_tests -- aggregate_order_by array_agg_plain_decodes_to_text_array`
+Expected: PASS (4 tests: `test_postgres_aggregate_order_by`, `_mvcc`, `test_postgres_array_agg_plain_decodes_to_text_array`, `_mvcc`).
+
+- [ ] **Step 5: Regression-check the fast path is still taken for non-array ungrouped aggregates**
+
+Run: `cargo test -p core_tester --test integration_tests integration::postgres -- --skip aggregate_order_by --skip array_agg_plain` then the broader `cargo test -p core_tester --test integration_tests` suite, to confirm no other ungrouped-aggregate test (`SUM`/`COUNT`/`AVG`/etc., which never match `expr_is_array`) regresses from this added bail-out — the change only removes eligibility for array-typed result columns, it does not alter behavior for any other case.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add core/translate/aggregation.rs tests/integration/postgres/dialect.rs
+git commit -S -m "fix(translate): decode array_agg to PG text array in ungrouped-aggregate fast path"
+```
+
+**Notes:**
+- This bug is **not** PG-dialect-branched the way D1/D2 are — `array_agg`'s array-typed result and the `ArrayDecode` instruction are core Turso infrastructure (used by more than just PG dialect), so there's no `SqlDialect::Postgres` check to add here; the fix is a straightforward gate-tightening in an existing optimizer fast path.
+- Confirmed via investigation this is unrelated to the 4 stale `fix/aggregate-order-by` git stashes present in this repo (`stash@{6,7,8,10}`) — those only add already-superseded `translator.rs` AST-level `ORDER BY` wiring for `agg_order`, which is already present in current `master`/this branch (`parser_pg/src/translator.rs:3329`). None of those stashes touch `core/translate/aggregation.rs` or the `ArrayDecode` path where this bug actually lives.
+- Do not widen scope to add `ArrayDecode` support to `emit_ungrouped_agg_inline_result` itself (i.e., don't try to make the fast path handle arrays too) — falling back to the already-correct `emit_select_result` path is simpler, safer, and the array-aggregate case is not the hot path this optimization exists for.
+
+---
+
 ### Workstream D sequencing notes
 
 1. Tasks D1 and D2 are fully independent — different files/regions (`value.rs`+`execute.rs`'s LIKE path vs. `execute.rs`'s divide op + `pg_server.rs`'s SQLSTATE map). Assign to two engineers, any order, no coordination needed. (H6, the third semantics finding originally considered for this workstream, is implemented in Workstream B's Task B11 instead — see the note at the top of this workstream.)
 2. D2's `cli/pg_server.rs:classify_constraint_sqlstate` edit is textually close to nothing else touched by Workstream A or C in this plan — confirmed no overlapping line ranges with Workstream A's Task A9/A10 edits (different functions) or Workstream C's tasks (different file region entirely, `pg_dispatch.rs` vs `pg_server.rs`).
-3. **Findings explicitly NOT specced in this workstream** (feature gaps, not silent-correctness regressions — each needs its own two-plan-rule follow-up per CLAUDE.md, not a task here): `CREATE SEQUENCE`/`nextval`/`currval`/`setval` support, full `TIMESTAMPTZ` timezone semantics (`AT TIME ZONE`, session `TimeZone` GUC, offset-aware storage), advisory locks (`pg_advisory_lock` family), and `INT4` 32-bit range enforcement. Each requires either a new Turso-core primitive (sequence object type, timezone-aware temporal type, session-scoped lock registry) or a deliberate scope decision (extending the `smallint`-style CHECK-based custom-type pattern to `int4`, and its performance/compatibility tradeoff for a widely-used base type). Scope each as a Turso-core plan (no PostgreSQL framing) paired with a separate pgmicro plan, per CLAUDE.md's "two-plan rule" — do not fold into this bug-fix plan.
+3. Task D3 is independent of D1/D2 — different file (`core/translate/aggregation.rs`, not touched by either), different bug class (fast-path optimizer gate, not dialect-branched value semantics). Newly discovered during Workstream E execution, not from the original quality review; schedule any time after D1/D2 or in parallel.
+4. **Findings explicitly NOT specced in this workstream** (feature gaps, not silent-correctness regressions — each needs its own two-plan-rule follow-up per CLAUDE.md, not a task here): `CREATE SEQUENCE`/`nextval`/`currval`/`setval` support, full `TIMESTAMPTZ` timezone semantics (`AT TIME ZONE`, session `TimeZone` GUC, offset-aware storage), advisory locks (`pg_advisory_lock` family), and `INT4` 32-bit range enforcement. Each requires either a new Turso-core primitive (sequence object type, timezone-aware temporal type, session-scoped lock registry) or a deliberate scope decision (extending the `smallint`-style CHECK-based custom-type pattern to `int4`, and its performance/compatibility tradeoff for a widely-used base type). Scope each as a Turso-core plan (no PostgreSQL framing) paired with a separate pgmicro plan, per CLAUDE.md's "two-plan rule" — do not fold into this bug-fix plan.
 
 ---
 
