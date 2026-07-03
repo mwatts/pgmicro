@@ -7216,7 +7216,7 @@ pub fn op_function(
                 } else {
                     " ".to_string()
                 };
-                state.registers[*dest].set_value(exec_lpad(input, length, &fill));
+                state.registers[*dest].set_value(exec_lpad(input, length, &fill)?);
             }
             ScalarFunc::Rpad => {
                 let input = state.registers[*start_reg].get_value();
@@ -7232,7 +7232,7 @@ pub fn op_function(
                 } else {
                     " ".to_string()
                 };
-                state.registers[*dest].set_value(exec_rpad(input, length, &fill));
+                state.registers[*dest].set_value(exec_rpad(input, length, &fill)?);
             }
             ScalarFunc::Gcd => {
                 let a = state.registers[*start_reg]
@@ -7262,7 +7262,7 @@ pub fn op_function(
                     .get_value()
                     .as_int()
                     .unwrap_or(0);
-                state.registers[*dest].set_value(exec_repeat(input, count));
+                state.registers[*dest].set_value(exec_repeat(input, count)?);
             }
             ScalarFunc::ToChar => {
                 let value = state.registers[*start_reg].get_value();

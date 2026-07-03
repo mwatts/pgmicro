@@ -118,26 +118,42 @@ pub fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
     Value::build_text(type_name)
 }
 
-pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Value {
+/// PostgreSQL's varlena MaxAllocSize (1GB - 1 byte). repeat()/lpad()/rpad()
+/// raise "requested length too large" instead of allocating past this.
+const PG_MAX_STRING_LEN: usize = 1_073_741_823;
+
+fn check_pg_string_length(len: usize) -> Result<(), LimboError> {
+    if len > PG_MAX_STRING_LEN {
+        return Err(LimboError::InvalidArgument(
+            "requested length too large".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Result<Value, LimboError> {
+    check_pg_string_length(length)?;
     let s = match input {
         Value::Text(t) => t.to_string(),
-        Value::Null => return Value::Null,
+        Value::Null => return Ok(Value::Null),
         v => v.to_string(),
     };
     let char_count = s.chars().count();
     if char_count >= length {
-        Value::build_text(s.chars().take(length).collect::<String>())
+        Ok(Value::build_text(
+            s.chars().take(length).collect::<String>(),
+        ))
     } else {
         let fill_chars: Vec<char> = fill.chars().collect();
         if fill_chars.is_empty() {
-            Value::build_text(s)
+            Ok(Value::build_text(s))
         } else {
             let pad: String = fill_chars
                 .iter()
                 .cycle()
                 .take(length - char_count)
                 .collect();
-            Value::build_text(format!("{pad}{s}"))
+            Ok(Value::build_text(format!("{pad}{s}")))
         }
     }
 }
@@ -173,16 +189,21 @@ pub fn exec_lcm(a: i64, b: i64) -> Result<Value, LimboError> {
 }
 
 /// Repeat a string n times.
-pub fn exec_repeat(input: &Value, count: i64) -> Value {
+pub fn exec_repeat(input: &Value, count: i64) -> Result<Value, LimboError> {
     let s = match input {
         Value::Text(t) => t.as_str(),
-        Value::Null => return Value::Null,
-        _ => return Value::Null,
+        Value::Null => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
     };
     if count <= 0 {
-        return Value::build_text(String::new());
+        return Ok(Value::build_text(String::new()));
     }
-    Value::build_text(s.repeat(count as usize))
+    let total_len = s
+        .len()
+        .checked_mul(count as usize)
+        .ok_or_else(|| LimboError::InvalidArgument("requested length too large".to_string()))?;
+    check_pg_string_length(total_len)?;
+    Ok(Value::build_text(s.repeat(count as usize)))
 }
 
 /// Simplified to_char: formats a number with the given format pattern.
@@ -331,26 +352,29 @@ pub fn exec_least<'a, T: Iterator<Item = &'a Value>>(args: T) -> Value {
     Value::exec_min(args)
 }
 
-pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Value {
+pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Result<Value, LimboError> {
+    check_pg_string_length(length)?;
     let s = match input {
         Value::Text(t) => t.to_string(),
-        Value::Null => return Value::Null,
+        Value::Null => return Ok(Value::Null),
         v => v.to_string(),
     };
     let char_count = s.chars().count();
     if char_count >= length {
-        Value::build_text(s.chars().take(length).collect::<String>())
+        Ok(Value::build_text(
+            s.chars().take(length).collect::<String>(),
+        ))
     } else {
         let fill_chars: Vec<char> = fill.chars().collect();
         if fill_chars.is_empty() {
-            Value::build_text(s)
+            Ok(Value::build_text(s))
         } else {
             let pad: String = fill_chars
                 .iter()
                 .cycle()
                 .take(length - char_count)
                 .collect();
-            Value::build_text(format!("{s}{pad}"))
+            Ok(Value::build_text(format!("{s}{pad}")))
         }
     }
 }
@@ -414,5 +438,31 @@ mod tests {
             exec_lcm(i64::MIN, -1),
             Err(LimboError::IntegerOverflow)
         ));
+    }
+
+    #[test]
+    fn repeat_rejects_oversized_result() {
+        let err = exec_repeat(&Value::build_text("x"), 2_000_000_000).unwrap_err();
+        assert!(matches!(err, LimboError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn lpad_rejects_oversized_length() {
+        let err = exec_lpad(&Value::build_text("x"), 2_000_000_000, " ").unwrap_err();
+        assert!(matches!(err, LimboError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn rpad_rejects_oversized_length() {
+        let err = exec_rpad(&Value::build_text("x"), 2_000_000_000, " ").unwrap_err();
+        assert!(matches!(err, LimboError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn repeat_still_works_under_cap() {
+        assert_eq!(
+            exec_repeat(&Value::build_text("ab"), 3).unwrap(),
+            Value::build_text("ababab")
+        );
     }
 }
