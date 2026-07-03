@@ -4816,6 +4816,9 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
+                // PG's bare NUMERIC is unbounded precision; Turso's numeric custom type
+                // requires a fixed precision/scale. (38, 19) is a deliberate approximation
+                // (matches common RDBMS defaults), not a bug — see EVALUATION.md / this note.
                 _ => Some(PgTypeMapping::with_params("numeric", vec![38, 19])),
             };
         }
