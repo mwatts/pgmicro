@@ -4998,37 +4998,28 @@ fn is_pg_temporal_candidate(node: &pg_query::protobuf::Node) -> bool {
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to Turso custom types or base SQLite storage types.
 fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
-    let pg_type = pg_typename_base(type_name)?;
+    // `pg_typename_base` doesn't carry array dimensions (they live on `array_bounds`,
+    // not `names`); use `extract_type_name_from_typename` instead, which appends the
+    // `[]` suffix `map_pg_type` expects (matching the column-DDL call sites below).
+    let pg_type = extract_type_name_from_typename(type_name).ok()?;
+    let typmods = extract_typmods_from_type_name(type_name);
+    let mapping = map_pg_type(&pg_type, &typmods)?;
 
-    let name = match pg_type.as_str() {
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "BIGSERIAL" | "SMALLSERIAL" | "OID"
-        | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "SMALLINT" | "INT2" => "smallint",
-        "BIGINT" | "INT8" => "bigint",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" => "REAL",
-        "BOOLEAN" | "BOOL" => "boolean",
-        "UUID" => "uuid",
-        "DATE" => "date",
-        "TIME" | "TIMETZ" => "time",
-        "TIMESTAMP" => "timestamp",
-        "TIMESTAMPTZ" => "timestamptz",
-        "INTERVAL" => "interval",
-        "MONEY" => "money",
-        "INET" => "inet",
-        "JSON" => "json",
-        "JSONB" => "jsonb",
-        "CIDR" => "cidr",
-        "MACADDR" => "macaddr",
-        "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "XML" | "BIT" | "VARBIT" | "TSVECTOR"
-        | "TSQUERY" => "TEXT",
-        "BYTEA" | "BLOB" => "BLOB",
-        _ => return None,
+    let size = match mapping.type_params.as_slice() {
+        [p, s] => Some(ast::TypeSize::TypeSize(
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
+            Box::new(ast::Expr::Literal(ast::Literal::Numeric(s.to_string()))),
+        )),
+        [n] => Some(ast::TypeSize::MaxSize(Box::new(ast::Expr::Literal(
+            ast::Literal::Numeric(n.to_string()),
+        )))),
+        _ => None,
     };
 
     Some(ast::Type {
-        name: name.to_string(),
-        size: None,
-        array_dimensions: 0,
+        name: mapping.type_name,
+        size,
+        array_dimensions: mapping.array_dimensions,
     })
 }
 
@@ -5091,15 +5082,12 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
     Ok(name)
 }
 
-/// Extract integer type modifiers from a column definition.
+/// Extract integer type modifiers from a `TypeName` node's `typmods` list.
 /// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
-fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
+fn extract_typmods_from_type_name(type_name: &pg_query::protobuf::TypeName) -> Vec<i64> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
 
-    let Some(type_name) = &col_def.type_name else {
-        return vec![];
-    };
     type_name
         .typmods
         .iter()
@@ -5112,6 +5100,16 @@ fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> 
             _ => None,
         })
         .collect()
+}
+
+/// Extract integer type modifiers from a column definition.
+/// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
+fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
+    col_def
+        .type_name
+        .as_ref()
+        .map(extract_typmods_from_type_name)
+        .unwrap_or_default()
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
@@ -9146,5 +9144,65 @@ mod tests {
         let parsed = crate::parse(sql).unwrap();
         let err = translator.translate(&parsed).unwrap_err();
         assert!(matches!(err, ParseError::ParseError(_)));
+    }
+
+    #[test]
+    fn test_cast_to_unmapped_enum_type_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT status::my_enum_type FROM orders";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let ast::Expr::Cast { type_name, .. } = &**expr {
+                        let ty = type_name.as_ref().expect(
+                            "CAST to unknown/user-defined type must not be silently dropped",
+                        );
+                        assert_eq!(ty.name, "my_enum_type");
+                    } else {
+                        panic!("Expected Cast expression, got {expr:?}");
+                    }
+                } else {
+                    panic!("Expected expr result column");
+                }
+            }
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_cast_preserves_varchar_length_and_array_dims() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT name::varchar(3), tags::integer[] FROM t";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
+                    if let ast::Expr::Cast { type_name, .. } = &**expr {
+                        let ty = type_name.as_ref().expect("varchar(3) cast type dropped");
+                        assert!(ty.size.is_some(), "varchar(3) length param was dropped");
+                    } else {
+                        panic!("Expected Cast expression, got {expr:?}");
+                    }
+                }
+                if let ast::ResultColumn::Expr(expr, _) = &columns[1] {
+                    if let ast::Expr::Cast { type_name, .. } = &**expr {
+                        let ty = type_name.as_ref().expect("integer[] cast type dropped");
+                        assert_eq!(ty.array_dimensions, 1, "array dimension was dropped");
+                    } else {
+                        panic!("Expected Cast expression, got {expr:?}");
+                    }
+                }
+            } else {
+                panic!("Expected OneSelect::Select");
+            }
+        } else {
+            panic!("Expected Select");
+        }
     }
 }
