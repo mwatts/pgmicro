@@ -63,7 +63,12 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
-        let mapped_name = self.map_table_name(&range_var.relname);
+        let schema_lower = range_var.schemaname.to_lowercase();
+        let mapped_name = if schema_lower == "information_schema" {
+            Self::map_information_schema_table(&range_var.relname)
+        } else {
+            self.map_table_name(&range_var.relname)
+        };
         let name = ast::Name::from_string(mapped_name);
         let alias = range_var
             .alias
@@ -72,7 +77,7 @@ impl PostgreSQLTranslator {
             .map(|a| ast::Name::from_string(&a.aliasname));
         let mut qn = if range_var.schemaname.is_empty()
             || matches!(
-                range_var.schemaname.to_lowercase().as_str(),
+                schema_lower.as_str(),
                 "pg_catalog" | "public" | "information_schema"
             ) {
             ast::QualifiedName::single(name)
@@ -82,6 +87,15 @@ impl PostgreSQLTranslator {
         };
         qn.alias = alias;
         qn
+    }
+
+    /// Maps `information_schema.<table>` names to their SQLite equivalents.
+    fn map_information_schema_table(table_name: &str) -> String {
+        match table_name.to_lowercase().as_str() {
+            "tables" => "sqlite_master".to_string(),
+            "columns" => "pragma_table_info".to_string(),
+            _ => table_name.to_string(),
+        }
     }
 
     /// Maps PostgreSQL system table names to their Turso equivalents.
@@ -116,8 +130,6 @@ impl PostgreSQLTranslator {
             | "pg_publication_rel"
             | "pg_get_tabledef"
             | "pg_tables" => table_name.to_string(),
-            "information_schema.tables" => "sqlite_master".to_string(),
-            "information_schema.columns" => "pragma_table_info".to_string(),
             // Default: keep original name
             _ => table_name.to_string(),
         }
@@ -8651,5 +8663,47 @@ mod tests {
             err.to_string().contains("multi-table TRUNCATE"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_information_schema_tables_maps_to_sqlite_master() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM information_schema.tables";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { from, .. } = &select.body.select {
+                let from_clause = from.as_ref().expect("Expected FROM clause");
+                if let ast::SelectTable::Table(qualified_name, _, _) = &*from_clause.select {
+                    assert_eq!(qualified_name.name.as_str(), "sqlite_master");
+                } else {
+                    panic!("Expected table reference");
+                }
+            }
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_information_schema_columns_maps_to_pragma_table_info() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM information_schema.columns";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { from, .. } = &select.body.select {
+                let from_clause = from.as_ref().expect("Expected FROM clause");
+                if let ast::SelectTable::Table(qualified_name, _, _) = &*from_clause.select {
+                    assert_eq!(qualified_name.name.as_str(), "pragma_table_info");
+                } else {
+                    panic!("Expected table reference");
+                }
+            }
+        } else {
+            panic!("Expected Select");
+        }
     }
 }
