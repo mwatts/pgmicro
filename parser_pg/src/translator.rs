@@ -328,6 +328,7 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
 
+        let mut check_exprs: Vec<ast::Expr> = Vec::new();
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
@@ -344,6 +345,11 @@ impl PostgreSQLTranslator {
                 }
                 ConstrType::ConstrForeign => {
                     foreign_key = extract_foreign_key(constraint);
+                }
+                ConstrType::ConstrCheck => {
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        check_exprs.push(self.translate_expr(raw_expr)?);
+                    }
                 }
                 _ => {}
             }
@@ -421,6 +427,14 @@ impl PostgreSQLTranslator {
                     clause,
                     defer_clause: None,
                 },
+            });
+        }
+
+        // CHECK
+        for expr in check_exprs {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Check(Box::new(expr)),
             });
         }
 
@@ -6014,6 +6028,33 @@ mod tests {
             }
         } else {
             panic!("expected CreateTable, got {stmt:?}");
+        }
+    }
+
+    #[test]
+    fn test_column_check_constraint_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t (age INTEGER CHECK (age >= 0))";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        } = translated
+        {
+            let col = &columns[0];
+            let has_check = col
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Check(_)));
+            assert!(
+                has_check,
+                "CHECK constraint was dropped: {:?}",
+                col.constraints
+            );
+        } else {
+            panic!("Expected CreateTable");
         }
     }
 
