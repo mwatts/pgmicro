@@ -788,33 +788,38 @@ impl PgAttributeCursor {
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
+                let (attlen, attbyval, attalign) = PG_BASE_TYPES
+                    .iter()
+                    .find(|t| t.oid == type_oid)
+                    .map(|t| (t.typlen, t.typbyval, t.typalign))
+                    .unwrap_or((-1, false, "i")); // unknown/array/enum: varlena, pass-by-reference
 
                 self.rows.push(vec![
-                    Value::from_i64(table_oid),   // attrelid
-                    Value::Text(col_name.into()), // attname
-                    Value::from_i64(type_oid),    // atttypid
-                    Value::from_i64(-1),          // attstattarget
-                    Value::from_i64(-1),          // attlen
-                    Value::from_i64(attnum),      // attnum
-                    Value::from_i64(0),           // attndims
-                    Value::from_i64(-1),          // attcacheoff
-                    Value::from_i64(atttypmod),   // atttypmod
-                    Value::from_i64(1),           // attbyval
-                    Value::Text("p".into()),      // attstorage (plain)
-                    Value::Text("i".into()),      // attalign (int)
-                    Value::from_i64(notnull),     // attnotnull
-                    Value::from_i64(has_def),     // atthasdef
-                    Value::from_i64(0),           // atthasmissing
-                    Value::Text("".into()),       // attidentity
-                    Value::Text("".into()),       // attgenerated
-                    Value::from_i64(0),           // attisdropped
-                    Value::from_i64(1),           // attislocal
-                    Value::from_i64(0),           // attinhcount
-                    Value::from_i64(0),           // attcollation
-                    Value::Null,                  // attacl
-                    Value::Null,                  // attoptions
-                    Value::Null,                  // attfdwoptions
-                    Value::Null,                  // attmissingval
+                    Value::from_i64(table_oid),           // attrelid
+                    Value::Text(col_name.into()),         // attname
+                    Value::from_i64(type_oid),            // atttypid
+                    Value::from_i64(-1),                  // attstattarget
+                    Value::from_i64(attlen),              // attlen
+                    Value::from_i64(attnum),              // attnum
+                    Value::from_i64(0),                   // attndims
+                    Value::from_i64(-1),                  // attcacheoff
+                    Value::from_i64(atttypmod),           // atttypmod
+                    Value::from_i64(i64::from(attbyval)), // attbyval
+                    Value::Text("p".into()),              // attstorage (plain)
+                    Value::Text(attalign.into()),         // attalign
+                    Value::from_i64(notnull),             // attnotnull
+                    Value::from_i64(has_def),             // atthasdef
+                    Value::from_i64(0),                   // atthasmissing
+                    Value::Text("".into()),               // attidentity
+                    Value::Text("".into()),               // attgenerated
+                    Value::from_i64(0),                   // attisdropped
+                    Value::from_i64(1),                   // attislocal
+                    Value::from_i64(0),                   // attinhcount
+                    Value::from_i64(0),                   // attcollation
+                    Value::Null,                          // attacl
+                    Value::Null,                          // attoptions
+                    Value::Null,                          // attfdwoptions
+                    Value::Null,                          // attmissingval
                 ]);
             }
         }

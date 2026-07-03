@@ -1039,6 +1039,37 @@ fn test_pg_attribute_atttypmod(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_attribute_varlena_columns_not_byval(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT attlen, attbyval, attalign FROM pg_attribute
+             JOIN pg_class c ON c.oid = attrelid
+             WHERE c.relname = 't' AND attname = 'name'",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            assert_eq!(
+                row.get_value(0).as_int(),
+                Some(-1),
+                "text is varlena, attlen must be -1"
+            );
+            assert_eq!(
+                row.get_value(1).as_int(),
+                Some(0),
+                "text is pass-by-reference, attbyval must be false"
+            );
+        }
+        _ => panic!("column 'name' not found in pg_attribute"),
+    }
+}
+
+#[turso_macros::test]
 fn test_pg_create_table_columns_in_pg_attribute(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
