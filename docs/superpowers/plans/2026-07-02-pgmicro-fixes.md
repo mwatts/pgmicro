@@ -1813,6 +1813,13 @@ git commit -S -m "fix(translator): preserve GENERATED ... STORED columns, reject
 
 **Two-plan note:** real `GENERATED ... AS IDENTITY` support needs (1) a Turso-core plan for a generic column-level identity/sequence feature with no mention of Postgres, then (2) a pgmicro plan wiring `ConstrIdentity` to it. Not scheduled here.
 
+**Superseded:** the Turso-core plan is written —
+`docs/superpowers/plans/2026-07-03-turso-core-sequences.md` (merged with the
+`CREATE SEQUENCE`/`nextval`/`currval`/`setval` item further below, since
+both need the same underlying sequence-object-type primitive). The pgmicro
+follow-up plan wiring `ConstrIdentity` to it is not yet written — do it once
+the core plan lands.
+
 ---
 
 ### Task B3: Bring ALTER TABLE ADD COLUMN to parity via a shared constraint-translation helper (H9)
@@ -3059,6 +3066,21 @@ git commit -S -m "fix(translator): DROP a, b, c drops every object not just the 
 
 **Notes:** `ast::Stmt::Drop*` variants (`DropTable`/`DropIndex`/`DropView`/`DropType`/`DropDomain`, `parser/src/ast.rs:235-275`) have no CASCADE representation — real cascading-drop support needs new AST + core support and is a two-plan candidate, not scheduled here. RESTRICT (PG's default) needs no special handling since it's the existing behavior.
 
+**Superseded:** the Turso-core plan is written —
+`docs/superpowers/plans/2026-07-03-turso-core-cascading-drop.md`. It found
+the "RESTRICT (PG's default) needs no special handling since it's the
+existing behavior" claim above is **wrong**: `validate_drop_table`
+(`core/translate/schema.rs:1734-1754`) only checks system-table protection
+and materialized-view redirection — it does not check whether any view
+references the table being dropped. Today, `DROP TABLE t` where a view
+selects from `t` succeeds unconditionally and leaves a dangling view behind,
+where real PostgreSQL refuses by default with
+`ERROR: cannot drop table t because other objects depend on it`. Fixing this
+RESTRICT-by-default gap is flagged in that plan as arguably higher priority
+than CASCADE itself, since it's a silently-wrong-today correctness bug, not
+just a missing feature. The pgmicro-side plan (parsing `CASCADE`/`RESTRICT`
+keywords, wiring to the new core primitive) is not yet written.
+
 ---
 
 ### Task B13: Reject `ON CONFLICT ON CONSTRAINT name` instead of silently broadening to an unqualified upsert (H10)
@@ -3502,6 +3524,23 @@ git commit -S -m "fix(translator): DROP SCHEMA a, b, c extracts every schema nam
 
 **Critical:** do not land the parser_pg rename before `pg_contains`/`pg_overlaps` exist in core, or every existing array `@>`/`<@`/`&&` query breaks. Two-plan candidate per CLAUDE.md: (1) a Turso-core plan for polymorphic containment functions, self-justifying with no mention of Postgres, (2) a pgmicro plan for this rename once the core functions land.
 
+**Superseded — the rename above is unnecessary, do not implement it.** The two
+plans are written:
+`docs/superpowers/plans/2026-07-03-turso-core-json-containment.md` (Turso-core
+side) and `docs/superpowers/plans/2026-07-03-pgmicro-json-containment-followup.md`
+(pgmicro side). Investigation while writing them found
+`parser_pg/src/translator.rs:2936-2953` **already** maps `@>`/`<@` to
+`array_contains_all` and `&&` to `array_overlap` — the same function names
+this task's "reference translation" proposes renaming to. The translator was
+never wrong about which function to call; `array_contains_all` itself just
+doesn't handle JSON/JSONB input yet. The actual fix is extending
+`array_contains_all` (core-side only) to detect and recursively compare
+JSON/JSONB values — see the core plan for the exact containment semantics,
+including a non-obvious top-level-only scalar-in-array exception verified
+against real PG behavior. `&&` has no real-PG meaning for jsonb at all
+(documented as a gap, not fixed, in the pgmicro follow-up — no operator
+exists in real Postgres for jsonb `&&`).
+
 ---
 
 ### Task B17: Reject `DELETE ... USING` instead of silently ignoring the join filter (H8)
@@ -3512,6 +3551,20 @@ git commit -S -m "fix(translator): DROP SCHEMA a, b, c extracts every schema nam
 **Current bug severity:** silently ignoring `USING` means the DELETE runs with only the `WHERE` clause and no join filter — it can delete far more rows than intended. E.g. `DELETE FROM t USING u WHERE t.id = u.id AND u.flag = true` currently deletes **every row of `t`**, since `u.flag` and the join condition vanish. This is a data-loss-risk bug, so the minimal safe fix is outright rejection, not a partial rewrite.
 
 **Cross-file note:** real support is a two-plan candidate — `ast::Stmt::Delete` (`parser/src/ast.rs:213-228`) has no `from`/`using` field (confirmed via grep: only `with`, `tbl_name`, `indexed`, `where_clause`, `returning`, `order_by`, `limit`), and SQLite has no native multi-table DELETE, so real support needs a new AST field plus core VDBE-level join support for DELETE that does not exist today. Not achievable purely in parser_pg — not scheduled here.
+
+**Superseded:** the Turso-core plan is written —
+`docs/superpowers/plans/2026-07-03-turso-core-join-delete.md`. It identifies
+`UPDATE ... FROM` (already shipped, `core/translate/update.rs`,
+`core/translate/emitter/update.rs`) as the direct architectural precedent —
+`DeletePlan` should gain the same `from_tables`/`write_set_plan` fields as
+`UpdatePlan`. It also surfaces a real bug in the **existing, shipped**
+`UPDATE ... FROM` code as a prerequisite fix: the write-set scratch table
+populated in `emitter/update.rs:90-166` is unkeyed/ungrouped, so a target row
+with N join matches produces N scratch rows — silently harmless for UPDATE
+today, but would multiply `RETURNING` rows for the new DELETE...USING
+feature and diverges from PostgreSQL's one-row-per-target-row DELETE
+semantics. The pgmicro-side plan (parsing `USING`, wiring to the new core
+fields) is not yet written.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3933,6 +3986,17 @@ git commit -S -m "fix(translator): CREATE OR REPLACE VIEW emits DROP+CREATE; rej
 ```
 
 **Notes:** Real `WITH NO DATA` support needs a Turso-core plan for an "unpopulated matview" state plus a corresponding `REFRESH MATERIALIZED VIEW` to populate it — today `is_refresh_matview` (translator.rs:5117) treats REFRESH as a no-op since Turso matviews are always live; that assumption would need to change too. Not scheduled here.
+
+**Superseded:** the Turso-core plan is written —
+`docs/superpowers/plans/2026-07-03-turso-core-unpopulated-matview.md`. It
+found `CreateMaterializedView` is already native Turso grammar
+(`parser/src/parser.rs:837`), so `WITH NO DATA`/`REFRESH MATERIALIZED VIEW`
+add as new Turso-native keywords/AST rather than PG-only syntax; population
+state is tracked via a new `Schema::unpopulated_views` set mirroring the
+existing `incompatible_views` pattern. `CONCURRENTLY` is explicitly excluded
+(no reusable diff/temp-table primitive exists today — flagged as genuinely
+new engineering, not a small addition). The pgmicro-side plan (parsing
+`WITH NO DATA`, wiring the REFRESH statement) is not yet written.
 
 ---
 
@@ -7196,6 +7260,35 @@ git commit -S -m "fix(translate): decode array_agg to PG text array in ungrouped
 3. Task D3 is independent of D1/D2 — different file (`core/translate/aggregation.rs`, not touched by either), different bug class (fast-path optimizer gate, not dialect-branched value semantics). Newly discovered during Workstream E execution, not from the original quality review; schedule any time after D1/D2 or in parallel.
 4. **Findings explicitly NOT specced in this workstream** (feature gaps, not silent-correctness regressions — each needs its own two-plan-rule follow-up per CLAUDE.md, not a task here): `CREATE SEQUENCE`/`nextval`/`currval`/`setval` support, full `TIMESTAMPTZ` timezone semantics (`AT TIME ZONE`, session `TimeZone` GUC, offset-aware storage), advisory locks (`pg_advisory_lock` family), and `INT4` 32-bit range enforcement. Each requires either a new Turso-core primitive (sequence object type, timezone-aware temporal type, session-scoped lock registry) or a deliberate scope decision (extending the `smallint`-style CHECK-based custom-type pattern to `int4`, and its performance/compatibility tradeoff for a widely-used base type). Scope each as a Turso-core plan (no PostgreSQL framing) paired with a separate pgmicro plan, per CLAUDE.md's "two-plan rule" — do not fold into this bug-fix plan.
 
+   **Superseded — all four Turso-core plans are written:**
+   - `CREATE SEQUENCE`/`nextval`/`currval`/`setval`: `docs/superpowers/plans/2026-07-03-turso-core-sequences.md`
+     (also covers `GENERATED ... AS IDENTITY` from Task B2/line 1814 above — same
+     primitive). Flags the durable non-transactional advancement mechanism
+     `nextval` requires as genuinely new engineering ground with no precedent in
+     `core/storage/` today.
+   - `TIMESTAMPTZ` timezone semantics: `docs/superpowers/plans/2026-07-03-turso-core-timezone.md`,
+     plus an (unrequested but kept) pgmicro-side follow-up at
+     `docs/superpowers/plans/2026-07-03-pgmicro-timezone-followup.md`. Root
+     finding: today's `timestamptz` custom type (`core/schema.rs:685`) is
+     byte-for-byte identical to plain `timestamp` (`core/schema.rs:684`) — it has
+     never had timezone-specific behavior.
+   - Advisory locks: `docs/superpowers/plans/2026-07-03-turso-core-advisory-locks.md`.
+     The core registry has no dependency on Workstream A, but its pgmicro
+     follow-up (not yet written) will: `cli/pg_server.rs` currently serves all
+     wire clients through one shared `Connection` (Task A3 unlanded), so wiring
+     `pg_advisory_lock`-family functions before that lands would make unrelated
+     `psql` sessions spuriously share locks.
+   - `INT4` 32-bit range enforcement: `docs/superpowers/plans/2026-07-03-turso-core-int32-overflow.md`.
+     Turned out cheaper than the CHECK-based framing above assumed: `int4` has
+     no custom type at all today (maps to raw `INTEGER`,
+     `translator.rs:4853`), and Turso already has a generic translate-time
+     custom-type `OPERATOR` dispatch mechanism (`expr.rs:8228`, used today by
+     `numeric`/`money`) that this can reuse — no new `Value` variant, no VDBE
+     change.
+
+   Each core plan's pgmicro-side follow-up (except timezone's, already written)
+   remains to be written once its core plan lands.
+
 ---
 
 ## Workstream F — REPL/Packaging
@@ -7435,6 +7528,20 @@ git commit -S -m "fix(repl): \\d/\\d+ strip and unescape quoted identifiers inst
 - Test: `pgmicro/tests/pgmicro.rs`
 
 **Root cause (do not attempt to fix here):** `core/util.rs:121-125`'s `normalize_ident()` unconditionally lowercases every identifier for both the SQLite and Postgres dialects — it has no concept of PG's quoted-vs-unquoted distinction. Table storage identity is keyed off this normalized name, so `"Foo"` and `foo` collide by construction. Fixing that is a real engine change (per CLAUDE.md's "two-plan rule": a Turso-core plan with no PG mention, then a pgmicro plan on top) — **out of scope for this task**. This task only makes the resulting error message honest about *why* the collision happened.
+
+**Superseded:** the Turso-core plan is written —
+`docs/superpowers/plans/2026-07-03-turso-core-identifier-case.md`. Key finding:
+the parser's `Name` AST already tracks quoting (`quote: Option<char>`), but
+`PartialEq`/`Hash` ignore it by design (intentional SQLite case-insensitive
+semantics), and all 23 call sites into `normalize_ident()` pass a bare `&str`
+— quote info is dead before `normalize_ident` even runs, so the fix is deeper
+than that one function. The plan leaves the SQLite-vs-Postgres dialect
+conflict (SQLite must stay case-insensitive regardless of quoting; PG
+delimited-identifier semantics need fold-unless-quoted) as an explicit open
+decision between two approaches (dialect-threaded normalization vs. a
+parallel resolution path) rather than picking silently. The pgmicro-side
+plan (wiring dialect-aware normalization through the translator) is not yet
+written.
 
 **Interfaces:** None — self-contained to `core/translate/schema.rs`. Independent of every other Workstream F task. **This is a `core/` change** — flag for extra review/CI attention per CLAUDE.md's "minimize core/ changes."
 
