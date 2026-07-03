@@ -558,9 +558,9 @@ fn test_pg_constraint_unnamed_checks_get_distinct_conname(db: TempDatabase) {
         }
     }
     assert_eq!(
-        names.len(),
-        2,
-        "two unnamed CHECK constraints must not collide on conname, got {names:?}"
+        names,
+        std::collections::HashSet::from(["t_check".to_string(), "t_check2".to_string()]),
+        "two unnamed CHECK constraints must get sequential disambiguated connames, got {names:?}"
     );
 }
 
