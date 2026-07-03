@@ -222,27 +222,74 @@ impl Connection {
         }
     }
 
-    /// Handle DROP SCHEMA in PostgreSQL mode.
+    /// Handle DROP SCHEMA in PostgreSQL mode. Supports comma-separated
+    /// schema lists (`DROP SCHEMA a, b`); each name is dropped independently
+    /// and in order (not atomic across names — see handle_pg_truncate for
+    /// the same pattern).
     /// For "public": drops all user tables from main DB.
-    /// For other schemas: drops all tables, then DETACHes.
+    /// For other schemas: enforces the same non-cascade-non-empty check as
+    /// "public" (C8), drops all tables when CASCADE, DETACHes, then deletes
+    /// the backing `turso-postgres-schema-<name>.db(-wal/-shm)` files so a
+    /// later CREATE SCHEMA of the same name starts empty instead of
+    /// resurrecting the old data.
     fn handle_pg_drop_schema(self: &Arc<Self>, stmt: &PgDropSchemaStmt) -> Result<()> {
-        let name = stmt.name.to_lowercase();
+        for name in &stmt.names {
+            self.drop_one_schema(name, stmt.if_exists, stmt.cascade)?;
+        }
+        Ok(())
+    }
+
+    fn drop_one_schema(self: &Arc<Self>, name: &str, if_exists: bool, cascade: bool) -> Result<()> {
+        let name = name.to_lowercase();
         validate_schema_name(&name)?;
         if name == "public" {
-            return self.handle_pg_drop_schema_public(stmt.cascade);
+            return self.handle_pg_drop_schema_public(cascade);
         }
         if !self.is_attached(&name) {
-            if stmt.if_exists {
+            if if_exists {
                 return Ok(());
             }
             return Err(LimboError::ParseError(format!(
                 "schema \"{name}\" does not exist"
             )));
         }
-        if stmt.cascade {
+        // Match the "public" schema's non-cascade-non-empty check: dropping
+        // a populated schema without CASCADE must error, not silently
+        // detach and leave the data reachable through a stale file.
+        let table_names = self.list_user_tables(Some(&name))?;
+        if !cascade && !table_names.is_empty() {
+            return Err(LimboError::ParseError(format!(
+                "cannot drop schema \"{name}\" because other objects depend on it"
+            )));
+        }
+        if cascade {
             self.drop_all_tables_in_schema(&name)?;
         }
-        self.detach_database(&name)
+        self.detach_database(&name)?;
+        // Only unlink after a successful detach, so a failed DROP SCHEMA
+        // never touches the file (mirrors the previous wire-only behavior
+        // tested by pgmicro/tests/pgmicro.rs::wire_drop_schema_keeps_file_on_failure).
+        self.unlink_schema_file(&name);
+        Ok(())
+    }
+
+    /// Delete the backing `.db`/`-wal`/`-shm` files for a detached schema.
+    /// No-op for in-memory main databases, which have no schema files.
+    /// Must be called only *after* `detach_database` has succeeded.
+    fn unlink_schema_file(&self, schema_name: &str) {
+        if self.db.path == ":memory:" {
+            return;
+        }
+        let path = std::path::PathBuf::from(self.schema_file_path(schema_name));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        // MVCC journal mode persists its logical log as `<db>-log` (see
+        // storage::journal_mode::logical_log_exists / open_mv_store). Leaving
+        // it behind makes the next CREATE SCHEMA of the same name see a
+        // logical log file next to a fresh WAL-mode header and fail with
+        // "MVCC logical log file exists ... database header indicates WAL mode".
+        let _ = std::fs::remove_file(path.with_extension("db-log"));
     }
 
     /// Drop all user tables in the main ("public") schema.
@@ -474,6 +521,15 @@ impl Connection {
     /// List user-visible table names in a schema.
     /// If schema_name is None, queries main DB's sqlite_schema.
     /// If schema_name is Some(name), queries name.sqlite_schema.
+    ///
+    /// Uses `StatementOrigin::Root` (not `prepare_internal`'s `InternalHelper`)
+    /// so the read transaction is fully finalized when this statement drops.
+    /// `InternalHelper` statements are nested and defer transaction cleanup to
+    /// an assumed parent Root statement; when this is the *only* statement run
+    /// against an attached schema DB (e.g. checking emptiness before a
+    /// non-cascade DROP SCHEMA), that assumption doesn't hold and the pager is
+    /// left holding a stale read lock, causing a subsequent `detach_database`
+    /// to fail with "database X is locked".
     fn list_user_tables(self: &Arc<Self>, schema_name: Option<&str>) -> Result<Vec<String>> {
         let filter =
             "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
@@ -481,15 +537,21 @@ impl Connection {
             Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
             None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
         };
-        let mut stmt = self.prepare_internal(&sql)?;
-        let rows = stmt.run_collect_rows()?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|row| match row.first() {
-                Some(Value::Text(t)) => Some(t.as_str().to_string()),
-                _ => None,
-            })
-            .collect())
+        let saved_dialect = self.get_sql_dialect();
+        self.set_sql_dialect(SqlDialect::Sqlite);
+        let result = (|| {
+            let mut stmt = self.prepare_with_origin(&sql, StatementOrigin::Root)?;
+            let rows = stmt.run_collect_rows()?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|row| match row.first() {
+                    Some(Value::Text(t)) => Some(t.as_str().to_string()),
+                    _ => None,
+                })
+                .collect())
+        })();
+        self.set_sql_dialect(saved_dialect);
+        result
     }
 
     fn default_pg_search_path() -> Vec<String> {

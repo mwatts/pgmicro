@@ -5271,7 +5271,9 @@ pub struct PgCreateSchemaStmt {
 
 #[derive(Debug, Clone)]
 pub struct PgDropSchemaStmt {
-    pub name: String,
+    /// Schema names to drop. Always non-empty. PG's `DROP SCHEMA a, b, c` shares one
+    /// `IF EXISTS`/`CASCADE` across all names, not per-name.
+    pub names: Vec<String>,
     pub if_exists: bool,
     pub cascade: bool,
 }
@@ -5378,19 +5380,28 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     if remove_type != ObjectType::ObjectSchema {
         return None;
     }
+    if drop.objects.is_empty() {
+        return None;
+    }
 
-    // Extract schema name from first object (String node)
-    let obj = drop.objects.first()?;
-    let obj_node = obj.node.as_ref()?;
-    let name = match obj_node.to_ref() {
-        NodeRef::String(s) => s.sval.clone(),
-        _ => return None,
-    };
+    let names: Vec<String> = drop
+        .objects
+        .iter()
+        .filter_map(|obj| match obj.node.as_ref()?.to_ref() {
+            NodeRef::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    if names.len() != drop.objects.len() {
+        // A non-String node in the list means something we don't understand — bail
+        // rather than silently dropping the un-parseable name.
+        return None;
+    }
 
     let cascade = DropBehavior::try_from(drop.behavior).ok() == Some(DropBehavior::DropCascade);
 
     Some(PgDropSchemaStmt {
-        name,
+        names,
         if_exists: drop.missing_ok,
         cascade,
     })
@@ -9204,5 +9215,25 @@ mod tests {
         } else {
             panic!("Expected Select");
         }
+    }
+
+    #[test]
+    fn test_drop_schema_multiple_names_extracted() {
+        let sql = "DROP SCHEMA a, b, c";
+        let parsed = crate::parse(sql).unwrap();
+        let stmt = try_extract_drop_schema(&parsed).expect("Should extract DROP SCHEMA");
+        assert_eq!(stmt.names, vec!["a", "b", "c"]);
+        assert!(!stmt.if_exists);
+        assert!(!stmt.cascade);
+    }
+
+    #[test]
+    fn test_drop_schema_single_name_still_works() {
+        let sql = "DROP SCHEMA IF EXISTS myschema CASCADE";
+        let parsed = crate::parse(sql).unwrap();
+        let stmt = try_extract_drop_schema(&parsed).expect("Should extract DROP SCHEMA");
+        assert_eq!(stmt.names, vec!["myschema"]);
+        assert!(stmt.if_exists);
+        assert!(stmt.cascade);
     }
 }

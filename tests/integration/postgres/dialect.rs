@@ -562,6 +562,78 @@ fn test_postgres_drop_schema_public_no_cascade_error(db: TempDatabase) {
     };
 }
 
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_schema_non_cascade_non_empty_error(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE SCHEMA dropme").unwrap();
+    conn.execute("CREATE TABLE dropme.t1 (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // DROP SCHEMA without CASCADE on a non-empty schema must error — matches
+    // the existing "public" schema behavior in
+    // test_postgres_drop_schema_public_no_cascade_error. Before the fix this
+    // silently succeeds and detaches without dropping/erroring.
+    let result = conn.execute("DROP SCHEMA dropme");
+    assert!(
+        result.is_err(),
+        "DROP SCHEMA without CASCADE on a non-empty schema should error, got {result:?}"
+    );
+
+    // The schema must still be usable (proves it was NOT silently detached).
+    conn.execute("INSERT INTO dropme.t1 (id) VALUES (1)")
+        .unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_schema_deletes_backing_file_and_data(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE SCHEMA s").unwrap();
+    conn.execute("CREATE TABLE s.t (x INTEGER)").unwrap();
+    conn.execute("INSERT INTO s.t VALUES (42)").unwrap();
+
+    let schema_file = db.path.parent().unwrap().join("turso-postgres-schema-s.db");
+    assert!(
+        schema_file.exists(),
+        "schema file should exist after CREATE SCHEMA"
+    );
+
+    conn.execute("DROP SCHEMA s CASCADE").unwrap();
+    assert!(
+        !schema_file.exists(),
+        "schema file must be deleted after DROP SCHEMA, found leftover {schema_file:?}"
+    );
+
+    // C8: recreating the schema must NOT resurrect the old table/data. Before
+    // the fix, the file was left on disk and silently reattached here.
+    conn.execute("CREATE SCHEMA s").unwrap();
+    let result = conn.query("SELECT * FROM s.t");
+    assert!(
+        result.is_err(),
+        "table from the dropped schema must not reappear in the recreated schema, got {result:?}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_drop_schema_multi_name(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = postgres").unwrap();
+
+    conn.execute("CREATE SCHEMA a").unwrap();
+    conn.execute("CREATE SCHEMA b").unwrap();
+
+    conn.execute("DROP SCHEMA a, b").unwrap();
+
+    // Both schemas must actually be gone — re-creating each must succeed,
+    // proving both were dropped, not just the first (the original bug: only
+    // "a" was dropped, "b" silently survived with no error).
+    conn.execute("CREATE SCHEMA a").unwrap();
+    conn.execute("CREATE SCHEMA b").unwrap();
+}
+
 // ==================== ALTER TABLE ====================
 
 #[turso_macros::test(mvcc)]
