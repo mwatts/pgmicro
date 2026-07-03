@@ -4788,6 +4788,15 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "JSONB" => "jsonb".into(),
 
         // Parametric types — return base name + params separately
+        //
+        // NOTE: CHAR(n)/character(n) is mapped to the same "varchar" Turso custom
+        // type as VARCHAR(n) as an interim measure. PostgreSQL's bpchar
+        // blank-padding-on-read semantics (values shorter than n are right-padded
+        // with spaces on output) are NOT implemented — a CHAR(5) value 'ab' will
+        // come back as 'ab', not 'ab   '. A real fix needs a distinct "char" Turso
+        // custom type with pad-on-decode SQL, which doesn't exist in
+        // core/schema.rs's bootstrap_builtin_types today; adding it is a core/
+        // change and out of scope here.
         "VARCHAR" | "CHAR" => {
             return match params.first() {
                 Some(_) => Some(PgTypeMapping::with_params("varchar", params.to_vec())),
