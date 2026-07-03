@@ -2936,23 +2936,24 @@ impl PostgreSQLTranslator {
                     escape: None,
                 });
             }
-            // Case-insensitive regex (~*, !~*) — treat same as case-sensitive
-            // since SQLite REGEXP is case-insensitive by default
-            "~*" => {
+            // Case-insensitive regex (~*, !~*) — Turso's `regexp()` (core/regexp.rs) calls
+            // regex::Regex::new() directly on the pattern with no implicit case-folding, so
+            // case-insensitivity must be requested explicitly via an inline `(?i)` flag,
+            // prepended at the SQL level so it also works for non-literal (dynamic) patterns.
+            "~*" | "!~*" => {
+                let not = op_name == "!~*";
+                let ci_pattern = ast::Expr::Binary(
+                    Box::new(ast::Expr::Literal(ast::Literal::String(
+                        "'(?i)'".to_string(),
+                    ))),
+                    ast::Operator::Concat,
+                    right,
+                );
                 return Ok(ast::Expr::Like {
                     lhs: left,
-                    not: false,
+                    not,
                     op: ast::LikeOperator::Regexp,
-                    rhs: right,
-                    escape: None,
-                });
-            }
-            "!~*" => {
-                return Ok(ast::Expr::Like {
-                    lhs: left,
-                    not: true,
-                    op: ast::LikeOperator::Regexp,
-                    rhs: right,
+                    rhs: Box::new(ci_pattern),
                     escape: None,
                 });
             }
@@ -7065,6 +7066,37 @@ mod tests {
                         matches!(**escape_expr, ast::Expr::Literal(ast::Literal::String(_))),
                         "escape char should be the plain literal, not wrapped in lower(): {escape_expr:?}"
                     );
+                } else {
+                    panic!("Expected Like expression");
+                }
+            }
+        } else {
+            panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_case_insensitive_regex_uses_inline_flag() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT * FROM users WHERE name ~* 'john'";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { where_clause, .. } = &select.body.select {
+                if let ast::Expr::Like { op, rhs, .. } = &**where_clause.as_ref().unwrap() {
+                    assert!(matches!(op, ast::LikeOperator::Regexp));
+                    if let ast::Expr::Binary(l, ast::Operator::Concat, r) = &**rhs {
+                        assert!(
+                            matches!(&**l, ast::Expr::Literal(ast::Literal::String(s)) if s.contains("(?i)")),
+                            "Expected '(?i)' prefix literal, got {l:?}"
+                        );
+                        assert!(
+                            matches!(&**r, ast::Expr::Literal(ast::Literal::String(s)) if s.contains("john"))
+                        );
+                    } else {
+                        panic!("Expected Concat rhs for case-insensitive regex, got {rhs:?}");
+                    }
                 } else {
                     panic!("Expected Like expression");
                 }
