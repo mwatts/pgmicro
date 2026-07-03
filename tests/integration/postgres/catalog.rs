@@ -1402,6 +1402,27 @@ fn test_pg_proc_alias_names(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_proc_builtin_functions_in_pg_catalog_namespace(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare("SELECT pronamespace FROM pg_proc WHERE proname = 'lower'")
+        .unwrap();
+    let StepResult::Row = stmt.step().unwrap() else {
+        panic!("expected lower() in pg_proc");
+    };
+    let row = stmt.row().unwrap();
+    let Value::Numeric(Numeric::Integer(ns)) = row.get_value(0) else {
+        panic!("expected integer pronamespace");
+    };
+    assert_eq!(
+        *ns, 11,
+        "built-in function lower() should be in pg_catalog (oid 11), not public"
+    );
+}
+
+#[turso_macros::test]
 fn test_pg_collation_builtin_rows(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();

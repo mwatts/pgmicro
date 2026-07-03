@@ -1494,33 +1494,33 @@ impl PgProcCursor {
             self.rows.push(vec![
                 Value::from_i64(oid),               // oid
                 Value::build_text(entry.name),      // proname
-                Value::from_i64(2200),              // pronamespace (public)
-                Value::from_i64(10),                // proowner
-                Value::from_i64(14),                // prolang (SQL)
-                Value::from_f64(1.0),               // procost
-                Value::from_f64(0.0),               // prorows
-                Value::from_i64(0),                 // provariadic
-                Value::build_text(prokind),         // prokind
-                Value::from_i64(0),                 // prosecdef
-                Value::from_i64(0),                 // proleakproof
-                Value::from_i64(0),                 // proisstrict
-                Value::from_i64(0),                 // proretset
-                Value::build_text(provolatile),     // provolatile
-                Value::build_text("u"),             // proparallel (unsafe)
+                Value::from_i64(11), // pronamespace (pg_catalog) — built-ins live in pg_catalog like real PostgreSQL, not public.
+                Value::from_i64(10), // proowner
+                Value::from_i64(14), // prolang (SQL)
+                Value::from_f64(1.0), // procost
+                Value::from_f64(0.0), // prorows
+                Value::from_i64(0),  // provariadic
+                Value::build_text(prokind), // prokind
+                Value::from_i64(0),  // prosecdef
+                Value::from_i64(0),  // proleakproof
+                Value::from_i64(0),  // proisstrict
+                Value::from_i64(0),  // proretset
+                Value::build_text(provolatile), // provolatile
+                Value::build_text("u"), // proparallel (unsafe)
                 Value::from_i64(entry.narg as i64), // pronargs
-                Value::from_i64(0),                 // pronargdefaults
-                Value::from_i64(0),                 // prorettype
-                Value::Null,                        // proargtypes
-                Value::Null,                        // proallargtypes
-                Value::Null,                        // proargmodes
-                Value::Null,                        // proargnames
-                Value::Null,                        // proargdefaults
-                Value::Null,                        // protrftypes
-                Value::Null,                        // prosrc
-                Value::Null,                        // probin
-                Value::Null,                        // prosqlbody
-                Value::Null,                        // proconfig
-                Value::Null,                        // proacl
+                Value::from_i64(0),  // pronargdefaults
+                Value::from_i64(0),  // prorettype
+                Value::Null,         // proargtypes
+                Value::Null,         // proallargtypes
+                Value::Null,         // proargmodes
+                Value::Null,         // proargnames
+                Value::Null,         // proargdefaults
+                Value::Null,         // protrftypes
+                Value::Null,         // prosrc
+                Value::Null,         // probin
+                Value::Null,         // prosqlbody
+                Value::Null,         // proconfig
+                Value::Null,         // proacl
             ]);
         }
 
@@ -1537,7 +1537,7 @@ impl PgProcCursor {
             self.rows.push(vec![
                 Value::from_i64(oid),
                 Value::build_text(entry.name),
-                Value::from_i64(2200),
+                Value::from_i64(11), // pronamespace (pg_catalog) — built-ins live in pg_catalog like real PostgreSQL, not public.
                 Value::from_i64(10),
                 Value::from_i64(14),
                 Value::from_f64(1.0),
@@ -1576,33 +1576,33 @@ impl PgProcCursor {
             self.rows.push(vec![
                 Value::from_i64(oid),         // oid
                 Value::build_text(name),      // proname
-                Value::from_i64(2200),        // pronamespace (public)
-                Value::from_i64(10),          // proowner
-                Value::from_i64(13),          // prolang (C)
-                Value::from_f64(1.0),         // procost
-                Value::from_f64(0.0),         // prorows
-                Value::from_i64(0),           // provariadic
-                Value::build_text(prokind),   // prokind
-                Value::from_i64(0),           // prosecdef
-                Value::from_i64(0),           // proleakproof
-                Value::from_i64(0),           // proisstrict
-                Value::from_i64(0),           // proretset
-                Value::build_text("v"),       // provolatile (volatile)
-                Value::build_text("u"),       // proparallel
+                Value::from_i64(11), // pronamespace (pg_catalog) — built-ins live in pg_catalog like real PostgreSQL, not public.
+                Value::from_i64(10), // proowner
+                Value::from_i64(13), // prolang (C)
+                Value::from_f64(1.0), // procost
+                Value::from_f64(0.0), // prorows
+                Value::from_i64(0),  // provariadic
+                Value::build_text(prokind), // prokind
+                Value::from_i64(0),  // prosecdef
+                Value::from_i64(0),  // proleakproof
+                Value::from_i64(0),  // proisstrict
+                Value::from_i64(0),  // proretset
+                Value::build_text("v"), // provolatile (volatile)
+                Value::build_text("u"), // proparallel
                 Value::from_i64(argc as i64), // pronargs
-                Value::from_i64(0),           // pronargdefaults
-                Value::from_i64(0),           // prorettype
-                Value::Null,                  // proargtypes
-                Value::Null,                  // proallargtypes
-                Value::Null,                  // proargmodes
-                Value::Null,                  // proargnames
-                Value::Null,                  // proargdefaults
-                Value::Null,                  // protrftypes
-                Value::Null,                  // prosrc
-                Value::Null,                  // probin
-                Value::Null,                  // prosqlbody
-                Value::Null,                  // proconfig
-                Value::Null,                  // proacl
+                Value::from_i64(0),  // pronargdefaults
+                Value::from_i64(0),  // prorettype
+                Value::Null,         // proargtypes
+                Value::Null,         // proallargtypes
+                Value::Null,         // proargmodes
+                Value::Null,         // proargnames
+                Value::Null,         // proargdefaults
+                Value::Null,         // protrftypes
+                Value::Null,         // prosrc
+                Value::Null,         // probin
+                Value::Null,         // prosqlbody
+                Value::Null,         // proconfig
+                Value::Null,         // proacl
             ]);
         }
     }
