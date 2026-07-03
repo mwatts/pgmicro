@@ -2936,19 +2936,38 @@ impl PgIndexCursor {
         let tbl_oid_map = table_oid_map(&schema);
 
         let mut index_oid = USER_TABLE_OID_START + num_tables;
-        for (table_name, _) in &tables {
+        for (table_name, table) in &tables {
             let table_oid = tbl_oid_map.get(*table_name).copied().unwrap_or(0);
+            let Table::BTree(btree) = table.as_ref() else {
+                continue;
+            };
             for idx in schema.get_indices(table_name) {
                 if idx.ephemeral {
                     continue;
                 }
                 let indnatts = idx.columns.len() as i64;
                 let indisunique = i64::from(idx.unique);
-                let indisprimary = i64::from(
-                    idx.name
-                        .starts_with(PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX)
-                        && idx.unique,
-                );
+
+                // Resolve this index's column-position set (skipping expression
+                // columns, which can't back a PK) and compare against unique_sets
+                // entries flagged is_primary_key — authoritative, unlike matching
+                // on the ambiguous sqlite_autoindex_* name prefix which SQLite
+                // also uses for plain UNIQUE constraints.
+                let idx_positions: std::collections::BTreeSet<usize> = idx
+                    .columns
+                    .iter()
+                    .filter(|c| c.expr.is_none())
+                    .map(|c| c.pos_in_table)
+                    .collect();
+                let indisprimary = i64::from(btree.unique_sets.iter().any(|us| {
+                    us.is_primary_key
+                        && us.columns.iter().all(|(name, _)| {
+                            btree
+                                .get_column(name)
+                                .is_some_and(|(pos, _)| idx_positions.contains(&pos))
+                        })
+                        && us.columns.len() == idx_positions.len()
+                }));
 
                 // Build indkey: space-separated 1-based column positions (0 for expression cols)
                 let indkey: String = idx

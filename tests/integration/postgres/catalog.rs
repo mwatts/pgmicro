@@ -340,6 +340,48 @@ fn test_pg_index_primary_key(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_pg_index_indisprimary_distinguishes_pk_from_unique(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // id must NOT be a rowid-alias PK (i.e. not a bare `INTEGER PRIMARY KEY`),
+    // otherwise SQLite backs the PK with the rowid itself instead of a
+    // separate sqlite_autoindex_*, and the bug (indisprimary misclassifying
+    // the UNIQUE email autoindex) can't be observed via a second PK row.
+    conn.execute("CREATE TABLE t (id TEXT PRIMARY KEY, email TEXT UNIQUE)")
+        .unwrap();
+
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT indisprimary, indisunique FROM pg_index
+             JOIN pg_class c ON c.oid = indrelid
+             WHERE c.relname = 't' ORDER BY indisprimary DESC",
+        )
+        .unwrap();
+
+    let mut pk_count = 0;
+    let mut rows = 0;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                rows += 1;
+                if stmt.row().unwrap().get_value(0).as_int() == Some(1) {
+                    pk_count += 1;
+                }
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(rows, 2, "expected 2 auto-indexes (pk + unique email)");
+    assert_eq!(
+        pk_count, 1,
+        "exactly one index should be marked indisprimary"
+    );
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // pg_constraint tests
 // ──────────────────────────────────────────────────────────────────────
