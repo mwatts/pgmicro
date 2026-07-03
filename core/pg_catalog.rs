@@ -344,7 +344,7 @@ impl PgClassCursor {
                     continue;
                 }
             }
-            let relnatts = btree.columns().len() as i64;
+            let relnatts = btree.columns().iter().filter(|c| !c.hidden()).count() as i64;
             let relhasindex = if schema.get_indices(table_name).next().is_some() {
                 1i64
             } else {
@@ -781,11 +781,15 @@ impl PgAttributeCursor {
             }
 
             let columns = table.columns();
-            for (i, col) in columns.iter().enumerate() {
+            let mut attnum = 0i64;
+            for col in columns.iter() {
+                if col.hidden() {
+                    continue;
+                }
+                attnum += 1;
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
                 let atttypmod = pg_atttypmod(&col.ty_str, &col.ty_params);
-                let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
                 let (attlen, attbyval, attalign) = PG_BASE_TYPES

@@ -1538,3 +1538,88 @@ fn test_pg_listen_notify_self_delivery(db: TempDatabase) {
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].payload, "ping");
 }
+
+#[turso_macros::test]
+fn test_pg_attribute_excludes_hidden_columns(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 't'",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let count = stmt.row().unwrap().get_value(0).as_int().unwrap();
+            assert_eq!(
+                count, 2,
+                "pg_attribute row count must match visible column count only"
+            );
+        }
+        _ => panic!("count query failed"),
+    }
+}
+
+/// Regression test for H29: `ALTER TABLE ... ADD COLUMN` builds its new
+/// `Column` via `impl TryFrom<&ColumnDefinition> for Column`
+/// (`core/schema.rs:4659`), which sets `hidden = ty_str.contains("HIDDEN")`.
+/// The type-name parser (`parser/src/parser.rs::parse_type`) concatenates
+/// consecutive identifier tokens, so `extra TEXT HIDDEN` parses as a single
+/// type name `"TEXT HIDDEN"`, so an `ALTER TABLE ADD COLUMN extra TEXT HIDDEN`
+/// genuinely sets `Column::hidden() == true` on an ordinary BTree table (no
+/// virtual table or extension required). Verified directly via
+/// `PRAGMA table_xinfo(t)`, whose `hidden` output column is 1 for `extra`.
+///
+/// Note: plain `CREATE TABLE` cannot reproduce this — its column-building
+/// path (`core/schema.rs`, around line 4035) hardcodes `hidden: false`
+/// regardless of the type text. Only the `ALTER TABLE ADD COLUMN` /
+/// `Column::try_from(&ColumnDefinition)` path can set it, which is why
+/// this test uses `ALTER TABLE` instead of a single `CREATE TABLE`.
+///
+/// Before the fix, `pg_attribute`/`pg_class.relnatts` counted the hidden
+/// column too, so `t` (2 visible + 1 hidden = 3 declared columns) reported 3
+/// attributes/relnatts instead of the correct 2. This exercises the
+/// `col.hidden()` branch that the plain 2-column regression test above
+/// cannot reach — confirmed by temporarily reverting the fix and observing
+/// this test fail with `left: 3, right: 2` before reapplying it.
+#[turso_macros::test]
+fn test_pg_attribute_and_relnatts_exclude_hidden_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("ALTER TABLE t ADD COLUMN extra TEXT HIDDEN")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 't'",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let count = stmt.row().unwrap().get_value(0).as_int().unwrap();
+            assert_eq!(
+                count, 2,
+                "pg_attribute must exclude the hidden column, leaving only 2 visible columns"
+            );
+        }
+        _ => panic!("count query failed"),
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT relnatts FROM pg_class WHERE relname = 't'")
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let relnatts = stmt.row().unwrap().get_value(0).as_int().unwrap();
+            assert_eq!(
+                relnatts, 2,
+                "relnatts must exclude the hidden column, leaving only 2 visible columns"
+            );
+        }
+        _ => panic!("relnatts query failed"),
+    }
+}
