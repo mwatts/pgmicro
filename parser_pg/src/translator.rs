@@ -3990,23 +3990,33 @@ impl PostgreSQLTranslator {
                 let targets: Vec<ast::SortedColumn> = infer
                     .index_elems
                     .iter()
-                    .filter_map(|elem| match &elem.node {
-                        Some(Node::IndexElem(idx_elem)) => {
-                            if !idx_elem.name.is_empty() {
-                                Some(ast::SortedColumn {
-                                    expr: Box::new(ast::Expr::Id(ast::Name::from_string(
-                                        &idx_elem.name,
-                                    ))),
-                                    order: None,
-                                    nulls: None,
-                                })
-                            } else {
-                                None
-                            }
+                    .map(|elem| match &elem.node {
+                        Some(Node::IndexElem(idx_elem)) if !idx_elem.name.is_empty() => {
+                            Ok(ast::SortedColumn {
+                                expr: Box::new(ast::Expr::Id(ast::Name::from_string(
+                                    &idx_elem.name,
+                                ))),
+                                order: None,
+                                nulls: None,
+                            })
                         }
-                        _ => None,
+                        Some(Node::IndexElem(idx_elem)) => {
+                            let expr_node = idx_elem.expr.as_ref().ok_or_else(|| {
+                                ParseError::ParseError(
+                                    "ON CONFLICT target has no name or expression".into(),
+                                )
+                            })?;
+                            Ok(ast::SortedColumn {
+                                expr: Box::new(self.translate_expr(expr_node)?),
+                                order: None,
+                                nulls: None,
+                            })
+                        }
+                        _ => Err(ParseError::ParseError(
+                            "ON CONFLICT: expected IndexElem".into(),
+                        )),
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, ParseError>>()?;
 
                 let where_clause = if let Some(wc) = &infer.where_clause {
                     Some(Box::new(self.translate_expr(wc)?))
@@ -8840,5 +8850,24 @@ mod tests {
         let parsed = crate::parse(sql).unwrap();
         let err = translator.translate(&parsed).unwrap_err();
         assert!(matches!(err, ParseError::ParseError(_)));
+    }
+
+    #[test]
+    fn test_on_conflict_expression_target_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "INSERT INTO users (email) VALUES ('A@B.com') \
+                   ON CONFLICT (lower(email)) DO NOTHING";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Insert { body, .. } = translated {
+            if let ast::InsertBody::Select(_, Some(upsert)) = body {
+                let index = upsert.index.expect("Should have conflict target");
+                assert_eq!(index.targets.len(), 1, "expression target was dropped");
+            } else {
+                panic!("Expected upsert");
+            }
+        } else {
+            panic!("Expected Insert");
+        }
     }
 }
