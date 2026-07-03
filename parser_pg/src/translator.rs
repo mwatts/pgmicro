@@ -4103,6 +4103,13 @@ impl PostgreSQLTranslator {
 
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
         let index = if let Some(infer) = &clause.infer {
+            if !infer.conname.is_empty() {
+                return Err(ParseError::ParseError(format!(
+                    "ON CONFLICT ON CONSTRAINT {} is not supported (no schema access at translate \
+                     time to resolve the constraint's columns); use ON CONFLICT (columns) instead",
+                    infer.conname
+                )));
+            }
             if !infer.index_elems.is_empty() {
                 let targets: Vec<ast::SortedColumn> = infer
                     .index_elems
@@ -9129,5 +9136,15 @@ mod tests {
         } else {
             panic!("Expected Insert");
         }
+    }
+
+    #[test]
+    fn test_on_conflict_on_constraint_rejected_not_silently_broadened() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "INSERT INTO users (id, email) VALUES (1, 'a@b.com') \
+                   ON CONFLICT ON CONSTRAINT users_email_key DO UPDATE SET email = excluded.email";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(matches!(err, ParseError::ParseError(_)));
     }
 }
