@@ -148,11 +148,13 @@ pub fn exec_lpad(input: &Value, length: usize, fill: &str) -> Result<Value, Limb
         if fill_chars.is_empty() {
             Ok(Value::build_text(s))
         } else {
-            let pad: String = fill_chars
-                .iter()
-                .cycle()
-                .take(length - char_count)
-                .collect();
+            let needed = length - char_count;
+            let max_char_bytes = fill_chars.iter().map(|c| c.len_utf8()).max().unwrap_or(1);
+            let worst_case_pad_bytes = needed.checked_mul(max_char_bytes).ok_or_else(|| {
+                LimboError::InvalidArgument("requested length too large".to_string())
+            })?;
+            check_pg_string_length(worst_case_pad_bytes.saturating_add(s.len()))?;
+            let pad: String = fill_chars.iter().cycle().take(needed).collect();
             Ok(Value::build_text(format!("{pad}{s}")))
         }
     }
@@ -369,11 +371,13 @@ pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Result<Value, Limb
         if fill_chars.is_empty() {
             Ok(Value::build_text(s))
         } else {
-            let pad: String = fill_chars
-                .iter()
-                .cycle()
-                .take(length - char_count)
-                .collect();
+            let needed = length - char_count;
+            let max_char_bytes = fill_chars.iter().map(|c| c.len_utf8()).max().unwrap_or(1);
+            let worst_case_pad_bytes = needed.checked_mul(max_char_bytes).ok_or_else(|| {
+                LimboError::InvalidArgument("requested length too large".to_string())
+            })?;
+            check_pg_string_length(worst_case_pad_bytes.saturating_add(s.len()))?;
+            let pad: String = fill_chars.iter().cycle().take(needed).collect();
             Ok(Value::build_text(format!("{s}{pad}")))
         }
     }
@@ -455,6 +459,20 @@ mod tests {
     #[test]
     fn rpad_rejects_oversized_length() {
         let err = exec_rpad(&Value::build_text("x"), 2_000_000_000, " ").unwrap_err();
+        assert!(matches!(err, LimboError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn lpad_rejects_oversized_multibyte_fill() {
+        // length is under the char-count cap but the multi-byte fill would blow
+        // the byte budget if built naively — must still be rejected.
+        let err = exec_lpad(&Value::build_text("x"), 1_000_000_000, "\u{1F600}").unwrap_err();
+        assert!(matches!(err, LimboError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn rpad_rejects_oversized_multibyte_fill() {
+        let err = exec_rpad(&Value::build_text("x"), 1_000_000_000, "\u{1F600}").unwrap_err();
         assert!(matches!(err, LimboError::InvalidArgument(_)));
     }
 
