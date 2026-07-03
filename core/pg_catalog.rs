@@ -4124,13 +4124,17 @@ fn parse_timestamp_prefix(s: &str) -> Option<()> {
     Some(())
 }
 
+/// Mirrors core/json/jsonb.rs's MAX_JSON_DEPTH — stops adversarial input
+/// from blowing the stack via unbounded object/array recursion.
+const MAX_JSON_VALIDATE_DEPTH: usize = 1000;
+
 /// Validate JSON text by parsing the full value (no trailing garbage).
 fn is_valid_json(s: &str) -> bool {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return false;
     }
-    parse_json_value(trimmed, 0).is_some_and(|end| end == trimmed.len())
+    parse_json_value(trimmed, 0, 0).is_some_and(|end| end == trimmed.len())
 }
 
 fn skip_json_whitespace(s: &str, mut pos: usize) -> usize {
@@ -4140,14 +4144,17 @@ fn skip_json_whitespace(s: &str, mut pos: usize) -> usize {
     pos
 }
 
-fn parse_json_value(s: &str, start: usize) -> Option<usize> {
+fn parse_json_value(s: &str, start: usize, depth: usize) -> Option<usize> {
+    if depth >= MAX_JSON_VALIDATE_DEPTH {
+        return None;
+    }
     let pos = skip_json_whitespace(s, start);
     if pos >= s.len() {
         return None;
     }
     match s.as_bytes()[pos] {
-        b'{' => parse_json_object(s, pos),
-        b'[' => parse_json_array(s, pos),
+        b'{' => parse_json_object(s, pos, depth + 1),
+        b'[' => parse_json_array(s, pos, depth + 1),
         b'"' => parse_json_string(s, pos),
         b't' => parse_json_literal(s, pos, "true"),
         b'f' => parse_json_literal(s, pos, "false"),
@@ -4246,7 +4253,7 @@ fn parse_json_number(s: &str, start: usize) -> Option<usize> {
     Some(pos)
 }
 
-fn parse_json_object(s: &str, start: usize) -> Option<usize> {
+fn parse_json_object(s: &str, start: usize, depth: usize) -> Option<usize> {
     let mut pos = start + 1;
     pos = skip_json_whitespace(s, pos);
     if s.as_bytes().get(pos) == Some(&b'}') {
@@ -4262,7 +4269,7 @@ fn parse_json_object(s: &str, start: usize) -> Option<usize> {
             return None;
         }
         pos += 1;
-        pos = parse_json_value(s, pos)?;
+        pos = parse_json_value(s, pos, depth)?;
         pos = skip_json_whitespace(s, pos);
         match s.as_bytes().get(pos) {
             Some(b',') => {
@@ -4275,14 +4282,14 @@ fn parse_json_object(s: &str, start: usize) -> Option<usize> {
     }
 }
 
-fn parse_json_array(s: &str, start: usize) -> Option<usize> {
+fn parse_json_array(s: &str, start: usize, depth: usize) -> Option<usize> {
     let mut pos = start + 1;
     pos = skip_json_whitespace(s, pos);
     if s.as_bytes().get(pos) == Some(&b']') {
         return Some(pos + 1);
     }
     loop {
-        pos = parse_json_value(s, pos)?;
+        pos = parse_json_value(s, pos, depth)?;
         pos = skip_json_whitespace(s, pos);
         match s.as_bytes().get(pos) {
             Some(b',') => {
@@ -4857,6 +4864,20 @@ mod tests {
         assert!(!is_valid_json(r#"{"a":1} trailing"#));
         assert!(is_valid_json(r#"{"a":1}"#));
         assert!(is_valid_json(r#"{"key": "value"}"#));
+    }
+
+    #[test]
+    fn test_is_valid_json_rejects_excessive_nesting() {
+        // 1001 levels of nested arrays would previously blow the stack before
+        // ever returning false; it must now return false without crashing.
+        let mut deeply_nested = "[".repeat(1001);
+        deeply_nested.push_str(&"]".repeat(1001));
+        assert!(!is_valid_json(&deeply_nested));
+
+        // exactly at the limit must still validate successfully.
+        let mut at_limit = "[".repeat(1000);
+        at_limit.push_str(&"]".repeat(1000));
+        assert!(is_valid_json(&at_limit));
     }
 
     #[test]
