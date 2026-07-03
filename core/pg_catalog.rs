@@ -2828,36 +2828,36 @@ impl PgTypeCursor {
             self.rows.push(vec![
                 Value::from_i64(*enum_oid),       // oid
                 Value::Text(name.clone().into()), // typname
-                Value::from_i64(11),              // typnamespace (pg_catalog)
-                Value::from_i64(10),              // typowner
-                Value::from_i64(4),               // typlen
-                Value::from_i64(1),               // typbyval
-                Value::build_text("e"),           // typtype (enum)
-                Value::build_text("E"),           // typcategory (enum)
-                Value::from_i64(0),               // typispreferred
-                Value::from_i64(1),               // typisdefined
-                Value::build_text(","),           // typdelim
-                Value::from_i64(0),               // typrelid
-                Value::Null,                      // typsubscript
-                Value::from_i64(0),               // typelem
-                Value::from_i64(0),               // typarray
-                Value::Null,                      // typinput
-                Value::Null,                      // typoutput
-                Value::Null,                      // typreceive
-                Value::Null,                      // typsend
-                Value::Null,                      // typmodin
-                Value::Null,                      // typmodout
-                Value::Null,                      // typanalyze
-                Value::build_text("i"),           // typalign
-                Value::build_text("p"),           // typstorage
-                Value::from_i64(0),               // typnotnull
-                Value::from_i64(0),               // typbasetype
-                Value::from_i64(-1),              // typtypmod
-                Value::from_i64(0),               // typndims
-                Value::from_i64(0),               // typcollation
-                Value::Null,                      // typdefaultbin
-                Value::Null,                      // typdefault
-                Value::Null,                      // typacl
+                Value::from_i64(2200), // typnamespace (public) — user-defined types live in the schema they were created in, not pg_catalog (reserved for built-ins).
+                Value::from_i64(10),   // typowner
+                Value::from_i64(4),    // typlen
+                Value::from_i64(1),    // typbyval
+                Value::build_text("e"), // typtype (enum)
+                Value::build_text("E"), // typcategory (enum)
+                Value::from_i64(0),    // typispreferred
+                Value::from_i64(1),    // typisdefined
+                Value::build_text(","), // typdelim
+                Value::from_i64(0),    // typrelid
+                Value::Null,           // typsubscript
+                Value::from_i64(0),    // typelem
+                Value::from_i64(0),    // typarray
+                Value::Null,           // typinput
+                Value::Null,           // typoutput
+                Value::Null,           // typreceive
+                Value::Null,           // typsend
+                Value::Null,           // typmodin
+                Value::Null,           // typmodout
+                Value::Null,           // typanalyze
+                Value::build_text("i"), // typalign
+                Value::build_text("p"), // typstorage
+                Value::from_i64(0),    // typnotnull
+                Value::from_i64(0),    // typbasetype
+                Value::from_i64(-1),   // typtypmod
+                Value::from_i64(0),    // typndims
+                Value::from_i64(0),    // typcollation
+                Value::Null,           // typdefaultbin
+                Value::Null,           // typdefault
+                Value::Null,           // typacl
             ]);
         }
     }

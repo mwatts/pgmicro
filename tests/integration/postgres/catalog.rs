@@ -252,6 +252,25 @@ fn test_pg_type_array_types(db: TempDatabase) {
     }
 }
 
+#[turso_macros::test]
+fn test_pg_type_user_enum_in_public_namespace(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')")
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT typnamespace FROM pg_type WHERE typname = 'mood'")
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => assert_eq!(
+            stmt.row().unwrap().get_value(0).as_int(),
+            Some(2200),
+            "user enum should live in public (2200)"
+        ),
+        _ => panic!("mood enum not found"),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // pg_index tests
 // ──────────────────────────────────────────────────────────────────────
