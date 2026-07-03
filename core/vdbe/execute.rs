@@ -7178,6 +7178,10 @@ pub fn op_function(
                     .get_value()
                     .as_int()
                     .unwrap_or(0);
+                // column_no/pretty (args 2,3) are accepted for real-PG arity
+                // compatibility but not used: per-column definitions are not
+                // implemented, so the full index def is always returned,
+                // matching column_no=0 semantics.
                 state.registers[*dest].set_value(exec_pg_get_indexdef(&program.connection, oid));
             }
             ScalarFunc::PgEncodingToChar => {

@@ -1043,7 +1043,10 @@ impl ScalarFunc {
             | Self::PgTypeIsVisible
             | Self::PgGetStatisticsObjDefColumns
             | Self::PgRelationIsPublishable => &[1],
-            Self::PgFormatType | Self::PgGetConstraintDef | Self::PgGetIndexDef => &[1, 2],
+            Self::PgFormatType | Self::PgGetConstraintDef => &[1, 2],
+            // Real PG has no 2-arg form: pg_get_indexdef(oid) or
+            // pg_get_indexdef(oid, column_no, pretty).
+            Self::PgGetIndexDef => &[1, 3],
             Self::PgGetExpr => &[2, 3],
             Self::Lpad | Self::Rpad => &[2, 3],
             // Scalar max/min (multi-arg)

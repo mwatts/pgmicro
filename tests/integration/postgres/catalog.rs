@@ -898,6 +898,25 @@ fn test_pg_get_indexdef(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_get_indexdef_accepts_three_arg_form(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")
+        .unwrap();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT pg_get_indexdef(indexrelid, 0, true) FROM pg_index idx
+             JOIN pg_class c ON c.oid = idx.indrelid WHERE c.relname = 't' AND idx.indisunique = 1",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {}
+        other => panic!("pg_get_indexdef(oid, 0, true) failed to execute: {other:?}"),
+    }
+}
+
+#[turso_macros::test]
 fn test_pg_attrdef_populated(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
