@@ -1393,6 +1393,30 @@ fn test_pg_comment_on_table(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_comment_on_mixed_case_table_resolves_same_oid_as_pg_class(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE \"MixedCase\" (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.execute("COMMENT ON TABLE \"MixedCase\" IS 'a table'")
+        .unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT d.description FROM pg_description d JOIN pg_class c ON c.oid = d.objoid WHERE c.relname = 'MixedCase'",
+        )
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let Value::Text(desc) = stmt.row().unwrap().get_value(0) else {
+                panic!("expected text")
+            };
+            assert_eq!(desc.as_str(), "a table");
+        }
+        _ => panic!("pg_description join on pg_class.oid found no row — case-key mismatch"),
+    }
+}
+
+#[turso_macros::test]
 fn test_pg_prepare_execute_deallocate(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();

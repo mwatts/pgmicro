@@ -26,7 +26,7 @@ const PG_ATTRIBUTE_IDX_ATTRELID: i32 = 1;
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
@@ -145,7 +145,13 @@ fn pg_atttypmod(ty_str: &str, ty_params: &[Box<Expr>]) -> i64 {
 }
 
 /// Build a mapping from table name to OID for all user tables.
-fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
+///
+/// Keys are `schema.tables` keys as-is (already lowercased by `normalize_ident`
+/// at table-creation time, matching `Schema::get_table`'s lookup convention).
+/// Callers with an externally-supplied (not-yet-normalized) table name must
+/// normalize it the same way (see `Schema::normalize_table_lookup_name`)
+/// before looking it up in this map.
+pub(crate) fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
     let tables = user_tables_sorted(schema);
     let mut map = HashMap::default();
     for (i, (name, _)) in tables.iter().enumerate() {

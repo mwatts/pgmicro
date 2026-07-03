@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use crate::pg_catalog::USER_TABLE_OID_START;
-use crate::schema::{Schema, Table};
+use crate::pg_catalog::{table_oid_map, user_tables_sorted};
+use crate::schema::Table;
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Result, Value};
 use turso_parser_pg::translator::{PgCommentStmt, PgCommentTarget};
@@ -59,36 +59,17 @@ impl PgCommentRegistry {
     }
 }
 
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by(|a, b| a.0.cmp(b.0));
-    tables
-}
-
-fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
-    user_tables_sorted(schema)
-        .into_iter()
-        .enumerate()
-        .map(|(i, (name, _))| (name.to_lowercase(), USER_TABLE_OID_START + i as i64))
-        .collect()
-}
-
 fn resolve_table_oid(conn: &Connection, table_name: &str) -> Result<i64> {
     let schema = conn.schema.read();
     let map = table_oid_map(&schema);
+    // `table_oid_map`'s keys are `schema.tables` keys, which are already
+    // lowercased by `normalize_ident` at table-creation time (see
+    // `Schema::add_btree_table`). `table_name` here comes straight from the
+    // parsed `COMMENT ON TABLE` statement and preserves PostgreSQL's quoting
+    // semantics (quoted case kept, unquoted folded to lowercase), so it must
+    // be normalized the same way before lookup — mirroring
+    // `Schema::normalize_table_lookup_name`'s convention, not a case-insensitive
+    // matching hack.
     map.get(&table_name.to_lowercase())
         .copied()
         .ok_or_else(|| LimboError::ParseError(format!("relation \"{table_name}\" does not exist")))
