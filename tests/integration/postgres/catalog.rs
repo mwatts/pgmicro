@@ -1734,3 +1734,10 @@ fn test_pg_proc_overloaded_builtin_has_distinct_oids(db: TempDatabase) {
         oids.len()
     );
 }
+
+#[turso_macros::test]
+fn test_pg_trigger_has_tgparentid_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    conn.prepare("SELECT tgparentid FROM pg_trigger").unwrap(); // must not error
+}
