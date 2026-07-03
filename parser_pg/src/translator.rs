@@ -329,6 +329,7 @@ impl PostgreSQLTranslator {
         let mut foreign_key: Option<PgForeignKey> = None;
 
         let mut check_exprs: Vec<ast::Expr> = Vec::new();
+        let mut generated_expr: Option<ast::Expr> = None;
         for constraint_node in &col_def.constraints {
             let Some(Node::Constraint(constraint)) = &constraint_node.node else {
                 continue;
@@ -350,6 +351,17 @@ impl PostgreSQLTranslator {
                     if let Some(ref raw_expr) = constraint.raw_expr {
                         check_exprs.push(self.translate_expr(raw_expr)?);
                     }
+                }
+                ConstrType::ConstrGenerated => {
+                    if let Some(ref raw_expr) = constraint.raw_expr {
+                        generated_expr = Some(self.translate_expr(raw_expr)?);
+                    }
+                }
+                ConstrType::ConstrIdentity => {
+                    return Err(ParseError::ParseError(
+                        "GENERATED ... AS IDENTITY is not supported (no Turso equivalent to PG sequences); \
+                         use SERIAL or a manually managed default instead".into(),
+                    ));
                 }
                 _ => {}
             }
@@ -435,6 +447,17 @@ impl PostgreSQLTranslator {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
                 constraint: ast::ColumnConstraint::Check(Box::new(expr)),
+            });
+        }
+
+        // GENERATED ... STORED (PG has no virtual generated columns, only STORED)
+        if let Some(expr) = generated_expr {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Generated {
+                    expr: Box::new(expr),
+                    typ: Some(ast::GeneratedColumnType::Stored),
+                },
             });
         }
 
@@ -6056,6 +6079,43 @@ mod tests {
         } else {
             panic!("Expected CreateTable");
         }
+    }
+
+    #[test]
+    fn test_generated_column_preserved() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t (a INTEGER, b INTEGER GENERATED ALWAYS AS (a * 2) STORED)";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+
+        if let ast::Stmt::CreateTable {
+            body: ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        } = translated
+        {
+            let b = &columns[1];
+            let generated = b.constraints.iter().find_map(|c| match &c.constraint {
+                ast::ColumnConstraint::Generated { expr: _, typ } => Some(*typ),
+                _ => None,
+            });
+            assert_eq!(
+                generated,
+                Some(Some(ast::GeneratedColumnType::Stored)),
+                "GENERATED ALWAYS AS (...) STORED was dropped: {:?}",
+                b.constraints
+            );
+        } else {
+            panic!("Expected CreateTable");
+        }
+    }
+
+    #[test]
+    fn test_identity_column_rejected_not_silently_dropped() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "CREATE TABLE t (id INTEGER GENERATED ALWAYS AS IDENTITY)";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(matches!(err, ParseError::ParseError(_)));
     }
 
     #[test]
