@@ -772,6 +772,21 @@ where
 
     match copy.format {
         PgCopyFormat::Text => {
+            if copy.header {
+                let mut line = String::new();
+                for (i, col) in columns.iter().enumerate() {
+                    if i > 0 {
+                        line.push(copy.delimiter);
+                    }
+                    line.push_str(col);
+                }
+                line.push('\n');
+                client
+                    .send(PgWireBackendMessage::CopyData(CopyData::new(
+                        line.into_bytes().into(),
+                    )))
+                    .await?;
+            }
             for row in &rows {
                 let mut line = String::new();
                 for (i, val) in row.iter().enumerate() {

@@ -871,6 +871,7 @@ const WIRE_PORT_COPY_STDOUT: u16 = 18432;
 const WIRE_PORT_NOTIFY: u16 = 19432;
 const WIRE_PORT_BINARY_INT4: u16 = 20432;
 const WIRE_PORT_PREPARED_DROP_SCHEMA: u16 = 21432;
+const WIRE_PORT_COPY_STDOUT_HEADER: u16 = 22432;
 
 fn wire_port(base: u16) -> u16 {
     base + (std::process::id() % 1000) as u16
@@ -1339,6 +1340,35 @@ fn wire_copy_to_stdout_streams_rows() {
         "expected Alice in copy data: {data}"
     );
     assert!(data.contains("Bob"), "expected Bob in copy data: {data}");
+
+    server.kill().ok();
+    server.wait().ok();
+}
+
+#[test]
+fn wire_copy_to_stdout_with_header_emits_header_row() {
+    // B22: COPY ... TO STDOUT WITH (HEADER) previously ignored the HEADER option
+    // entirely (try_extract_copy_stdout's option loop omitted "header"). Verify the
+    // wire protocol now emits a header row of column names before the data rows.
+    let port = wire_port(WIRE_PORT_COPY_STDOUT_HEADER);
+    let mut server = start_pgmicro_server(port);
+    let mut client = PgTestClient::connect(port);
+
+    client.query_command_tags("CREATE TABLE wire_stdout_hdr(id INT, name TEXT)");
+    client.query_command_tags("INSERT INTO wire_stdout_hdr VALUES (1, 'Alice')");
+
+    let (tags, data) = client.copy_to_stdout("COPY wire_stdout_hdr TO STDOUT WITH (HEADER)");
+    assert!(
+        tags.iter().any(|t| t == "COPY 1"),
+        "expected COPY 1 tag, got: {tags:?}"
+    );
+    let lines: Vec<&str> = data.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"id\tname"),
+        "expected header row before data, got: {data:?}"
+    );
+    assert!(data.contains("1\tAlice"), "expected data row: {data}");
 
     server.kill().ok();
     server.wait().ok();

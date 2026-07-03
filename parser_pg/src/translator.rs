@@ -4537,35 +4537,17 @@ impl PostgreSQLTranslator {
             ast::CopyTarget::File(copy.filename.clone())
         };
 
-        let mut format = ast::CopyFormat::Text;
-        let mut delimiter = None;
-        let mut header = false;
-        let mut null_string = None;
-        let mut quote = None;
-        let mut escape = None;
-
-        for opt in &copy.options {
-            let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-                continue;
-            };
-            match def.defname.as_str() {
-                "format" => {
-                    if let Some(val) = def_elem_string_val(def) {
-                        match val.to_lowercase().as_str() {
-                            "csv" => format = ast::CopyFormat::Csv,
-                            "binary" => format = ast::CopyFormat::Binary,
-                            _ => format = ast::CopyFormat::Text,
-                        }
-                    }
-                }
-                "delimiter" => delimiter = def_elem_string_val(def),
-                "header" => header = def_elem_bool_val(def).unwrap_or(true),
-                "null" => null_string = def_elem_string_val(def),
-                "quote" => quote = def_elem_string_val(def),
-                "escape" => escape = def_elem_string_val(def),
-                _ => {}
-            }
-        }
+        let opts = parse_copy_options(&copy.options)?;
+        let format = match opts.format.as_deref().map(str::to_lowercase).as_deref() {
+            Some("csv") => ast::CopyFormat::Csv,
+            Some("binary") => ast::CopyFormat::Binary,
+            _ => ast::CopyFormat::Text,
+        };
+        let delimiter = opts.delimiter;
+        let header = opts.header.unwrap_or(false);
+        let null_string = opts.null_string;
+        let quote = opts.quote;
+        let escape = opts.escape;
 
         Ok(ast::Stmt::Copy {
             table_name,
@@ -4688,17 +4670,61 @@ fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
 }
 
 /// Extract a boolean value from a DefElem's arg.
-/// If arg is None (bare keyword like HEADER), returns None (caller defaults to true).
-fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Option<bool> {
-    let arg = def.arg.as_deref()?;
+/// If arg is None (bare keyword like HEADER), returns `Ok(None)` (caller defaults to true).
+/// Fails loud with a `ParseError` on an unrecognized string value instead of silently
+/// treating it as `false`.
+fn def_elem_bool_val(def: &pg_query::protobuf::DefElem) -> Result<Option<bool>, ParseError> {
+    let Some(arg) = def.arg.as_deref() else {
+        return Ok(None);
+    };
     match &arg.node {
-        Some(pg_query::protobuf::node::Node::Integer(i)) => Some(i.ival != 0),
-        Some(pg_query::protobuf::node::Node::String(s)) => Some(matches!(
-            s.sval.to_lowercase().as_str(),
-            "true" | "on" | "1"
-        )),
-        _ => None,
+        Some(pg_query::protobuf::node::Node::Integer(i)) => Ok(Some(i.ival != 0)),
+        Some(pg_query::protobuf::node::Node::String(s)) => match s.sval.to_lowercase().as_str() {
+            "true" | "on" | "1" | "yes" => Ok(Some(true)),
+            "false" | "off" | "0" | "no" => Ok(Some(false)),
+            other => Err(ParseError::ParseError(format!(
+                "invalid boolean value for option {}: {other:?}",
+                def.defname
+            ))),
+        },
+        _ => Ok(None),
     }
+}
+
+/// Parsed COPY option set, shared by `translate_copy` and the three `try_extract_copy_*`
+/// functions (which previously duplicated this loop with different subsets of options).
+#[derive(Default)]
+struct PgCopyOptions {
+    format: Option<String>, // "text" | "csv" | "binary"
+    delimiter: Option<String>,
+    header: Option<bool>,
+    null_string: Option<String>,
+    quote: Option<String>,
+    escape: Option<String>,
+    encoding: Option<String>,
+}
+
+fn parse_copy_options(options: &[pg_query::protobuf::Node]) -> Result<PgCopyOptions, ParseError> {
+    let mut opts = PgCopyOptions::default();
+    for opt in options {
+        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
+            continue;
+        };
+        match def.defname.as_str() {
+            "format" => opts.format = def_elem_string_val(def),
+            "delimiter" => opts.delimiter = def_elem_string_val(def),
+            // A bare `HEADER` keyword (no arg) means true; resolve that here so an
+            // absent option (opts.header == None) stays distinguishable from a
+            // present-but-bare option (opts.header == Some(true)).
+            "header" => opts.header = Some(def_elem_bool_val(def)?.unwrap_or(true)),
+            "null" => opts.null_string = def_elem_string_val(def),
+            "quote" => opts.quote = def_elem_string_val(def),
+            "escape" => opts.escape = def_elem_string_val(def),
+            "encoding" => opts.encoding = def_elem_string_val(def),
+            _ => {}
+        }
+    }
+    Ok(opts)
 }
 
 /// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
@@ -5458,6 +5484,9 @@ pub struct PgCopyFromStmt {
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
+    /// Captured from the `ENCODING` COPY option, not yet acted upon by the file reader
+    /// (which currently assumes UTF-8 via `std::fs::read_to_string`).
+    pub encoding: Option<String>,
 }
 
 /// Try to extract a COPY FROM file statement from pg_query parse output.
@@ -5504,27 +5533,11 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         Some(cols)
     };
 
-    let mut delimiter = None;
-    let mut header = false;
-    let mut null_string = None;
-
-    for opt in &copy.options {
-        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-            continue;
-        };
-        match def.defname.as_str() {
-            "format" => {
-                // Only support text format for now
-                if let Some(val) = def_elem_string_val(def) {
-                    if val.to_lowercase() != "text" {
-                        return None; // unsupported format
-                    }
-                }
-            }
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "header" => header = def_elem_bool_val(def).unwrap_or(true),
-            "null" => null_string = def_elem_string_val(def),
-            _ => {}
+    let opts = parse_copy_options(&copy.options).ok()?;
+    // Only support text format for now.
+    if let Some(val) = &opts.format {
+        if val.to_lowercase() != "text" {
+            return None; // unsupported format
         }
     }
 
@@ -5533,9 +5546,10 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         schema_name,
         columns,
         filename: copy.filename.clone(),
-        delimiter,
-        header,
-        null_string,
+        delimiter: opts.delimiter,
+        header: opts.header.unwrap_or(false),
+        null_string: opts.null_string,
+        encoding: opts.encoding,
     })
 }
 
@@ -5614,6 +5628,8 @@ pub struct PgCopyStdinStmt {
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
+    /// Captured from the `ENCODING` COPY option, not yet acted upon downstream.
+    pub encoding: Option<String>,
 }
 
 /// Try to extract COPY FROM STDIN from pg_query parse output.
@@ -5657,39 +5673,22 @@ pub fn try_extract_copy_stdin(parse_result: &ParseResult) -> Option<PgCopyStdinS
         Some(cols)
     };
 
-    let mut format = PgCopyFormat::Text;
-    let mut delimiter = None;
-    let mut header = false;
-    let mut null_string = None;
-    for opt in &copy.options {
-        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-            continue;
-        };
-        match def.defname.as_str() {
-            "format" => {
-                if let Some(val) = def_elem_string_val(def) {
-                    format = match val.to_lowercase().as_str() {
-                        "text" => PgCopyFormat::Text,
-                        "binary" => PgCopyFormat::Binary,
-                        _ => return None,
-                    };
-                }
-            }
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "header" => header = def_elem_bool_val(def).unwrap_or(true),
-            "null" => null_string = def_elem_string_val(def),
-            _ => {}
-        }
-    }
+    let opts = parse_copy_options(&copy.options).ok()?;
+    let format = match opts.format.as_deref().map(str::to_lowercase).as_deref() {
+        Some("text") | None => PgCopyFormat::Text,
+        Some("binary") => PgCopyFormat::Binary,
+        Some(_) => return None,
+    };
 
     Some(PgCopyStdinStmt {
         table_name,
         schema_name,
         columns,
         format,
-        delimiter,
-        header,
-        null_string,
+        delimiter: opts.delimiter,
+        header: opts.header.unwrap_or(false),
+        null_string: opts.null_string,
+        encoding: opts.encoding,
     })
 }
 
@@ -5702,6 +5701,9 @@ pub struct PgCopyStdoutStmt {
     pub format: PgCopyFormat,
     pub delimiter: char,
     pub null_string: String,
+    pub header: bool,
+    /// Captured from the `ENCODING` COPY option, not yet acted upon downstream.
+    pub encoding: Option<String>,
 }
 
 /// Try to extract COPY TO STDOUT from pg_query parse output.
@@ -5745,36 +5747,17 @@ pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdou
         Some(cols)
     };
 
-    let mut format = PgCopyFormat::Text;
-    let mut delimiter = '\t';
-    let mut null_string = "\\N".to_string();
-    for opt in &copy.options {
-        let Some(pg_query::protobuf::node::Node::DefElem(def)) = &opt.node else {
-            continue;
-        };
-        match def.defname.as_str() {
-            "format" => {
-                if let Some(val) = def_elem_string_val(def) {
-                    format = match val.to_lowercase().as_str() {
-                        "text" => PgCopyFormat::Text,
-                        "binary" => PgCopyFormat::Binary,
-                        _ => return None,
-                    };
-                }
-            }
-            "delimiter" => {
-                if let Some(val) = def_elem_string_val(def) {
-                    delimiter = val.chars().next().unwrap_or('\t');
-                }
-            }
-            "null" => {
-                if let Some(val) = def_elem_string_val(def) {
-                    null_string = val;
-                }
-            }
-            _ => {}
-        }
-    }
+    let opts = parse_copy_options(&copy.options).ok()?;
+    let format = match opts.format.as_deref().map(str::to_lowercase).as_deref() {
+        Some("text") | None => PgCopyFormat::Text,
+        Some("binary") => PgCopyFormat::Binary,
+        Some(_) => return None,
+    };
+    let delimiter = opts
+        .delimiter
+        .and_then(|v| v.chars().next())
+        .unwrap_or('\t');
+    let null_string = opts.null_string.unwrap_or_else(|| "\\N".to_string());
 
     Some(PgCopyStdoutStmt {
         table_name,
@@ -5783,6 +5766,8 @@ pub fn try_extract_copy_stdout(parse_result: &ParseResult) -> Option<PgCopyStdou
         format,
         delimiter,
         null_string,
+        header: opts.header.unwrap_or(false),
+        encoding: opts.encoding,
     })
 }
 
@@ -9000,6 +8985,20 @@ mod tests {
     }
 
     #[test]
+    fn test_copy_header_invalid_boolean_string_fails_loud() {
+        // M7: an unrecognized boolean string for a COPY option must produce a ParseError,
+        // not be silently treated as `false` (the previous `def_elem_bool_val` behavior).
+        let translator = PostgreSQLTranslator::new();
+        let sql = "COPY users FROM '/path' WITH (HEADER 'maybe')";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid boolean value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_copy_from_stdin() {
         let translator = PostgreSQLTranslator::new();
         let sql = "COPY users FROM STDIN";
@@ -9066,6 +9065,37 @@ mod tests {
         let copy = try_extract_copy_from(&parsed).unwrap();
         let cols = copy.columns.unwrap();
         assert_eq!(cols, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn test_try_extract_copy_from_encoding() {
+        let parsed =
+            crate::parse("COPY users FROM '/tmp/data.tsv' WITH (ENCODING 'LATIN1')").unwrap();
+        let copy = try_extract_copy_from(&parsed).unwrap();
+        assert_eq!(copy.encoding.as_deref(), Some("LATIN1"));
+    }
+
+    #[test]
+    fn test_try_extract_copy_stdout_header() {
+        let parsed = crate::parse("COPY users TO STDOUT WITH (HEADER)").unwrap();
+        let copy = try_extract_copy_stdout(&parsed).unwrap();
+        assert!(copy.header);
+    }
+
+    #[test]
+    fn test_try_extract_copy_stdout_no_header_by_default() {
+        let parsed = crate::parse("COPY users TO STDOUT").unwrap();
+        let copy = try_extract_copy_stdout(&parsed).unwrap();
+        assert!(!copy.header);
+    }
+
+    #[test]
+    fn test_try_extract_copy_stdout_invalid_boolean_string_returns_none() {
+        // try_extract_copy_stdout returns Option, not Result; an invalid boolean must
+        // fall back to None so the caller retries via the full translate_copy path,
+        // which surfaces the ParseError.
+        let parsed = crate::parse("COPY users TO STDOUT WITH (HEADER 'maybe')").unwrap();
+        assert!(try_extract_copy_stdout(&parsed).is_none());
     }
 
     #[test]
