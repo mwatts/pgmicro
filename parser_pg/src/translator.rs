@@ -3977,7 +3977,11 @@ impl PostgreSQLTranslator {
 
                 ast::UpsertDo::Set { sets, where_clause }
             }
-            _ => return Ok(None),
+            other => {
+                return Err(ParseError::ParseError(format!(
+                    "Unsupported ON CONFLICT action: {other:?}"
+                )));
+            }
         };
 
         // Translate conflict target (the columns in ON CONFLICT (col1, col2))
