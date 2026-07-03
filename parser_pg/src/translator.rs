@@ -4779,6 +4779,15 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "BIGINT" | "INT8" => "bigint".into(),
         "UUID" => "uuid".into(),
         "DATE" => "date".into(),
+        // NOTE: TIMETZ (`time with time zone`) is collapsed into the same "time"
+        // Turso custom type as plain TIME, as an interim measure — unlike
+        // TIMESTAMP/TIMESTAMPTZ below, which already have distinct custom types
+        // ("timestamp" vs "timestamptz"). PostgreSQL's TIMETZ carries an explicit
+        // UTC offset that this mapping silently discards: a TIMETZ value's offset
+        // information is lost on write. A real fix needs a distinct "timetz" Turso
+        // custom type with offset-aware ENCODE/DECODE SQL, which doesn't exist in
+        // core/schema.rs's bootstrap_builtin_types today; adding it is a core/
+        // change and out of scope here.
         "TIME" | "TIMETZ" => "time".into(),
         "TIMESTAMP" => "timestamp".into(),
         "TIMESTAMPTZ" => "timestamptz".into(),
