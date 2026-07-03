@@ -253,6 +253,27 @@ fn test_pg_type_array_types(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_type_money_is_byval(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+
+    // money is backed by int8, a fixed-size, pass-by-value type
+    let mut stmt = conn
+        .prepare("SELECT typbyval FROM pg_type WHERE typname = 'money'")
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let row = stmt.row().unwrap();
+            let Value::Numeric(Numeric::Integer(typbyval)) = row.get_value(0) else {
+                panic!("expected integer typbyval");
+            };
+            assert_eq!(*typbyval, 1, "money is int8-backed, must be pass-by-value");
+        }
+        _ => panic!("money not found in pg_type"),
+    }
+}
+
+#[turso_macros::test]
 fn test_pg_type_user_enum_in_public_namespace(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();

@@ -2622,7 +2622,7 @@ const PG_BASE_TYPES: &[PgTypeInfo] = &[
         typlen: 8,
         typarray: 791,
         typelem: 0,
-        typbyval: false,
+        typbyval: true,
         typalign: "d",
         typstorage: "p",
     },
