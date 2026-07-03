@@ -534,6 +534,37 @@ fn test_pg_constraint_check(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_constraint_unnamed_checks_get_distinct_conname(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (a INTEGER CHECK (a > 0), b INTEGER CHECK (b > 0))")
+        .unwrap();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT conname FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid WHERE c.relname = 't' AND con.contype = 'c'",
+        )
+        .unwrap();
+    let mut names = std::collections::HashSet::new();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let Value::Text(n) = stmt.row().unwrap().get_value(0) else {
+                    panic!("expected text")
+                };
+                names.insert(n.as_str().to_string());
+            }
+            StepResult::Done => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        names.len(),
+        2,
+        "two unnamed CHECK constraints must not collide on conname, got {names:?}"
+    );
+}
+
+#[turso_macros::test]
 fn test_pg_constraint_conindid_scoped_to_own_table(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE)")

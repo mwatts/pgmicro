@@ -3374,11 +3374,14 @@ impl PgConstraintCursor {
             }
 
             // CHECK constraints from check_constraints
-            for chk in &btree.check_constraints {
-                let conname = chk
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("{table_name}_check"));
+            for (chk_idx, chk) in btree.check_constraints.iter().enumerate() {
+                let conname = chk.name.clone().unwrap_or_else(|| {
+                    if chk_idx == 0 {
+                        format!("{table_name}_check")
+                    } else {
+                        format!("{table_name}_check{}", chk_idx + 1)
+                    }
+                });
 
                 let conkey = chk
                     .column
