@@ -4349,8 +4349,12 @@ fn parse_json_array(s: &str, start: usize, depth: usize) -> Option<usize> {
 static SQLITE_DDL_INTEGER_PK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\bINTEGER\s+PRIMARY\s+KEY\b").expect("valid INTEGER PRIMARY KEY regex")
 });
+// Consumes a preceding whitespace run along with the keyword, so
+// "...KEY AUTOINCREMENT)" -> "...KEY)" instead of "...KEY )".
 static SQLITE_DDL_AUTOINCREMENT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bAUTOINCREMENT\b").expect("valid AUTOINCREMENT regex"));
+    LazyLock::new(|| Regex::new(r"(?i)\s*\bAUTOINCREMENT\b").expect("valid AUTOINCREMENT regex"));
+static SQLITE_DDL_STRING_LITERAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"'(?:[^']|'')*'").expect("valid string literal regex"));
 static SQLITE_DDL_WITHOUT_ROWID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bWITHOUT\s+ROWID\b").expect("valid WITHOUT ROWID regex"));
 static SQLITE_DDL_INTEGER: LazyLock<Regex> =
@@ -4364,36 +4368,47 @@ static SQLITE_DDL_BLOB: LazyLock<Regex> =
 static SQLITE_DDL_DATETIME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bDATETIME\b").expect("valid DATETIME regex"));
 
+/// Applies the SQLite -> PostgreSQL keyword rewrites to a DDL segment that is
+/// known to contain no string literals.
+fn convert_ddl_segment(segment: &str) -> String {
+    let mut s = segment.to_string();
+
+    s = SQLITE_DDL_INTEGER_PK
+        .replace_all(&s, "SERIAL PRIMARY KEY")
+        .into_owned();
+    s = SQLITE_DDL_AUTOINCREMENT.replace_all(&s, "").into_owned();
+    s = SQLITE_DDL_INTEGER.replace_all(&s, "integer").into_owned();
+    s = SQLITE_DDL_REAL
+        .replace_all(&s, "double precision")
+        .into_owned();
+    s = SQLITE_DDL_TEXT.replace_all(&s, "text").into_owned();
+    s = SQLITE_DDL_BLOB.replace_all(&s, "bytea").into_owned();
+    s = SQLITE_DDL_DATETIME
+        .replace_all(&s, "timestamp")
+        .into_owned();
+    s = SQLITE_DDL_WITHOUT_ROWID.replace_all(&s, "").into_owned();
+
+    s
+}
+
 /// Convert a SQLite CREATE TABLE DDL string to PostgreSQL-compatible syntax.
+///
+/// Keyword rewrites are applied only outside of `'...'` string literals (e.g.
+/// inside DEFAULT/CHECK expressions), so e.g. `DEFAULT 'REAL ESTATE'` isn't
+/// corrupted into `DEFAULT 'double precision ESTATE'`. SQL's `''`
+/// escaped-quote-within-a-string convention is respected by the literal regex.
 fn convert_sqlite_ddl_to_postgres(sqlite_ddl: &str) -> String {
-    let mut postgres_ddl = sqlite_ddl.to_string();
+    let mut result = String::with_capacity(sqlite_ddl.len());
+    let mut last_end = 0;
 
-    postgres_ddl = SQLITE_DDL_INTEGER_PK
-        .replace_all(&postgres_ddl, "SERIAL PRIMARY KEY")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_AUTOINCREMENT
-        .replace_all(&postgres_ddl, "")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_INTEGER
-        .replace_all(&postgres_ddl, "integer")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_REAL
-        .replace_all(&postgres_ddl, "double precision")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_TEXT
-        .replace_all(&postgres_ddl, "text")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_BLOB
-        .replace_all(&postgres_ddl, "bytea")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_DATETIME
-        .replace_all(&postgres_ddl, "timestamp")
-        .into_owned();
-    postgres_ddl = SQLITE_DDL_WITHOUT_ROWID
-        .replace_all(&postgres_ddl, "")
-        .into_owned();
+    for m in SQLITE_DDL_STRING_LITERAL.find_iter(sqlite_ddl) {
+        result.push_str(&convert_ddl_segment(&sqlite_ddl[last_end..m.start()]));
+        result.push_str(m.as_str()); // string literal preserved verbatim
+        last_end = m.end();
+    }
+    result.push_str(&convert_ddl_segment(&sqlite_ddl[last_end..]));
 
-    postgres_ddl
+    result
 }
 
 impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
@@ -4899,6 +4914,55 @@ mod tests {
         assert!(postgres_ddl.contains("INTEGER_col text"));
         assert!(postgres_ddl.contains("col INTEGER_col integer"));
         assert!(!postgres_ddl.contains("col integer_col integer"));
+    }
+
+    #[test]
+    fn test_convert_ddl_preserves_string_literals() {
+        let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT DEFAULT 'REAL ESTATE', note TEXT CHECK (note != 'BLOB storage'))";
+        let converted = convert_sqlite_ddl_to_postgres(ddl);
+        assert!(
+            converted.contains("'REAL ESTATE'"),
+            "string literal must survive verbatim, got: {converted}"
+        );
+        assert!(
+            converted.contains("'BLOB storage'"),
+            "string literal must survive verbatim, got: {converted}"
+        );
+        assert!(converted.contains("kind text"));
+        assert!(converted.contains("note text"));
+    }
+
+    #[test]
+    fn test_convert_ddl_no_trailing_space_after_serial_pk() {
+        let ddl = "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)";
+        let converted = convert_sqlite_ddl_to_postgres(ddl);
+        assert!(
+            converted.contains("SERIAL PRIMARY KEY)") || converted.contains("SERIAL PRIMARY KEY,"),
+            "expected no stray space/double-space after SERIAL PRIMARY KEY, got: {converted}"
+        );
+        assert!(
+            !converted.contains("SERIAL PRIMARY KEY  "),
+            "double space found: {converted}"
+        );
+    }
+
+    #[test]
+    fn test_convert_ddl_preserves_escaped_quote_in_literal() {
+        // SQL's '' escaped-quote-within-a-string convention: the literal
+        // 'it''s REAL' is a single string literal containing "it's REAL",
+        // and must not be split at the escaped quote nor have REAL rewritten.
+        let ddl = "CREATE TABLE t (name TEXT DEFAULT 'it''s REAL', kind TEXT DEFAULT 'REAL')";
+        let converted = convert_sqlite_ddl_to_postgres(ddl);
+        assert!(
+            converted.contains("'it''s REAL'"),
+            "escaped-quote literal must survive verbatim, got: {converted}"
+        );
+        assert!(
+            converted.contains("DEFAULT 'REAL'"),
+            "second literal must survive verbatim, got: {converted}"
+        );
+        assert!(converted.contains("name text"));
+        assert!(converted.contains("kind text"));
     }
 
     #[test]
