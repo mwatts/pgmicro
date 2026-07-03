@@ -2699,10 +2699,11 @@ impl PostgreSQLTranslator {
                     Ok(ast::Expr::Literal(ast::Literal::Numeric(f.fval.clone())))
                 }
                 pg_query::protobuf::a_const::Val::Boolval(b) => {
-                    // SQLite uses 0/1 for booleans
-                    Ok(ast::Expr::Literal(ast::Literal::Numeric(
-                        if b.boolval { "1" } else { "0" }.to_string(),
-                    )))
+                    Ok(ast::Expr::Literal(if b.boolval {
+                        ast::Literal::True
+                    } else {
+                        ast::Literal::False
+                    }))
                 }
                 _ => Err(ParseError::ParseError(
                     "Unsupported constant type".to_string(),
@@ -8798,6 +8799,26 @@ mod tests {
             }
         } else {
             panic!("Expected Select");
+        }
+    }
+
+    #[test]
+    fn test_boolean_literal_uses_true_false_variant() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT true, false";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                assert!(matches!(
+                    columns[0],
+                    ast::ResultColumn::Expr(ref e, _) if matches!(**e, ast::Expr::Literal(ast::Literal::True))
+                ));
+                assert!(matches!(
+                    columns[1],
+                    ast::ResultColumn::Expr(ref e, _) if matches!(**e, ast::Expr::Literal(ast::Literal::False))
+                ));
+            }
         }
     }
 }
