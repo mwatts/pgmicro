@@ -1454,6 +1454,28 @@ fn test_pg_proc_builtin_functions_in_pg_catalog_namespace(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_pg_proc_aggregate_prokind_is_a(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT prokind FROM pg_proc WHERE proname = 'sum'")
+        .unwrap();
+    match stmt.step().unwrap() {
+        StepResult::Row => {
+            let Value::Text(prokind) = stmt.row().unwrap().get_value(0) else {
+                panic!("expected text prokind")
+            };
+            assert_eq!(
+                prokind.as_str(),
+                "a",
+                "sum() is an aggregate, must report prokind='a'"
+            );
+        }
+        _ => panic!("sum() not found in pg_proc"),
+    }
+}
+
+#[turso_macros::test]
 fn test_pg_collation_builtin_rows(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("PRAGMA sql_dialect = 'postgres'").unwrap();

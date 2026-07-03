@@ -1483,20 +1483,32 @@ fn stable_proc_oid_map(conn: &Connection) -> HashMap<String, i64> {
 
 impl PgProcCursor {
     fn load_functions(&mut self) {
-        use crate::function::Func;
+        use crate::function::{AggFunc, Func};
+        use strum::IntoEnumIterator;
 
         self.rows.clear();
         let oid_map = stable_proc_oid_map(&self.conn);
+
+        // `Func::builtin_function_list()` tags every AggFunc entry as "w" (window-capable)
+        // for SQLite's own PRAGMA function_list consumer — that's correct for its purpose,
+        // but PostgreSQL's pg_proc.prokind must distinguish true aggregates ('a') from
+        // genuine window functions ('w', e.g. row_number). Look up real aggregate names
+        // via the AggFunc enum itself rather than trusting the borrowed "w" tag.
+        let agg_names: std::collections::HashSet<&'static str> =
+            AggFunc::iter().map(|f| f.as_str()).collect();
 
         // Built-in functions from the same registry as PRAGMA function_list
         for entry in Func::builtin_function_list() {
             let oid = *oid_map
                 .get(&entry.name)
                 .expect("builtin function missing from stable OID map");
-            let prokind = match entry.func_type {
-                "a" => "a", // aggregate
-                "w" => "w", // window
-                _ => "f",   // function
+            let prokind = if agg_names.contains(entry.name.as_str()) {
+                "a" // aggregate
+            } else {
+                match entry.func_type {
+                    "w" => "w", // genuine window function (e.g. row_number)
+                    _ => "f",   // function
+                }
             };
             let provolatile = if entry.deterministic { "i" } else { "v" };
 
