@@ -1958,6 +1958,12 @@ impl PostgreSQLTranslator {
         };
 
         let distinctness = if !select.distinct_clause.is_empty() {
+            if !Self::is_plain_distinct(&select.distinct_clause) {
+                return Err(ParseError::ParseError(
+                    "DISTINCT ON is not supported inside UNION/INTERSECT/EXCEPT branches"
+                        .to_string(),
+                ));
+            }
             Some(ast::Distinctness::Distinct)
         } else {
             None
@@ -8820,5 +8826,15 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn test_distinct_on_in_union_branch_rejected_not_downgraded() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "(SELECT DISTINCT ON (dept) dept, salary FROM emp ORDER BY dept, salary DESC) \
+                   UNION SELECT dept, salary FROM contractors";
+        let parsed = crate::parse(sql).unwrap();
+        let err = translator.translate(&parsed).unwrap_err();
+        assert!(matches!(err, ParseError::ParseError(_)));
     }
 }
