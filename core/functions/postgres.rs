@@ -42,7 +42,7 @@ pub fn exec_pg_encoding_to_char(encoding: i64) -> Value {
     let name = match encoding {
         6 => "UTF8",
         0 => "SQL_ASCII",
-        _ => "UTF8",
+        _ => "",
     };
     Value::build_text(name)
 }
@@ -386,6 +386,12 @@ pub fn exec_rpad(input: &Value, length: usize, fill: &str) -> Result<Value, Limb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pg_encoding_to_char_unknown_encoding_errors() {
+        // real PostgreSQL returns "" for an out-of-range encoding id, never errors.
+        assert_eq!(exec_pg_encoding_to_char(9999), Value::build_text(""));
+    }
 
     #[test]
     fn gcd_normal_cases() {
