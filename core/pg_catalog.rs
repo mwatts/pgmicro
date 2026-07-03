@@ -907,11 +907,13 @@ fn parse_enum_labels_from_type_def(td: &TypeDef) -> Vec<String> {
     if let Some(idx) = upper.find("AS ENUM") {
         let rest = &td.sql[idx + 7..];
         if let (Some(start_paren), Some(end_paren)) = (rest.find('('), rest.rfind(')')) {
-            let inner = &rest[start_paren + 1..end_paren];
-            return inner
-                .split(',')
-                .filter_map(parse_enum_label_token)
-                .collect();
+            if start_paren < end_paren {
+                let inner = &rest[start_paren + 1..end_paren];
+                return inner
+                    .split(',')
+                    .filter_map(parse_enum_label_token)
+                    .collect();
+            }
         }
     }
 
@@ -5502,5 +5504,30 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn test_parse_enum_labels_handles_malformed_type_def() {
+        // "AS ENUM" present but ')' appears before '(' — must not panic on the
+        // rest[start_paren + 1..end_paren] slice.
+        use crate::schema::TypeDefKind;
+        let td = TypeDef {
+            name: "mood".to_string(),
+            is_builtin: false,
+            not_null: false,
+            is_domain: false,
+            sql: "CREATE TYPE mood AS ENUM )(".to_string(),
+            domain_checks: Vec::new(),
+            kind: TypeDefKind::Custom {
+                params: Vec::new(),
+                base: "text".to_string(),
+                encode: None,
+                decode: None,
+                operators: Vec::new(),
+                default: None,
+            },
+        };
+        let labels = parse_enum_labels_from_type_def(&td);
+        assert!(labels.is_empty());
     }
 }
